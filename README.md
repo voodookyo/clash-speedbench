@@ -86,7 +86,8 @@ python3 speedbench_web.py          # 打开 http://127.0.0.1:8950
 
 ```bash
 brew install --cask swiftbar
-# 然后把 swiftbar/speedbench.5m.sh 拷进（或软链进）SwiftBar 插件目录
+# 软链（推荐，自动定位仓库路径）进 SwiftBar 插件目录：
+ln -s "$PWD/swiftbar/speedbench.5m.sh" ~/SwiftBar/
 ```
 
 菜单栏常驻显示 `⚡冠军节点 带宽`，下拉可看上次 Top 5、一键切换节点、发起全量测速、打开 Web 面板。

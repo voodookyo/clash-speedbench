@@ -17,7 +17,10 @@
 
 set -u
 
-REPO_DIR="/Users/admin/Documents/Kimiwork/clash-speedbench"
+# 插件位于 <repo>/swiftbar/ 下；推荐软链进 SwiftBar 插件目录。
+# 通过解析自身软链自动定位仓库根目录，也可以用 SPEEDBENCH_REPO 覆盖。
+SELF="$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+REPO_DIR="${SPEEDBENCH_REPO:-$(cd "$(dirname "$SELF")/.." && pwd)}"
 HISTORY="${SPEEDBENCH_HISTORY:-$REPO_DIR/speedbench-history.jsonl}"
 SWITCH_PY="$REPO_DIR/speedbench_switch.py"
 WEB_PY="$REPO_DIR/speedbench_web.py"
