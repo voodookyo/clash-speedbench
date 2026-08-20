@@ -1,0 +1,9 @@
+# 测速报告（本地生成，不入库）
+clash-speedtest-*.csv
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
