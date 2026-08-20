@@ -573,6 +573,44 @@ def write_csv(results: List[Result], path: Path) -> None:
             ])
 
 
+def result_to_dict(r: Result) -> dict:
+    ip = r.ip if r.ip and r.ip.ok else IpInfo()
+    return {
+        "name": r.name,
+        "provider": r.provider,
+        "proto": r.proto,
+        "latency_ms": r.latency_ms,
+        "median_mbps": None if r.median_mbps is None else round(r.median_mbps, 3),
+        "best_mbps": None if r.best_mbps is None else round(r.best_mbps, 3),
+        "samples_mbps": [round(x, 3) for x in r.speeds_mbps],
+        "score": r.score,
+        "stars": star_str(r.score),
+        "tags": r.tags,
+        "status": r.status,
+        "ip": {
+            "exit_ip": ip.exit_ip, "country": ip.country, "country_code": ip.country_code,
+            "region": ip.region, "city": ip.city, "isp": ip.isp, "org": ip.org,
+            "asn": ip.asn, "kind": ip.kind, "risk": ip.risk, "ok": ip.ok,
+        },
+    }
+
+
+def append_history(results: List[Result], path: Path, mb: int, rounds: int,
+                   csv_path: Optional[Path]) -> None:
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "mb": mb,
+        "rounds": rounds,
+        "csv": str(csv_path) if csv_path else "",
+        "results": [result_to_dict(r) for r in rank_results(results)],
+    }
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"⚠️ 历史记录写入失败: {e}", file=sys.stderr)
+
+
 def pick_switch_group(proxies: Dict[str, dict], graph: Dict[str, List[str]],
                       best_name: str, root: str) -> Optional[str]:
     """Find the Selector group to auto-switch: prefer the non-root group with the
@@ -645,6 +683,11 @@ def main() -> int:
                         help="测速结束后把主 Selector 组自动切换到综合评分第一的节点")
     parser.add_argument("--switch-group", default="",
                         help="配合 --auto-switch 使用，手动指定要切换的策略组名")
+    parser.add_argument("--history",
+                        default=str(Path(__file__).resolve().parent / "speedbench-history.jsonl"),
+                        help="历史记录 JSONL 路径，默认在脚本目录下")
+    parser.add_argument("--no-history", action="store_true",
+                        help="不写入历史记录")
     parser.add_argument("--yes", action="store_true",
                         help="不询问确认直接开始")
     args = parser.parse_args()
@@ -848,6 +891,8 @@ def main() -> int:
         write_csv(results, out)
         print(f"\nCSV 已保存: {out.resolve()}")
         print("排序规则：按综合评分（带宽 55% + 延迟 25% + IP 风险 20%）从高到低。")
+        if not args.no_history:
+            append_history(results, Path(args.history), args.mb, args.rounds, out)
         if args.auto_switch:
             auto_switch_best(api, proxies, graph, root, results, args.switch_group)
     else:

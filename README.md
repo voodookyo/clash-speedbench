@@ -49,7 +49,7 @@ python3 clash_speedbench.py --yes
 python3 clash_speedbench.py --include '香港|HK|日本|JP|新加坡|SG' --auto-switch --yes
 ```
 
-macOS 用户也可以直接**双击 `speedbench.command`**（可拖到桌面或 Dock 当按钮用）。
+macOS 用户也可以直接**双击 `speedbench.command`**（可拖到桌面或 Dock 当按钮用），双击后出现菜单：终端全量测速 / 打开 Web 面板 / 测速并自动切换冠军。
 
 ## 输出示例
 
@@ -69,6 +69,35 @@ CSV 已保存: clash-speedtest-20260820-181130.csv
 
 CSV 包含全部字段：延迟/中位带宽/峰值/各轮采样/评分/星级/标签/出口IP/国家/ASN/ISP/ORG/IP类型/风险/状态。
 
+## 本地 Web 面板
+
+```bash
+python3 speedbench_web.py          # 打开 http://127.0.0.1:8950
+# 或双击 speedbench-web.command
+```
+
+深色单页面板，零依赖（无需 npm/Flask），只绑定 127.0.0.1：
+
+- 一键开始测速（可设节点过滤/每轮 MB/轮数/自动切换），实时进度和日志
+- 结果表格：节点/延迟/带宽/星级/IP画像/标签，每行一个「切换」按钮直接换节点
+- 历史带宽趋势图：每次测速自动写入 `speedbench-history.jsonl`，点任意节点看历史曲线
+
+## 菜单栏小工具（可选，需 SwiftBar）
+
+```bash
+brew install --cask swiftbar
+# 然后把 swiftbar/speedbench.5m.sh 拷进（或软链进）SwiftBar 插件目录
+```
+
+菜单栏常驻显示 `⚡冠军节点 带宽`，下拉可看上次 Top 5、一键切换节点、发起全量测速、打开 Web 面板。
+
+命令行也可以单独使用切换工具：
+
+```bash
+python3 speedbench_switch.py --best          # 切到上次测速的冠军节点
+python3 speedbench_switch.py --name '日本 01'
+```
+
 ## 常用参数
 
 | 参数 | 说明 | 默认 |
@@ -84,6 +113,8 @@ CSV 包含全部字段：延迟/中位带宽/峰值/各轮采样/评分/星级/�
 | `--switch-group NAME` | 指定要切换的策略组 | 自动探测主 Selector |
 | `--controller URL` | 指定 controller（支持 `unix://` 前缀） | 自动探测 |
 | `--top N` | 表格只显示前 N 名 | 全部 |
+| `--history PATH` | 历史记录 JSONL 路径 | 脚本目录下 |
+| `--no-history` | 不写历史记录 | 关 |
 
 设置了 External Controller Secret 时，用环境变量传入（避免写进 shell history）：
 

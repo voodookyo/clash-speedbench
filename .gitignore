@@ -1,5 +1,6 @@
-# 测速报告（本地生成，不入库）
+# 测速报告与历史（本地生成，不入库）
 clash-speedtest-*.csv
+speedbench-history.jsonl
 
 # macOS
 .DS_Store
