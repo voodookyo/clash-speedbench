@@ -98,6 +98,17 @@ python3 speedbench_switch.py --best          # 切到上次测速的冠军节点
 python3 speedbench_switch.py --name '日本 01'
 ```
 
+## 打包成 macOS App（最省事）
+
+```bash
+bash build_app.sh          # 生成 dist/Clash SpeedBench.app（含图标，自包含）
+cp -R "dist/Clash SpeedBench.app" /Applications/
+```
+
+之后从启动台/应用程序**双击 Clash SpeedBench 图标**即可：自动启动面板并打开浏览器；
+在面板里完成测速、看榜、切节点；点右上角「停止面板」即退出。
+数据（历史/CSV/日志）存放在 `~/Library/Application Support/ClashSpeedBench/`，不污染应用包。
+
 ## 常用参数
 
 | 参数 | 说明 | 默认 |

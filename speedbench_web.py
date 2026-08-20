@@ -35,7 +35,10 @@ from clash_speedbench import (  # noqa: E402
 )
 
 SCRIPT = HERE / "clash_speedbench.py"
-HISTORY = HERE / "speedbench-history.jsonl"
+# 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
+# ~/Library/Application Support/ClashSpeedBench，避免污染应用包。
+DATA_HOME = Path(os.environ.get("SPEEDBENCH_HOME", str(HERE)))
+HISTORY = DATA_HOME / "speedbench-history.jsonl"
 
 STATE = {
     "running": False,
@@ -89,7 +92,7 @@ def slim_history() -> list:
 
 
 def run_benchmark(params: dict) -> None:
-    cmd = [sys.executable, str(SCRIPT), "--yes"]
+    cmd = [sys.executable, str(SCRIPT), "--yes", "--history", str(HISTORY)]
     if params.get("include"):
         cmd += ["--include", str(params["include"])]
     if params.get("mb"):
@@ -107,7 +110,7 @@ def run_benchmark(params: dict) -> None:
 
     try:
         proc = subprocess.Popen(
-            cmd, cwd=str(HERE),
+            cmd, cwd=str(DATA_HOME),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
@@ -198,7 +201,7 @@ PAGE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>⚡ Clash SpeedBench</h1>
+<h1>⚡ Clash SpeedBench <button class="mini" style="float:right" onclick="quitPanel()">停止面板</button></h1>
 <div class="sub">延迟 + 真实带宽 + IP 纯净度 + 综合评分 · 本地面板（127.0.0.1）</div>
 
 <div class="card">
@@ -313,6 +316,12 @@ async function switchNode(name){
   alert(r.msg);
 }
 
+async function quitPanel(){
+  if(!confirm('停止 SpeedBench 面板？（正在进行的测速会中断并自动恢复 Clash 配置）')) return;
+  try{ await fetch('/api/quit',{method:'POST'}); }catch(e){}
+  document.body.innerHTML='<div style="text-align:center;padding:80px;color:#8b949e">面板已停止，可以关闭此标签页。<br>下次双击 Clash SpeedBench 图标重新启动。</div>';
+}
+
 let histData = [];
 async function loadHistory(){ histData = await (await fetch('/api/history')).json(); drawChart(); }
 
@@ -421,6 +430,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "msg": "缺少节点名"}, 400)
                 return
             self._json(do_switch(name))
+        elif path == "/api/quit":
+            self._json({"ok": True, "msg": "面板已停止"})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
         else:
             self._json({"ok": False, "msg": "not found"}, 404)
 

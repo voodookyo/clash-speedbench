@@ -95,9 +95,10 @@ printf '切换到冠军节点 | shell="%s" param1="%s" param2="--best" terminal=
     "$PYTHON3" "$SWITCH_PY"
 printf '开始全量测速（终端） | shell="/usr/bin/open" param1="-a" param2="Terminal" param3="%s"\n' \
     "$COMMAND_FILE"
-# shell 只能放一条命令，所以用 bash -c 组合：8950 未监听则后台起 Web 面板，再打开浏览器。
-# 注意该命令未经 shell 转义地进入 param2，路径中含空格或引号会出问题——本仓库路径无空格。
-WEB_CMD="if ! /usr/bin/nc -z 127.0.0.1 ${WEB_PORT} >/dev/null 2>&1; then nohup ${PYTHON3} ${WEB_PY} >/dev/null 2>&1 & sleep 1; fi; /usr/bin/open http://127.0.0.1:${WEB_PORT}"
+# shell 只能放一条命令，所以用 bash -c 组合：
+# 已安装 App 则直接打开 App（自包含、数据目录独立）；否则 8950 未监听时后台起仓库版面板再开浏览器。
+# 注意该命令未经 shell 转义地进入 param2：内部只用单引号，避免破坏 SwiftBar 的双引号参数解析。
+WEB_CMD="if [ -d '/Applications/Clash SpeedBench.app' ]; then /usr/bin/open -a 'Clash SpeedBench'; else if ! /usr/bin/nc -z 127.0.0.1 ${WEB_PORT} >/dev/null 2>&1; then nohup ${PYTHON3} ${WEB_PY} >/dev/null 2>&1 & sleep 1; fi; /usr/bin/open http://127.0.0.1:${WEB_PORT}; fi"
 printf '打开 Web 面板 | shell="/bin/bash" param1="-c" param2="%s" terminal=false\n' "$WEB_CMD"
 printf '%s\n' '---'
 printf '刷新 | refresh=true\n'

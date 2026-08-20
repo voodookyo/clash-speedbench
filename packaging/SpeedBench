@@ -1,0 +1,30 @@
+#!/bin/bash
+# Clash SpeedBench.app 启动器
+# 双击 App 时：确保本地面板在运行（单实例），然后打开浏览器。
+set -u
+
+RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
+APP_DIR="$RES/app"
+DATA="$HOME/Library/Application Support/ClashSpeedBench"
+mkdir -p "$DATA"
+
+PY=""
+for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    if [ -x "$p" ]; then PY="$p"; break; fi
+done
+
+if [ -z "$PY" ]; then
+    /usr/bin/osascript -e 'display alert "Clash SpeedBench 需要 python3" message "未发现 python3。请先安装 Xcode 命令行工具：xcode-select --install"' >/dev/null 2>&1 || true
+    exit 1
+fi
+
+if ! /usr/bin/nc -z 127.0.0.1 8950 >/dev/null 2>&1; then
+    SPEEDBENCH_HOME="$DATA" nohup "$PY" "$APP_DIR/speedbench_web.py" --no-browser >>"$DATA/web.log" 2>&1 &
+    # 等服务就绪（最多 5 秒）
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        /usr/bin/nc -z 127.0.0.1 8950 >/dev/null 2>&1 && break
+        sleep 0.5
+    done
+fi
+
+open "http://127.0.0.1:8950"
