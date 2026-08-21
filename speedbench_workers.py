@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Clash SpeedBench — concurrent worker pool.
+Clash SpeedBench — concurrent worker pool (two-phase).
 
-Spawns several throwaway mihomo processes (reusing the binary that ships with
-Clash Verge) with a minimal generated config, so bandwidth tests run truly in
-parallel and the user's running Clash instance is never touched (no GLOBAL
-switching, no traffic hijack).
+Phase 1 粗筛：spawns several throwaway mihomo processes (reusing the binary that
+ships with Clash Verge) with a minimal generated config, probing nodes in
+parallel — latency/jitter, connectivity and exit-IP profile only, NO bandwidth
+download, so the user's running Clash instance is never touched and the WAN
+link stays idle.
+
+Phase 2 精测：one extra throwaway mihomo worker measures the Top-N nodes' real
+download speed strictly one node at a time, so parallel downloads never fight
+over the same WAN bandwidth.
 
 Key tricks (validated against Clash Verge Rev + TUN on macOS):
 - The Verge-generated clash-verge.yaml holds full proxy credentials; we extract
@@ -37,18 +42,22 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from clash_speedbench import (
-    DEFAULT_DELAY_URL,
     DEFAULT_DOWNLOAD_URL,
     IpInfo,
     MihomoAPI,
     Result,
+    adaptive_sample,
     classify_ip,
     compute_score,
     curl_speed,
     fetch_ip_info,
     fmt_ms,
     fmt_speed,
+    ip_brief,
     make_tags,
+    multi_stream_speed,
+    probe_latency,
+    warmup_speed,
 )
 
 
@@ -250,63 +259,101 @@ class Worker:
         if self.dir:
             self.dir.cleanup()
 
-    def delay(self, name: str, timeout_ms: int) -> Optional[int]:
-        """Warm-up dial once, then take the second (warm) measurement."""
-        assert self.api is not None
-        first = self.api.proxy_delay(name, DEFAULT_DELAY_URL, timeout_ms)
-        if first is None:
-            return None
-        second = self.api.proxy_delay(name, DEFAULT_DELAY_URL, timeout_ms)
-        return second if second is not None else first
-
     def select(self, name: str) -> None:
         assert self.api is not None
         self.api.select("GLOBAL", name)
 
 
-def _test_node_in_worker(worker: Worker, name: str, proto: str, args) -> Result:
-    latency = worker.delay(name, args.delay_timeout)
-    speeds: List[float] = []
-    statuses: List[str] = []
+def _probe_node_in_worker(worker: Worker, name: str, proto: str, args) -> Result:
+    """Phase 1 粗筛：只做延迟/抖动 + 连通性判定 + 出口 IP 画像，不跑带宽下载。"""
+    assert worker.api is not None
+    latency, jitter = probe_latency(worker.api, name, args.delay_timeout)
+    if latency is None:
+        return Result(name=name, provider="", proto=proto, latency_ms=None,
+                      speeds_mbps=[], median_mbps=None, best_mbps=None,
+                      status="unreachable")
+
     ip: Optional[IpInfo] = None
+    if not args.no_ip:
+        try:
+            worker.select(name)
+            time.sleep(args.settle)
+            data = fetch_ip_info(worker.proxy_url, args.ip_timeout)
+            if data:
+                ip = classify_ip(data)
+        except Exception:
+            pass  # IP 画像失败不影响粗筛结论
+    return Result(name=name, provider="", proto=proto, latency_ms=latency,
+                  speeds_mbps=[], median_mbps=None, best_mbps=None,
+                  status="ok", ip=ip, jitter_ms=jitter)
+
+
+def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
+    """Phase 2 精测：对单个节点测真实带宽（严格串行调用），结果合并进 Phase 1 的 r。"""
     try:
-        worker.select(name)
+        worker.select(r.name)
         time.sleep(args.settle)
     except Exception as e:
-        return Result(name=name, provider="", proto=proto, latency_ms=latency,
-                      speeds_mbps=[], median_mbps=None, best_mbps=None,
-                      status=f"switch-failed: {e}")
+        r.status = f"switch-failed: {e}"[:160]
+        return
 
+    # --mb 未显式指定时先 ~1MB 预热估速，再自适应样本大小
+    mb = args.mb
+    max_time = args.max_time
+    if mb is None:
+        rough = warmup_speed(worker.proxy_url, min(3.0, args.max_time))
+        mb, max_time = adaptive_sample(rough, args.max_time)
+    r.sample_mb = mb
+
+    speeds: List[float] = []
+    statuses: List[str] = []
     for round_i in range(args.rounds):
-        byte_count = args.mb * 1_000_000
+        byte_count = mb * 1_000_000
         url = (DEFAULT_DOWNLOAD_URL.format(bytes=byte_count)
-               + f"&measId={int(time.time()*1000)}-w-{round_i}")
-        speed, status = curl_speed(
+               + f"&measId={int(time.time()*1000)}-p2-{round_i}")
+        speed, status, c_ms, _sz = curl_speed(
             proxy_url=worker.proxy_url,
             download_url=url,
-            max_time=args.max_time,
-            connect_timeout=min(3.0, args.max_time),
+            max_time=max_time,
+            connect_timeout=min(3.0, max_time),
         )
         statuses.append(status)
+        if r.connect_ms is None and c_ms is not None:
+            r.connect_ms = c_ms
         if speed is not None:
             speeds.append(speed)
 
-    if not args.no_ip:
-        data = fetch_ip_info(worker.proxy_url, args.ip_timeout)
-        if data:
-            ip = classify_ip(data)
+    if getattr(args, "multi", False):
+        r.multi_mbps = multi_stream_speed(worker.proxy_url, mb * 1_000_000,
+                                          max_time, min(3.0, max_time))
 
-    median = statistics.median(speeds) if speeds else None
-    best = max(speeds) if speeds else None
-    status = "ok" if speeds else ";".join(statuses)[:160]
-    return Result(name=name, provider="", proto=proto, latency_ms=latency,
-                  speeds_mbps=speeds, median_mbps=median, best_mbps=best,
-                  status=status, ip=ip)
+    r.speeds_mbps = speeds
+    r.median_mbps = statistics.median(speeds) if speeds else None
+    r.best_mbps = max(speeds) if speeds else None
+    r.status = "ok" if speeds else ";".join(statuses)[:160]
+
+
+def select_phase2_nodes(results: List[Result], top_n: int,
+                        measure_all: bool = False) -> List[Result]:
+    """Phase 2 选节点：剔除不通节点后按延迟升序，取 Top N（measure_all 时取全部连通节点）。"""
+    reachable = sorted((r for r in results if r.latency_ms is not None),
+                       key=lambda r: r.latency_ms or 0)
+    top_n = max(1, top_n)
+    return reachable if measure_all else reachable[:top_n]
+
+
+def relabel_unmeasured(r: Result) -> None:
+    """连通但未进 Phase 2 精测的节点：把「不通」标签改标为「未精测」。"""
+    if r.latency_ms is not None and "不通" in r.tags.split(","):
+        r.tags = ",".join("未精测" if t == "不通" else t
+                          for t in r.tags.split(","))
 
 
 def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args) -> List[Result]:
-    """True parallel benchmark over throwaway mihomo workers. Never touches the
-    user's running instance. Raises WorkerUnavailable to trigger fallback."""
+    """两阶段测速，从不触碰用户正在运行的实例：
+    Phase 1 用并发 worker 池粗筛（延迟/抖动/连通性/IP 画像，不跑带宽），
+    Phase 2 新建单个 worker 对 Top-N 连通节点严格串行精测真实带宽，
+    保证同一时刻全网只有一路测速下载。Raises WorkerUnavailable 触发回退。"""
     mihomo_bin = find_mihomo_bin()
     if not mihomo_bin:
         raise WorkerUnavailable("未找到 mihomo 二进制（Clash Verge 自带的 verge-mihomo）")
@@ -333,7 +380,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args) -> List
     hosts = build_hosts(selected)
 
     worker_count = max(1, min(args.workers, len(selected)))
-    print(f"启动 {worker_count} 个并发 worker（不打扰正在运行的 Clash）…")
+    print(f"Phase 1 粗筛: 启动 {worker_count} 个并发 worker"
+          f"（仅延迟/连通性/IP 画像，不下载，不打扰正在运行的 Clash）…")
 
     # Round-robin 分片，尽量均匀
     shards: List[List[dict]] = [[] for _ in range(worker_count)]
@@ -353,22 +401,19 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args) -> List
                 name = str(p.get("name"))
                 proto = str(p.get("type", ""))
                 try:
-                    r = _test_node_in_worker(worker, name, proto, args)
+                    r = _probe_node_in_worker(worker, name, proto, args)
                 except Exception as e:
                     r = Result(name=name, provider="", proto=proto, latency_ms=None,
                                speeds_mbps=[], median_mbps=None, best_mbps=None,
                                status=f"error: {e}"[:160])
-                r.score = compute_score(r)
-                r.tags = make_tags(r)
                 with results_lock:
                     results.append(r)
                     done_counter["n"] += 1
                     idx = done_counter["n"]
-                ip_brief = ""
-                if r.ip and r.ip.ok:
-                    ip_brief = f" | {r.ip.country_code or r.ip.country}·{r.ip.kind}·风险{r.ip.risk}"
-                print(f"[{idx:>3}/{total}] {name} | {fmt_ms(r.latency_ms)} ms | "
-                      f"{fmt_speed(r.median_mbps)} Mbps{ip_brief}")
+                ip_txt = f" | {ip_brief(r.ip)}" if r.ip and r.ip.ok else ""
+                jitter_brief = f"±{r.jitter_ms:.0f}" if r.jitter_ms else ""
+                print(f"Phase 1 粗筛 [{idx:>3}/{total}] {name} | "
+                      f"{fmt_ms(r.latency_ms)}{jitter_brief} ms{ip_txt}")
         finally:
             worker.stop()
 
@@ -393,6 +438,64 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args) -> List
     except KeyboardInterrupt:
         print("\n\n收到 Ctrl+C，停止测速（worker 均为临时进程，正在清理）……")
         raise
-    elapsed = time.time() - started
-    print(f"并发测速完成，耗时 {elapsed:.1f}s（{total} 节点 × {worker_count} workers）")
+    print(f"Phase 1 粗筛完成，耗时 {time.time() - started:.1f}s"
+          f"（{total} 节点 × {worker_count} workers）")
+
+    # Phase 2 选节点：剔除不通节点后按延迟升序，取 Top N（--all 时取全部连通节点）
+    chosen = select_phase2_nodes(results, getattr(args, "top_n", 15),
+                                 getattr(args, "all", False))
+
+    if not chosen:
+        print("Phase 2 精测: 没有连通节点，跳过带宽精测。")
+    else:
+        scope = "全部" if getattr(args, "all", False) else f"Top {len(chosen)}"
+        print(f"Phase 2 精测: {scope} {len(chosen)} 个节点，单 worker 严格串行"
+              f"（同一时刻只有一路测速下载）…")
+        chosen_proxies = [by_name[r.name] for r in chosen if r.name in by_name]
+        worker2: Optional[Worker] = None
+        try:
+            worker2 = Worker(mihomo_bin, chosen_proxies, hosts, iface)
+            worker2.start()
+        except Exception as e:
+            print(f"⚠️ Phase 2 worker 启动失败，保留 Phase 1 粗筛结果: {e}",
+                  file=sys.stderr)
+            worker2 = None
+        if worker2 is not None:
+            try:
+                for i, r in enumerate(chosen, 1):
+                    try:
+                        _speed_node_in_worker(worker2, r, args)
+                    except Exception as e:
+                        r.status = f"error: {e}"[:160]
+                    r.score = compute_score(r)
+                    r.tags = make_tags(r)
+                    ip_txt = f" | {ip_brief(r.ip)}" if r.ip and r.ip.ok else ""
+                    multi_brief = f" / {r.multi_mbps:.0f}" if r.multi_mbps else ""
+                    mb_brief = f"（{r.sample_mb}MB 样本）" if r.sample_mb else ""
+                    print(f"Phase 2 精测 [{i:>3}/{len(chosen)}] {r.name} | "
+                          f"{fmt_ms(r.latency_ms)} ms | "
+                          f"{fmt_speed(r.median_mbps)}{multi_brief} Mbps"
+                          f"{mb_brief}{ip_txt}")
+            except KeyboardInterrupt:
+                # 保留已完成的精测结果，继续走报告
+                print("\n\n收到 Ctrl+C，停止精测（保留已完成结果，正在清理 worker）……")
+            finally:
+                worker2.stop()
+
+    # 汇总打分/标签：Phase 2 节点已算分；连通但未精测的标「未精测」而非「不通」
+    measured = {r.name for r in chosen}
+    for r in results:
+        if r.name in measured:
+            continue
+        r.score = compute_score(r)
+        r.tags = make_tags(r)
+        relabel_unmeasured(r)
+
+    sample_desc = f"{args.mb}MB" if args.mb else "自适应10~95MB"
+    if getattr(args, "multi", False):
+        sample_desc += " + 4路峰值"
+    scope = f"全部 {len(chosen)}" if getattr(args, "all", False) else f"Top {len(chosen)}"
+    args.mode_summary = (f"两阶段：Phase1 {total} 节点并发粗筛 → "
+                         f"Phase2 {scope} 节点串行精测（{sample_desc} ×{args.rounds} 轮）")
+    print(f"两阶段测速完成，总耗时 {time.time() - started:.1f}s")
     return results

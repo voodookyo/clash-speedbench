@@ -6,7 +6,7 @@ Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速
 - Measures per-node latency with Mihomo's /delay API
 - Temporarily switches Mihomo to GLOBAL mode for real download tests
 - Downloads through the running mixed-port with curl
-- Fetches exit-IP profile per node via ip-api.com (ASN/国家/ISP/住宅或机房/风险)
+- Fetches exit-IP profile per node via ip-api.com (ASN/国家/ISP/机房托管·移动·代理标记)
 - Restores the original mode and proxy selections on exit
 - Renders a star-rated box table and writes a CSV report
 
@@ -29,6 +29,7 @@ import sys
 import time
 import unicodedata
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -167,8 +168,12 @@ class IpInfo:
     isp: str = ""
     org: str = ""
     asn: str = ""           # 例如 "AS13335 Cloudflare, Inc."
-    kind: str = ""          # 住宅 / 机房 / 移动 / 代理/VPN
-    risk: str = ""          # 低 / 中 / 高
+    asname: str = ""        # 例如 "CLOUDFLARENET"
+    kind: str = ""          # 代理/VPN / 机房托管 / 移动网络 / ISP/非托管 / 未知
+    # ip-api 原始布尔标记：仅表示"被识别为"，全 false 不等于住宅，故如实保留
+    proxy: bool = False
+    hosting: bool = False
+    mobile: bool = False
     ok: bool = False
 
 
@@ -185,6 +190,10 @@ class Result:
     ip: Optional[IpInfo] = None
     score: float = 0.0
     tags: str = ""
+    jitter_ms: Optional[float] = None    # 延迟抖动（多次延迟采样的标准差）
+    connect_ms: Optional[float] = None   # TCP+TLS 建连耗时（curl time_appconnect）
+    multi_mbps: Optional[float] = None   # 4 路并发流合计峰值带宽（--multi）
+    sample_mb: Optional[int] = None      # 实际带宽样本大小 MB（自适应时逐节点不同）
 
 
 def detect_controller(secret: str, explicit: Optional[str]) -> Tuple[str, bool]:
@@ -300,10 +309,12 @@ def restore_groups(api: MihomoAPI, saved: Dict[str, Tuple[str, Optional[str]]]) 
 
 
 def curl_speed(proxy_url: str, download_url: str, max_time: float,
-               connect_timeout: float) -> Tuple[Optional[float], str]:
+               connect_timeout: float) -> Tuple[Optional[float], str, Optional[float], float]:
     """
-    Returns Mbps, status.
-    curl speed_download is bytes/sec.
+    返回 (Mbps, status, connect_ms, size_mb)。curl speed_download 单位是 bytes/sec。
+    有效样本严格判定：returncode 为 0 或 28（max-time 截断）、http_code==200、
+    且下载量 >= 256KB；其余一律记为失败并在 status 里注明原因。
+    connect_ms 取自 time_appconnect（TCP+TLS 建连耗时；非 TLS 时退化为 time_connect）。
     """
     cmd = [
         "curl",
@@ -314,7 +325,9 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
         "--location",
         "--connect-timeout", str(connect_timeout),
         "--max-time", str(max_time),
-        "--write-out", "%{speed_download}\t%{time_total}\t%{size_download}",
+        "--write-out",
+        "%{speed_download}\t%{time_total}\t%{size_download}\t%{http_code}"
+        "\t%{time_connect}\t%{time_appconnect}\t%{time_starttransfer}",
         download_url,
     ]
     try:
@@ -322,28 +335,100 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
     except FileNotFoundError:
         raise RuntimeError("未找到 curl。macOS 自带 curl；Windows 10/11 通常也自带 curl。")
     except subprocess.TimeoutExpired:
-        return None, "curl-timeout"
+        return None, "curl-timeout", None, 0.0
 
-    # curl code 28 means max-time reached; this can still be a valid throughput sample.
     text = (p.stdout or "").strip()
     parts = text.split("\t")
-    if len(parts) != 3:
+    if len(parts) != 7:
         err = (p.stderr or "").strip().replace("\n", " ")[:120]
-        return None, f"curl-{p.returncode}: {err}"
+        return None, f"curl-{p.returncode}: {err}", None, 0.0
 
     try:
         speed_Bps = float(parts[0])
         size_B = float(parts[2])
+        http_code = int(parts[3])
+        t_connect = float(parts[4])
+        t_appconnect = float(parts[5])
     except ValueError:
-        return None, "parse-error"
+        return None, "parse-error", None, 0.0
 
-    # Accept partial downloads caused by our time cap if enough bytes were transferred.
+    size_mb = size_B / 1_000_000
+    tls_s = t_appconnect if t_appconnect > 0 else t_connect
+    connect_ms: Optional[float] = round(tls_s * 1000, 1) if tls_s > 0 else None
+
+    if p.returncode not in (0, 28):
+        err = (p.stderr or "").strip().replace("\n", " ")[:120]
+        return None, f"curl-{p.returncode}: {err}", connect_ms, size_mb
+    if http_code != 200:
+        return None, f"http-{http_code}", connect_ms, size_mb
+    # 下载量太少的样本不可信（对端提前断流、劫持返回小页面等）
     if speed_Bps <= 0 or size_B < 256 * 1024:
         err = (p.stderr or "").strip().replace("\n", " ")[:120]
-        return None, f"no-data: {err}"
+        return None, f"no-data: {err}" if err else "no-data", connect_ms, size_mb
 
     mbps = speed_Bps * 8 / 1_000_000
-    return mbps, "ok"
+    return mbps, "ok", connect_ms, size_mb
+
+
+WARMUP_BYTES = 1_000_000  # ~1MB 预热请求，用于估粗速度
+
+
+def warmup_speed(proxy_url: str, connect_timeout: float) -> Optional[float]:
+    """~1MB 轻量下载估粗速度（Mbps），供自适应样本大小参考；失败返回 None。"""
+    url = (DEFAULT_DOWNLOAD_URL.format(bytes=WARMUP_BYTES)
+           + f"&measId=warmup-{int(time.time()*1000)}")
+    mbps, _, _, _ = curl_speed(proxy_url, url, max_time=5.0,
+                               connect_timeout=connect_timeout)
+    return mbps
+
+
+def adaptive_sample(rough_mbps: Optional[float],
+                    base_max_time: float) -> Tuple[int, float]:
+    """按粗速度选自适应样本大小与单轮时限，返回 (样本 MB, max_time)。
+    目标单次样本持续 2-4 秒；时限在 --max-time 基础上最多放宽到 6s
+    （用户显式指定更大的 --max-time 时以用户为准）。"""
+    if rough_mbps is None or rough_mbps <= 0:
+        return 10, base_max_time
+    if rough_mbps < 20:
+        mb = 10
+    elif rough_mbps < 100:
+        mb = 30
+    elif rough_mbps < 300:
+        mb = 60
+    else:
+        mb = 95
+    est = mb * 8 / rough_mbps  # 按粗速度预计的下载秒数
+    return mb, max(base_max_time, min(6.0, est * 1.25))
+
+
+def multi_stream_speed(proxy_url: str, byte_count: int, max_time: float,
+                       connect_timeout: float, streams: int = 4) -> Optional[float]:
+    """同一节点 streams 路并发 curl，合计带宽 Mbps（峰值参考）；全部失败返回 None。"""
+    def one(i: int) -> Optional[float]:
+        url = (DEFAULT_DOWNLOAD_URL.format(bytes=byte_count)
+               + f"&measId=multi-{int(time.time()*1000)}-{i}")
+        mbps, _, _, _ = curl_speed(proxy_url, url, max_time, connect_timeout)
+        return mbps
+
+    with ThreadPoolExecutor(max_workers=streams) as pool:
+        speeds = [s for s in pool.map(one, range(streams)) if s is not None]
+    return round(sum(speeds), 3) if speeds else None
+
+
+def probe_latency(api: MihomoAPI, name: str, timeout_ms: int,
+                  count: int = 3) -> Tuple[Optional[int], Optional[float]]:
+    """多次延迟采样（首个样本兼作预热，遇失败即停止），
+    返回 (中位延迟 ms, 抖动=样本标准差 ms)；完全不通返回 (None, None)。"""
+    vals: List[float] = []
+    for _ in range(max(1, count)):
+        d = api.proxy_delay(name, DEFAULT_DELAY_URL, timeout_ms)
+        if d is None:
+            break
+        vals.append(float(d))
+    if not vals:
+        return None, None
+    jitter = statistics.stdev(vals) if len(vals) > 1 else 0.0
+    return int(round(statistics.median(vals))), round(jitter, 1)
 
 
 def fetch_ip_info(proxy_url: str, timeout: float) -> Optional[dict]:
@@ -375,27 +460,34 @@ def classify_ip(data: dict) -> IpInfo:
     proxy = bool(data.get("proxy"))
     hosting = bool(data.get("hosting"))
     mobile = bool(data.get("mobile"))
+    isp = str(data.get("isp", ""))
+    org = str(data.get("org", ""))
     if proxy:
         kind = "代理/VPN"
     elif hosting:
-        kind = "机房"
+        kind = "机房托管"
     elif mobile:
-        kind = "移动"
+        kind = "移动网络"
+    elif isp or org:
+        # 三个标记全 false 只表示"未被识别为代理/机房/移动"，
+        # 可能是家庭宽带也可能是企业/校园网等，不能断言住宅，故记中性的 ISP/非托管
+        kind = "ISP/非托管"
     else:
-        kind = "住宅"
-    risk_score = (50 if proxy else 0) + (40 if hosting else 0) + (15 if mobile else 0)
-    risk = "高" if risk_score >= 50 else "中" if risk_score >= 30 else "低"
+        kind = "未知"
     return IpInfo(
         exit_ip=str(data.get("query", "")),
         country=str(data.get("country", "")),
         country_code=str(data.get("countryCode", "")),
         region=str(data.get("regionName", "")),
         city=str(data.get("city", "")),
-        isp=str(data.get("isp", "")),
-        org=str(data.get("org", "")),
+        isp=isp,
+        org=org,
         asn=str(data.get("as", "")),
+        asname=str(data.get("asname", "")),
         kind=kind,
-        risk=risk,
+        proxy=proxy,
+        hosting=hosting,
+        mobile=mobile,
         ok=True,
     )
 
@@ -417,17 +509,28 @@ def bandwidth_score(mbps: Optional[float]) -> float:
     return min(mbps, 100.0) / 100 * 100
 
 
-RISK_SCORE = {"低": 100.0, "中": 55.0, "高": 15.0}
+def ip_flag_score(ip: Optional[IpInfo]) -> float:
+    """IP 画像分项（启发式扣分，不是真实风险库评分）：
+    proxy 标记→30、hosting 标记→55、mobile 标记→80、无标记/查询失败/未知→100。
+    仅反映"代理/机房出口通常更可能被风控"的经验倾向，不代表该 IP 的真实风险等级。"""
+    if not ip or not ip.ok:
+        return 100.0
+    if ip.proxy:
+        return 30.0
+    if ip.hosting:
+        return 55.0
+    if ip.mobile:
+        return 80.0
+    return 100.0
 
 
 def compute_score(r: Result) -> float:
-    """综合评分 0-100：带宽 55% + 延迟 25% + IP 风险 20%。不通的节点为 0。"""
+    """综合评分 0-100：带宽 55% + 延迟 25% + IP 标记 20%。不通的节点为 0。"""
     bw = bandwidth_score(r.median_mbps)
     if bw == 0.0:
         return 0.0
     lat = latency_score(r.latency_ms)
-    risk = RISK_SCORE.get(r.ip.risk, 50.0) if r.ip and r.ip.ok else 50.0
-    return round(0.55 * bw + 0.25 * lat + 0.20 * risk, 1)
+    return round(0.55 * bw + 0.25 * lat + 0.20 * ip_flag_score(r.ip), 1)
 
 
 def star_str(score: float) -> str:
@@ -451,14 +554,12 @@ def make_tags(r: Result) -> str:
         if r.latency_ms is not None and r.latency_ms > 300:
             tags.append("高延迟")
     if r.ip and r.ip.ok:
-        if r.ip.kind == "住宅":
-            tags.append("住宅IP")
-        elif r.ip.kind == "机房":
-            tags.append("机房IP")
+        if r.ip.kind == "ISP/非托管":
+            tags.append("ISP/非托管")
+        elif r.ip.kind == "机房托管":
+            tags.append("机房托管")
         elif r.ip.kind == "代理/VPN":
             tags.append("脏IP")
-        if r.ip.risk == "高":
-            tags.append("高风险")
     return ",".join(tags)
 
 
@@ -468,6 +569,13 @@ def fmt_ms(v: Optional[int]) -> str:
 
 def fmt_speed(v: Optional[float]) -> str:
     return "-" if v is None else f"{v:.1f}"
+
+
+def ip_brief(ip: IpInfo) -> str:
+    """终端 IP 画像简写：国家代码·类型·AS 名（无 AS 名时退化为 ISP 简写）。"""
+    cc = ip.country_code or ip.country or "?"
+    net = ip.asname or ip.isp[:16]
+    return f"{cc}·{ip.kind}·{net}" if net else f"{cc}·{ip.kind}"
 
 
 def disp_width(s: str) -> int:
@@ -502,17 +610,22 @@ def print_speedbench(results: List[Result], top: int) -> None:
     ranked = rank_results(results)
     shown = ranked[:top] if top > 0 else ranked
 
-    headers = ["节点", "延迟", "带宽", "评分", "IP画像", "标签"]
+    headers = ["节点", "延迟", "抖动", "建连", "带宽", "评分", "IP画像", "标签"]
 
     def row_of(r: Result) -> List[str]:
-        ip_desc = "-"
-        if r.ip and r.ip.ok:
-            cc = r.ip.country_code or r.ip.country
-            ip_desc = f"{cc}·{r.ip.kind}·风险{r.ip.risk}"
+        ip_desc = ip_brief(r.ip) if r.ip and r.ip.ok else "-"
+        if r.median_mbps is None:
+            bw = "-"
+        elif r.multi_mbps:
+            bw = f"{r.median_mbps:.1f} / {r.multi_mbps:.0f}Mbps"
+        else:
+            bw = f"{r.median_mbps:.1f}Mbps"
         return [
             r.name,
             "-" if r.latency_ms is None else f"{r.latency_ms}ms",
-            "-" if r.median_mbps is None else f"{r.median_mbps:.1f}Mbps",
+            "-" if r.jitter_ms is None else f"{r.jitter_ms:.1f}ms",
+            "-" if r.connect_ms is None else f"{r.connect_ms:.0f}ms",
+            bw,
             star_str(r.score),
             ip_desc,
             r.tags or "-",
@@ -542,33 +655,41 @@ def print_speedbench(results: List[Result], top: int) -> None:
     for row in rows:
         print(line(row))
     print(hline("└", "┴", "┘"))
-    print("  延迟测速 │ 带宽测速 │ IP质量 │ 综合评分 = 带宽55% + 延迟25% + IP风险20%")
+    print("  延迟/抖动/建连单位 ms │ 带宽 = 单流 Mbps（/ 后为 --multi 4 路合计峰值） │ 评分 = 带宽55% + 延迟25% + IP标记20%（启发式扣分，非风险评分）")
 
 
 def write_csv(results: List[Result], path: Path) -> None:
     ranked = rank_results(results)
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["rank", "name", "provider", "protocol", "latency_ms",
-                    "median_mbps", "best_mbps", "all_samples_mbps",
-                    "score", "stars", "tags",
-                    "exit_ip", "country", "asn", "isp", "org", "ip_kind", "ip_risk",
-                    "status"])
+        w.writerow(["rank", "name", "provider", "protocol", "latency_ms", "jitter_ms",
+                    "connect_ms", "median_mbps", "multi_mbps", "best_mbps", "sample_mb",
+                    "all_samples_mbps", "score", "stars", "tags",
+                    "exit_ip", "country", "asn", "asname", "isp", "org",
+                    "ip_kind", "ip_flags", "status"])
         for rank, r in enumerate(ranked, 1):
             ip = r.ip if r.ip and r.ip.ok else IpInfo()
+            ip_flags = "|".join(f for f, on in (("proxy", ip.proxy),
+                                                ("hosting", ip.hosting),
+                                                ("mobile", ip.mobile)) if on)
             w.writerow([
                 rank,
                 r.name,
                 r.provider,
                 r.proto,
                 "" if r.latency_ms is None else r.latency_ms,
+                "" if r.jitter_ms is None else f"{r.jitter_ms:.1f}",
+                "" if r.connect_ms is None else f"{r.connect_ms:.1f}",
                 "" if r.median_mbps is None else f"{r.median_mbps:.3f}",
+                "" if r.multi_mbps is None else f"{r.multi_mbps:.3f}",
                 "" if r.best_mbps is None else f"{r.best_mbps:.3f}",
+                "" if r.sample_mb is None else r.sample_mb,
                 "|".join(f"{x:.3f}" for x in r.speeds_mbps),
                 f"{r.score:.1f}",
                 star_str(r.score),
                 r.tags,
-                ip.exit_ip, ip.country, ip.asn, ip.isp, ip.org, ip.kind, ip.risk,
+                ip.exit_ip, ip.country, ip.asn, ip.asname, ip.isp, ip.org,
+                ip.kind, ip_flags,
                 r.status,
             ])
 
@@ -580,8 +701,12 @@ def result_to_dict(r: Result) -> dict:
         "provider": r.provider,
         "proto": r.proto,
         "latency_ms": r.latency_ms,
+        "jitter_ms": r.jitter_ms,
+        "connect_ms": r.connect_ms,
         "median_mbps": None if r.median_mbps is None else round(r.median_mbps, 3),
+        "multi_mbps": None if r.multi_mbps is None else round(r.multi_mbps, 3),
         "best_mbps": None if r.best_mbps is None else round(r.best_mbps, 3),
+        "sample_mb": r.sample_mb,
         "samples_mbps": [round(x, 3) for x in r.speeds_mbps],
         "score": r.score,
         "stars": star_str(r.score),
@@ -590,12 +715,14 @@ def result_to_dict(r: Result) -> dict:
         "ip": {
             "exit_ip": ip.exit_ip, "country": ip.country, "country_code": ip.country_code,
             "region": ip.region, "city": ip.city, "isp": ip.isp, "org": ip.org,
-            "asn": ip.asn, "kind": ip.kind, "risk": ip.risk, "ok": ip.ok,
+            "asn": ip.asn, "asname": ip.asname, "kind": ip.kind,
+            "proxy": ip.proxy, "hosting": ip.hosting, "mobile": ip.mobile,
+            "ok": ip.ok,
         },
     }
 
 
-def append_history(results: List[Result], path: Path, mb: int, rounds: int,
+def append_history(results: List[Result], path: Path, mb: Optional[int], rounds: int,
                    csv_path: Optional[Path]) -> None:
     record = {
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -652,13 +779,18 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
     if not results:
         print("没有产生有效测速结果。")
         return 0
+    summary = getattr(args, "mode_summary", "")
+    if summary:
+        print(f"\n本次模式: {summary}")
     print_speedbench(results, args.top)
     out = Path(args.output) if args.output else Path(
         f"clash-speedtest-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
     )
     write_csv(results, out)
     print(f"\nCSV 已保存: {out.resolve()}")
-    print("排序规则：按综合评分（带宽 55% + 延迟 25% + IP 风险 20%）从高到低。")
+    print("排序规则：按综合评分（带宽 55% + 延迟 25% + IP 标记 20%）从高到低。")
+    if any("未精测" in (r.tags or "") for r in results):
+        print("注：「未精测」节点仅完成 Phase 1 粗筛（延迟/连通性/IP 画像），未参与带宽精测。")
     if not args.no_history:
         append_history(results, Path(args.history), args.mb, args.rounds, out)
     if args.auto_switch:
@@ -669,7 +801,7 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速（延迟 + 真实带宽 + IP 纯净度）"
+        description="Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速（延迟 + 真实带宽 + IP 画像）"
     )
     parser.add_argument("--controller",
                         help="External Controller，例如 http://127.0.0.1:9097 或 unix:///tmp/verge/verge-mihomo.sock")
@@ -679,11 +811,12 @@ def main() -> int:
     parser.add_argument("--exclude", default=r"(?i)(剩余|流量|到期|官网|套餐|公告|倍率|traffic|expire)",
                         help="排除名称匹配此正则的节点")
     parser.add_argument("--provider", help="只测试指定 provider-name（精确匹配）")
-    parser.add_argument("--mb", type=int, default=30,
-                        help="单轮请求数据量 MB，默认 30；Cloudflare 公共端点不建议设得过大")
+    parser.add_argument("--mb", type=int, default=None,
+                        help="单轮请求数据量 MB（1~95）；不指定时先 ~1MB 预热估速，"
+                             "再自适应 10/30/60/95MB（目标单样本 2-4 秒）")
     parser.add_argument("--rounds", type=int, default=1, help="每节点测速轮数，默认 1")
     parser.add_argument("--max-time", type=float, default=4.0,
-                        help="每轮下载最长秒数，默认 4")
+                        help="每轮下载最长秒数，默认 4（自适应模式下最多放宽到 6s）")
     parser.add_argument("--settle", type=float, default=0.35,
                         help="切换节点后等待秒数，默认 0.35")
     parser.add_argument("--delay-timeout", type=int, default=5000,
@@ -709,19 +842,28 @@ def main() -> int:
     parser.add_argument("--no-history", action="store_true",
                         help="不写入历史记录")
     parser.add_argument("--workers", type=int, default=6,
-                        help="并发 worker 数（起多个临时 mihomo 实例并行测速，不影响运行中的 Clash）；"
+                        help="并发 worker 数（起多个临时 mihomo 实例并行粗筛，不影响运行中的 Clash）；"
                              "1=关闭并发，回退到串行 GLOBAL 切换模式。默认 6")
+    parser.add_argument("--top-n", type=int, default=15,
+                        help="两阶段模式：Phase 2 只对延迟最优的前 N 个连通节点串行精测带宽，默认 15")
+    parser.add_argument("--all", action="store_true",
+                        help="两阶段模式：跳过 Top-N 筛选，Phase 2 对所有连通节点串行精测")
+    parser.add_argument("--multi", action="store_true",
+                        help="精测阶段对每节点追加 4 路并发流测峰值带宽（记入 multi_mbps，多耗 4 倍样本流量）")
     parser.add_argument("--config-file", default="",
                         help="并发模式用的完整配置文件路径（含节点凭据），默认自动找 Clash Verge 的运行配置")
     parser.add_argument("--yes", action="store_true",
                         help="不询问确认直接开始")
     args = parser.parse_args()
 
-    if args.mb < 1 or args.mb > 95:
+    if args.mb is not None and (args.mb < 1 or args.mb > 95):
         print("错误：--mb 建议范围 1~95。", file=sys.stderr)
         return 2
     if args.rounds < 1 or args.rounds > 5:
         print("错误：--rounds 建议范围 1~5。", file=sys.stderr)
+        return 2
+    if args.top_n < 1:
+        print("错误：--top-n 至少为 1。", file=sys.stderr)
         return 2
 
     try:
@@ -768,11 +910,22 @@ def main() -> int:
                   file=sys.stderr)
             return 1
         proto_by_name = {n: str(info.get("type", "")) for n, info in leaves.items()}
-        print("Clash SpeedBench（并发 worker 模式，不影响正在运行的 Clash）")
+        if args.mb:
+            sample_desc = f"{args.mb} MB"
+            max_mb = args.mb
+        else:
+            sample_desc = "自适应 10~95 MB（~1MB 预热估速）"
+            max_mb = 95
+        n_phase2 = len(candidates) if args.all else min(args.top_n, len(candidates))
+        est_mb = max_mb * args.rounds * n_phase2 * (5 if args.multi else 1)
+        print("Clash SpeedBench（两阶段并发模式，不影响正在运行的 Clash）")
         print(f"候选节点: {len(candidates)}")
-        print(f"测速参数: {args.mb} MB × {args.rounds} 轮/节点，单轮最长 {args.max_time:g}s"
+        print(f"流程: Phase 1 并发粗筛（延迟/连通性/IP 画像，不跑带宽） → "
+              f"Phase 2 {'全部' if args.all else f'Top {n_phase2}'} 串行精测带宽")
+        print(f"测速参数: {sample_desc} × {args.rounds} 轮/节点，单轮最长 {args.max_time:g}s"
+              + ("，追加 4 路并发峰值" if args.multi else "")
               + ("，含出口 IP 画像" if not args.no_ip else "，已跳过 IP 画像"))
-        print(f"理论最大流量消耗约: {args.mb * args.rounds * len(candidates) / 1024:.2f} GiB")
+        print(f"理论最大流量消耗约: {est_mb / 1024:.2f} GiB（仅 Phase 2 精测节点消耗带宽）")
         if not args.yes:
             ans = input("\n开始测速？[Y/n] ").strip().lower()
             if ans not in ("", "y", "yes"):
@@ -814,8 +967,16 @@ def main() -> int:
         return 1
 
     original_mode = str(config.get("mode", "rule")).lower()
-    data_per_node = args.mb * args.rounds
+    if args.mb:
+        sample_desc = f"{args.mb} MB"
+        max_mb = args.mb
+    else:
+        sample_desc = "自适应 10~95 MB（~1MB 预热估速）"
+        max_mb = 95  # 自适应上限，用于流量估算
+    data_per_node = max_mb * args.rounds * (5 if args.multi else 1)
     total_max_mb = data_per_node * len(candidates)
+    args.mode_summary = (f"串行模式：单实例逐节点全测（{sample_desc} ×{args.rounds} 轮"
+                         + (" + 4 路并发峰值" if args.multi else "") + "）")
 
     print("Clash SpeedBench")
     print(f"Mihomo: {version.get('version', version)}")
@@ -825,7 +986,8 @@ def main() -> int:
     print(f"候选节点: {len(candidates)}")
     if skipped_no_path:
         print(f"无法从 {root} 到达、将跳过: {len(skipped_no_path)} 个")
-    print(f"测速参数: {args.mb} MB × {args.rounds} 轮/节点，单轮最长 {args.max_time:g}s"
+    print(f"测速参数: {sample_desc} × {args.rounds} 轮/节点，单轮最长 {args.max_time:g}s"
+          + ("，追加 4 路并发峰值" if args.multi else "")
           + ("，含出口 IP 画像" if not args.no_ip else "，已跳过 IP 画像"))
     print(f"理论最大流量消耗约: {total_max_mb / 1024:.2f} GiB")
     print("注意：测速期间 Mihomo 会临时切换到 GLOBAL 模式；脚本结束或 Ctrl+C 后会尝试自动恢复。")
@@ -869,23 +1031,38 @@ def main() -> int:
                 results.append(res)
                 continue
 
-            latency = api.proxy_delay(name, DEFAULT_DELAY_URL, args.delay_timeout)
+            latency, jitter = probe_latency(api, name, args.delay_timeout)
+
+            # 带宽采样：--mb 未显式指定时先 ~1MB 预热估速，再自适应样本大小
+            mb = args.mb
+            max_time = args.max_time
+            if mb is None:
+                rough = warmup_speed(proxy_url, min(3.0, args.max_time))
+                mb, max_time = adaptive_sample(rough, args.max_time)
 
             speeds = []
             statuses = []
+            connect_ms = None
             for round_i in range(args.rounds):
                 # Add cache-busting measId even though Cloudflare's __down is dynamic.
-                byte_count = args.mb * 1_000_000
+                byte_count = mb * 1_000_000
                 url = DEFAULT_DOWNLOAD_URL.format(bytes=byte_count) + f"&measId={int(time.time()*1000)}-{idx}-{round_i}"
-                speed, status = curl_speed(
+                speed, st, c_ms, _sz = curl_speed(
                     proxy_url=proxy_url,
                     download_url=url,
-                    max_time=args.max_time,
-                    connect_timeout=min(3.0, args.max_time),
+                    max_time=max_time,
+                    connect_timeout=min(3.0, max_time),
                 )
-                statuses.append(status)
+                statuses.append(st)
+                if connect_ms is None and c_ms is not None:
+                    connect_ms = c_ms
                 if speed is not None:
                     speeds.append(speed)
+
+            multi = None
+            if args.multi:
+                multi = multi_stream_speed(proxy_url, mb * 1_000_000, max_time,
+                                           min(3.0, max_time))
 
             median = statistics.median(speeds) if speeds else None
             best = max(speeds) if speeds else None
@@ -909,18 +1086,21 @@ def main() -> int:
                 best_mbps=best,
                 status=status,
                 ip=ip,
+                jitter_ms=jitter,
+                connect_ms=connect_ms,
+                multi_mbps=multi,
+                sample_mb=mb,
             )
             res.score = compute_score(res)
             res.tags = make_tags(res)
             results.append(res)
 
-            ip_brief = ""
-            if ip and ip.ok:
-                ip_brief = f" | {ip.country_code or ip.country}·{ip.kind}·风险{ip.risk}"
+            ip_txt = f" | {ip_brief(ip)}" if ip and ip.ok else ""
+            multi_brief = f" / {multi:.0f}" if multi else ""
             print(
                 f"[{idx:>3}/{len(candidates)}] "
                 f"{name} | {fmt_ms(latency)} ms | "
-                f"{fmt_speed(median)} Mbps{ip_brief}"
+                f"{fmt_speed(median)}{multi_brief} Mbps（{mb}MB）{ip_txt}"
             )
 
     except KeyboardInterrupt:

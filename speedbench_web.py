@@ -226,7 +226,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <h1>⚡ Clash SpeedBench <button class="mini" style="float:right" onclick="quitPanel()">停止面板</button></h1>
-<div class="sub">延迟 + 真实带宽 + IP 纯净度 + 综合评分 · 本地面板（127.0.0.1）<span id="cur-line"></span></div>
+<div class="sub">延迟 + 真实带宽 + IP 画像 + 综合评分 · 本地面板（127.0.0.1）<span id="cur-line"></span></div>
 
 <div class="card">
   <div class="controls">
@@ -276,23 +276,39 @@ function tagHtml(tags){
   if(!tags) return '-';
   return tags.split(',').map(t=>{
     let cls='tag';
-    if(/不通|龟速|脏IP|高风险|高延迟/.test(t)) cls+=' bad';
-    if(/低延迟|高带宽|住宅/.test(t)) cls+=' good';
+    if(/不通|龟速|脏IP|高延迟/.test(t)) cls+=' bad';
+    if(/低延迟|高带宽|ISP\/非托管/.test(t)) cls+=' good';
     return `<span class="${cls}">${esc(t)}</span>`;
   }).join('');
 }
 
+// 旧历史记录的 kind 取值（住宅/机房/移动）映射到新口径，保证老数据不崩
+const KIND_ALIAS = {'住宅':'ISP/非托管','住宅IP':'ISP/非托管','机房':'机房托管','移动':'移动网络'};
+function normKind(ip){
+  const k = (ip && ip.kind) || '';
+  return KIND_ALIAS[k] || k || '未知';
+}
+
 function ipHtml(ip){
   if(!ip || !ip.ok) return '-';
-  return `${esc(ip.country_code||ip.country)}·${esc(ip.kind)}·风险${esc(ip.risk)}`;
+  let h = `${esc(ip.country_code||ip.country||'?')}·${esc(normKind(ip))}`;
+  const badges = [];
+  if(ip.proxy)   badges.push('<span class="tag bad">代理</span>');
+  if(ip.hosting) badges.push('<span class="tag bad">托管</span>');
+  if(ip.mobile)  badges.push('<span class="tag">移动</span>');
+  return badges.length ? h + ' ' + badges.join('') : h;
 }
 
 let latestData = null;
 let sortKey = 'score', sortAsc = false;
 let currentNode = '', currentGroup = '';
 
+// IP 列按类型固定优先级排序：ISP/非托管 > 移动网络 > 机房托管 > 代理/VPN > 未知。
+// 数值越大排越前（表格默认降序，与评分列习惯一致）；未识别的旧值按"未知"处理；
+// 查询失败（无 ip 或 !ok）返回 null，由排序逻辑统一沉底
+const KIND_RANK = {'ISP/非托管':4,'移动网络':3,'机房托管':2,'代理/VPN':1,'未知':0};
 function sortVal(r, k){
-  if(k==='ip'){ const ip=r.ip; return (ip&&ip.ok)?(100-(+ip.risk||0)):null; }
+  if(k==='ip'){ const ip=r.ip; return (ip&&ip.ok)?(KIND_RANK[normKind(ip)]??0):null; }
   return r[k];
 }
 
