@@ -18,11 +18,18 @@ Key tricks (validated against Clash Verge Rev + TUN on macOS):
   the `proxies` list via macOS's built-in ruby (YAML -> JSON), no pip needed.
 - Worker configs are written as JSON (valid YAML) with three test domains pinned
   in `hosts` — the main instance's TUN DNS hijack would otherwise return fake-ips.
-- Every proxy gets `interface-name: <physical if>` so worker dials bypass the
-  main TUN (verified: no double-hop through the running instance).
+- Selected nodes are expanded with their `dialer-proxy` dependency closure, so
+  relay nodes whose entry node lives outside the shard stay dialable.
+- Worker configs set a global top-level `interface-name: <physical if>` so worker
+  dials bypass the main TUN; a node's own `interface-name` still takes
+  precedence (mihomo only falls back to the global default when the per-proxy
+  option is unset — see component/dialer), so deliberate per-node settings are
+  never overridden.
 
 Anything missing (ruby / binary / config / DoH) -> WorkerUnavailable, and the
-caller falls back to the sequential in-place mode.
+caller falls back to the sequential in-place mode. A default route that already
+lives on a virtual interface (global TUN / other VPN) raises VirtualDefaultRoute
+(a WorkerUnavailable subclass) and takes the same fallback.
 """
 
 from __future__ import annotations
@@ -63,6 +70,11 @@ from clash_speedbench import (
 
 class WorkerUnavailable(RuntimeError):
     pass
+
+
+class VirtualDefaultRoute(WorkerUnavailable):
+    """默认路由落在虚拟隧道接口（全局 TUN/其他 VPN）时抛出：worker 模式拒绝启动。
+    继承 WorkerUnavailable，main() 走同一条「并发不可用 -> 回退串行」路径。"""
 
 
 MIHOMO_BIN_CANDIDATES = (
@@ -127,6 +139,33 @@ def extract_proxies(config_path: str) -> List[dict]:
     return proxies
 
 
+def with_dependencies(selected: List[dict], all_proxies: List[dict]) -> List[dict]:
+    """把入选节点的 dialer-proxy 链式依赖闭包并进来。
+    mihomo 的链式代理（dialer-proxy: 前置节点名）要求前置节点出现在同一份
+    配置的 proxies 里，否则该节点无法拨号（主 Clash 能用、这里误报不通）。
+    返回新列表：入选节点保持原顺序在前，依赖节点按发现顺序追加在后；
+    visited 集合负责去重并防御循环依赖（A -> B -> A）。不改动入参。"""
+    by_name = {p.get("name"): p for p in all_proxies
+               if isinstance(p, dict) and p.get("name")}
+    merged: List[dict] = []
+    visited: set = set()
+    # 第一遍先收齐入选节点（保持原顺序，去重）
+    for p in selected:
+        if isinstance(p, dict) and p.get("name") not in visited:
+            visited.add(p.get("name"))
+            merged.append(p)
+    # 第二遍沿 merged 逐节点补 dialer-proxy 链；新追加的依赖也会被继续解析，
+    # 循环依赖（A -> B -> A）在 visited 处停下
+    i = 0
+    while i < len(merged):
+        dep = by_name.get(merged[i].get("dialer-proxy") or "")
+        if dep is not None and dep.get("name") not in visited:
+            visited.add(dep.get("name"))
+            merged.append(dep)
+        i += 1
+    return merged
+
+
 def physical_interface() -> Optional[str]:
     try:
         p = subprocess.run(["route", "get", "default"],
@@ -137,6 +176,16 @@ def physical_interface() -> Optional[str]:
     except (OSError, subprocess.TimeoutExpired):
         pass
     return None
+
+
+# 虚拟隧道接口前缀：默认路由落在这些接口上，说明全局 TUN/其他 VPN
+# 已接管系统流量，worker 绑它拨号等于在别人的隧道里测速，结果无意义
+VIRTUAL_IFACE_PREFIXES = ("utun", "ipsec", "ppp", "tun", "tap")
+
+
+def is_virtual_iface(name: Optional[str]) -> bool:
+    """接口名是否为虚拟隧道接口（utun*/ipsec*/ppp*/tun*/tap*）。"""
+    return bool(name) and name.startswith(VIRTUAL_IFACE_PREFIXES)
 
 
 def doh_resolve(domain: str) -> Optional[str]:
@@ -211,12 +260,8 @@ class Worker:
         ctl_port = _free_port()
         while ctl_port == mix_port:
             ctl_port = _free_port()
-        proxies = []
-        for p in self.proxies:
-            q = dict(p)
-            if self.iface:
-                q["interface-name"] = self.iface
-            proxies.append(q)
+        # 复制节点 dict，避免改动调用方共享的节点定义
+        proxies = [dict(p) for p in self.proxies]
         cfg = {
             "mode": "global",
             "mixed-port": mix_port,
@@ -227,6 +272,12 @@ class Worker:
             "hosts": self.hosts,
             "proxies": proxies,
         }
+        if self.iface:
+            # 绑接口用配置顶层的全局 interface-name，而不是逐节点改写：
+            # mihomo 拨号时节点自身的 interface-name 优先，全局值仅作缺省
+            # （见 component/dialer/dialer.go），因此节点原本故意设置的接口
+            # 绝不覆盖，未设置的节点才绑物理网卡绕过主实例 TUN
+            cfg["interface-name"] = self.iface
         cfg_path = Path(self.dir.name) / "config.json"
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
         self.proc = subprocess.Popen(
@@ -374,10 +425,17 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args) -> List
         raise WorkerUnavailable("配置文件中没有匹配任何候选节点")
 
     iface = physical_interface()
+    if iface and is_virtual_iface(iface):
+        # 默认路由已被全局 TUN/其他 VPN 接管：绑虚拟接口拨号的测速无意义。
+        # 抛专用异常（WorkerUnavailable 子类），main() 按既有机制自动回退串行模式
+        raise VirtualDefaultRoute(
+            f"默认路由接口 {iface} 是虚拟隧道接口（全局 TUN/其他 VPN 接管了默认路由），"
+            f"worker 模式测速无意义")
     if not iface:
         print("⚠️ 无法确定物理网卡，worker 拨号可能被主实例 TUN 截获（结果可能不准）")
     print("正在解析测试域名与节点服务器域名（DoH）…")
-    hosts = build_hosts(selected)
+    # 依赖闭包内前置节点的 server 域名也要钉住，否则前置节点拨号会拿到 fake-ip
+    hosts = build_hosts(with_dependencies(selected, all_proxies))
 
     worker_count = max(1, min(args.workers, len(selected)))
     print(f"Phase 1 粗筛: 启动 {worker_count} 个并发 worker"
@@ -394,7 +452,9 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args) -> List
     total = len(selected)
 
     def shard_loop(shard: List[dict]) -> None:
-        worker = Worker(mihomo_bin, shard, hosts, iface)
+        # worker 配置 = 分片节点 + 各自的 dialer-proxy 依赖闭包；
+        # 探测仍只针对分片内的入选节点，依赖节点仅供链式拨号、不计入结果
+        worker = Worker(mihomo_bin, with_dependencies(shard, all_proxies), hosts, iface)
         worker.start()
         try:
             for p in shard:
@@ -454,7 +514,9 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args) -> List
         chosen_proxies = [by_name[r.name] for r in chosen if r.name in by_name]
         worker2: Optional[Worker] = None
         try:
-            worker2 = Worker(mihomo_bin, chosen_proxies, hosts, iface)
+            # Phase 2 单 worker 同样并入 dialer-proxy 依赖闭包
+            worker2 = Worker(mihomo_bin, with_dependencies(chosen_proxies, all_proxies),
+                             hosts, iface)
             worker2.start()
         except Exception as e:
             print(f"⚠️ Phase 2 worker 启动失败，保留 Phase 1 粗筛结果: {e}",

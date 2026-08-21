@@ -15,6 +15,8 @@ import argparse
 import json
 import os
 import re
+import secrets
+import signal
 import subprocess
 import sys
 import threading
@@ -45,10 +47,15 @@ STATE = {
     "lines": [],
     "started": None,
     "exit_code": None,
+    "proc": None,
 }
 STATE_LOCK = threading.Lock()
 
 MAX_LINES = 500
+
+# 每次启动随机生成的写操作令牌：注入页面 <meta>，所有 POST 必须携带，
+# 防止其他网页跨站向本地面板发写请求（CSRF）。
+WEB_TOKEN = secrets.token_hex(16)
 
 
 def read_history() -> list:
@@ -114,6 +121,8 @@ def run_benchmark(params: dict) -> None:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
+        with STATE_LOCK:
+            STATE["proc"] = proc
         assert proc.stdout is not None
         for line in proc.stdout:
             line = line.rstrip("\n")
@@ -129,6 +138,35 @@ def run_benchmark(params: dict) -> None:
     finally:
         with STATE_LOCK:
             STATE["running"] = False
+            STATE["proc"] = None
+
+
+def cancel_benchmark() -> dict:
+    """中断正在运行的测速子进程。
+
+    先发 SIGINT：clash_speedbench.py 的 finally 会恢复 Clash 策略组/模式；
+    最多等 5 秒，未退出再 terminate（再兜底 kill）。
+    """
+    with STATE_LOCK:
+        proc = STATE.get("proc")
+        running = STATE["running"]
+    if not running or proc is None or proc.poll() is not None:
+        return {"ok": False, "msg": "当前没有正在进行的测速"}
+    try:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        with STATE_LOCK:
+            STATE["lines"].append("!! 测速已被手动中断")
+        return {"ok": True, "msg": "已中断测速，Clash 配置已恢复"}
+    except Exception as e:
+        return {"ok": False, "msg": f"中断失败: {e}"}
 
 
 def do_switch(name: str) -> dict:
@@ -174,6 +212,7 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="sb-token" content="__SB_TOKEN__">
 <title>Clash SpeedBench</title>
 <style>
   :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e6edf3;
@@ -193,6 +232,7 @@ PAGE = r"""<!DOCTYPE html>
   button { background:var(--accent); color:#0d1117; border:0; border-radius:6px;
            padding:8px 18px; font-weight:600; cursor:pointer; }
   button:disabled { opacity:.4; cursor:not-allowed; }
+  button.danger { background:var(--bad); color:#fff; }
   button.mini { padding:3px 10px; font-size:12px; background:#21262d; color:var(--fg);
                 border:1px solid var(--border); }
   button.mini:hover { border-color:var(--accent); }
@@ -225,7 +265,7 @@ PAGE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>⚡ Clash SpeedBench <button class="mini" style="float:right" onclick="quitPanel()">停止面板</button></h1>
+<h1>⚡ Clash SpeedBench <button class="mini" id="btn-quit" style="float:right">停止面板</button></h1>
 <div class="sub">延迟 + 真实带宽 + IP 画像 + 综合评分 · 本地面板（127.0.0.1）<span id="cur-line"></span></div>
 
 <div class="card">
@@ -236,7 +276,8 @@ PAGE = r"""<!DOCTYPE html>
     <div><label>轮数</label><input type="number" id="f-rounds" value="1" min="1" max="5"></div>
     <div><label>&nbsp;</label><label style="color:var(--fg)">
       <input type="checkbox" id="f-autoswitch"> 测完自动切到冠军</label></div>
-    <div><label>&nbsp;</label><button id="btn-run" onclick="startRun()">开始测速</button></div>
+    <div><label>&nbsp;</label><button id="btn-run">开始测速</button></div>
+    <div><label>&nbsp;</label><button id="btn-cancel" class="danger" style="display:none">中断测速</button></div>
   </div>
   <div class="warn">⚠️ 测速期间 Mihomo 会临时切到 GLOBAL 模式，全网流量跟随被测节点；结束自动恢复。</div>
   <progress id="prog" max="100" value="0"></progress>
@@ -249,11 +290,11 @@ PAGE = r"""<!DOCTYPE html>
   <table>
     <thead><tr>
       <th>#</th>
-      <th class="sort" data-k="name" onclick="setSort('name')">节点 <span class="arr"></span></th>
-      <th class="sort" data-k="latency_ms" onclick="setSort('latency_ms')">延迟 <span class="arr"></span></th>
-      <th class="sort" data-k="median_mbps" onclick="setSort('median_mbps')">带宽 <span class="arr"></span></th>
-      <th class="sort" data-k="score" onclick="setSort('score')">评分 <span class="arr">▼</span></th>
-      <th class="sort" data-k="ip" onclick="setSort('ip')">IP画像 <span class="arr"></span></th>
+      <th class="sort" data-k="name">节点 <span class="arr"></span></th>
+      <th class="sort" data-k="latency_ms">延迟 <span class="arr"></span></th>
+      <th class="sort" data-k="median_mbps">带宽 <span class="arr"></span></th>
+      <th class="sort" data-k="score">评分 <span class="arr">▼</span></th>
+      <th class="sort" data-k="ip">IP画像 <span class="arr"></span></th>
       <th>标签</th><th></th>
     </tr></thead>
     <tbody id="tbody"></tbody>
@@ -269,6 +310,15 @@ PAGE = r"""<!DOCTYPE html>
 <script>
 let pollTimer = null;
 let chartNode = null;
+
+// 写操作令牌：由服务端每次启动随机生成并注入 <meta>，所有 POST 必须携带
+const SB_TOKEN = document.querySelector('meta[name="sb-token"]').content;
+async function post(url, body){
+  const r = await fetch(url, {method:'POST',
+    headers:{'X-SpeedBench-Token': SB_TOKEN, 'Content-Type':'application/json'},
+    body: JSON.stringify(body||{})});
+  return r.json();
+}
 
 function esc(s){ return (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
@@ -339,11 +389,11 @@ function renderTable(){
     <td>${esc(r.name)}${isCur?'<span class="cur-mark">✅ 当前</span>':''}</td>
     <td class="mono">${r.latency_ms??'-'}</td>
     <td class="mono">${r.median_mbps?r.median_mbps.toFixed(1):'-'}</td>
-    <td class="stars" title="查看历史趋势" onclick="showChart('${esc(r.name)}')">${esc(r.stars)}</td>
+    <td class="stars" title="查看历史趋势" data-name="${esc(r.name)}">${esc(r.stars)}</td>
     <td>${ipHtml(r.ip)}</td>
     <td>${tagHtml(r.tags)}</td>
     <td>${isCur?'<button class="mini" disabled>使用中</button>'
-               :`<button class="mini" onclick="switchNode('${esc(r.name)}')">切换</button>`}</td>
+               :`<button class="mini sw" data-name="${esc(r.name)}">切换</button>`}</td>
   </tr>`;}).join('');
 }
 
@@ -379,9 +429,10 @@ async function startRun(){
     rounds: +document.getElementById('f-rounds').value,
     auto_switch: document.getElementById('f-autoswitch').checked,
   };
-  const r = await (await fetch('/api/run',{method:'POST',body:JSON.stringify(body)})).json();
+  const r = await post('/api/run', body);
   if(!r.ok){ alert(r.msg); return; }
   document.getElementById('btn-run').disabled = true;
+  document.getElementById('btn-cancel').style.display = '';
   document.getElementById('log').style.display='block';
   document.getElementById('prog').style.display='block';
   pollTimer = setInterval(pollStatus, 1200);
@@ -402,12 +453,13 @@ async function pollStatus(){
   if(!s.running){
     clearInterval(pollTimer);
     document.getElementById('btn-run').disabled = false;
+    document.getElementById('btn-cancel').style.display = 'none';
     loadLatest(); loadHistory(); loadCurrent();
   }
 }
 
 async function switchNode(name){
-  const r = await (await fetch('/api/switch',{method:'POST',body:JSON.stringify({name})})).json();
+  const r = await post('/api/switch', {name});
   if(r.ok){
     currentNode = name;
     if(r.group) currentGroup = r.group;
@@ -417,9 +469,16 @@ async function switchNode(name){
   }
 }
 
+async function cancelRun(){
+  if(!confirm('中断当前测速？会向测速进程发送中断信号，恢复 Clash 配置后停止。')) return;
+  const r = await post('/api/run/cancel');
+  if(!r.ok){ alert(r.msg); return; }
+  pollStatus();
+}
+
 async function quitPanel(){
-  if(!confirm('停止 SpeedBench 面板？（正在进行的测速会中断并自动恢复 Clash 配置）')) return;
-  try{ await fetch('/api/quit',{method:'POST'}); }catch(e){}
+  if(!confirm('停止 SpeedBench 面板？若测速仍在进行，会先中断测速并恢复 Clash 配置，然后停止面板。')) return;
+  try{ await post('/api/quit'); }catch(e){}
   document.body.innerHTML='<div style="text-align:center;padding:80px;color:#8b949e">面板已停止，可以关闭此标签页。<br>下次双击 Clash SpeedBench 图标重新启动。</div>';
 }
 
@@ -462,6 +521,19 @@ function drawChart(){
   pts.forEach((p,i)=>{ if(pts.length<=12||i%2===0) ctx.fillText(p.ts, x(i)-20*dpr, H-10*dpr); });
 }
 
+// 事件绑定：节点名一律走 dataset（HTML 属性经 esc 转义），绝不拼接进 JS 源码
+document.getElementById('tbody').addEventListener('click', e=>{
+  const btn = e.target.closest('button.sw');
+  if(btn){ switchNode(btn.dataset.name); return; }
+  const cell = e.target.closest('td.stars');
+  if(cell && cell.dataset.name!=null) showChart(cell.dataset.name);
+});
+document.querySelectorAll('th.sort').forEach(th=>
+  th.addEventListener('click', ()=>setSort(th.dataset.k)));
+document.getElementById('btn-run').addEventListener('click', startRun);
+document.getElementById('btn-cancel').addEventListener('click', cancelRun);
+document.getElementById('btn-quit').addEventListener('click', quitPanel);
+
 loadLatest(); loadHistory(); loadCurrent();
 window.addEventListener('resize', drawChart);
 </script>
@@ -499,7 +571,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path == "/":
-            self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            page = PAGE.replace("__SB_TOKEN__", WEB_TOKEN)
+            self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         elif path == "/api/latest":
             self._json(latest_record())
         elif path == "/api/current":
@@ -516,7 +589,29 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"ok": False, "msg": "not found"}, 404)
 
+    def _check_post(self) -> bool:
+        """POST 写操作防护：令牌 + Host + Origin 三重校验，任一不符返回 403。
+
+        面板只绑 127.0.0.1，但其他网页仍可跨站向本机端口发 POST（CSRF /
+        DNS rebinding），因此所有写操作必须携带页面注入的随机令牌。
+        """
+        port = self.server.server_port
+        token = self.headers.get("X-SpeedBench-Token") or ""
+        if not secrets.compare_digest(token, WEB_TOKEN):
+            self._json({"ok": False, "msg": "Forbidden: 令牌无效"}, 403)
+            return False
+        if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self._json({"ok": False, "msg": "Forbidden: Host 不允许"}, 403)
+            return False
+        origin = self.headers.get("Origin")
+        if origin and origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
+            self._json({"ok": False, "msg": "Forbidden: Origin 不允许"}, 403)
+            return False
+        return True
+
     def do_POST(self) -> None:
+        if not self._check_post():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/run":
             with STATE_LOCK:
@@ -533,8 +628,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "msg": "缺少节点名"}, 400)
                 return
             self._json(do_switch(name))
+        elif path == "/api/run/cancel":
+            self._json(cancel_benchmark())
         elif path == "/api/quit":
-            self._json({"ok": True, "msg": "面板已停止"})
+            with STATE_LOCK:
+                busy = STATE["running"]
+            if busy:
+                cancel_benchmark()  # 先中断测速（SIGINT 恢复 Clash 配置），再停面板
+            msg = "面板已停止" + ("，已先中断进行中的测速" if busy else "")
+            self._json({"ok": True, "msg": msg})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         else:
             self._json({"ok": False, "msg": "not found"}, 404)
