@@ -102,7 +102,9 @@ python3 speedbench_web.py          # 打开 http://127.0.0.1:8950
 
 - 一键开始测速（可设节点过滤/每轮 MB/轮数/自动切换），实时进度和日志，可随时「中断测速」（SIGINT 优雅中断，自动恢复 Clash 配置）
 - 结果表格：节点/延迟/带宽/星级/IP画像/标签，**点击表头按该列升/降序排序**（不通节点永远沉底），当前使用中的节点绿色高亮，点每行「切换」按钮一键换节点（v2rayN 式体验）
-- 历史带宽趋势图：每次测速自动写入 `speedbench-history.jsonl`，点任意节点看历史曲线
+- 历史带宽趋势图：测速自动写入 `speedbench-history.jsonl` 并同步进 **SQLite 历史库**（`speedbench-history.db`，零依赖），点任意节点看 30 天趋势曲线与出口 IP 变化记录
+- **评分 Profile 切换**：综合推荐 / ⚡日常（延迟+抖动优先）/ 🚀下载（单·多流带宽优先）/ 🧼IP（托管·代理标记优先），一键切换排序口径
+- 地区分组榜单（按出口国家/地区聚合 Top 3）+ ⭐ 收藏节点速览（localStorage 持久化）
 - 安全：每次启动生成随机 token，所有写操作 API 校验 `X-SpeedBench-Token` + Host/Origin 白名单；页面无 inline 事件，节点名永不进入 JS 源码（防订阅方注入）
 
 ## 菜单栏小工具（可选，需 SwiftBar）

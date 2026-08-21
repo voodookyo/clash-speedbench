@@ -35,12 +35,23 @@ from clash_speedbench import (  # noqa: E402
     detect_controller,
     pick_switch_group,
 )
+import speedbench_db  # noqa: E402
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
 # ~/Library/Application Support/ClashSpeedBench，避免污染应用包。
 DATA_HOME = Path(os.environ.get("SPEEDBENCH_HOME", str(HERE)))
 HISTORY = DATA_HOME / "speedbench-history.jsonl"
+
+
+def db_path() -> Path:
+    """SQLite 历史库：与 jsonl 同目录同名、仅换后缀。
+
+    jsonl 仍是原始备份，DB 是它的可查询镜像；测试补丁 HISTORY 时
+    DB 路径随之指向临时目录，互不串扰。
+    """
+    return HISTORY.with_suffix(".db")
+
 
 STATE = {
     "running": False,
@@ -57,7 +68,30 @@ MAX_LINES = 500
 # 防止其他网页跨站向本地面板发写请求（CSRF）。
 WEB_TOKEN = secrets.token_hex(16)
 
+# jsonl → DB 的同步策略：读取前惰性增量同步。每次读 API 先比对 jsonl mtime，
+# 有变化才 import_jsonl（导入本身按 ts 去重，幂等），面板读到的永远是最新数据，
+# mtime 不变时代价只是一次 stat；启动时与 /api/run 结束后再各显式同步一次，
+# 只为让导入问题尽早暴露。
+_DB_SYNC_LOCK = threading.Lock()
+_DB_SYNCED = {}  # str(db_path) -> 已同步的 jsonl mtime
 
+
+def sync_db() -> int:
+    """jsonl 有新增时增量导入 SQLite（幂等），返回新导入的轮次数。"""
+    try:
+        mtime = HISTORY.stat().st_mtime
+    except OSError:
+        return 0  # 历史文件不存在：无可导入，查询会返回空
+    key = str(db_path())
+    with _DB_SYNC_LOCK:
+        if _DB_SYNCED.get(key) == mtime and Path(key).exists():
+            return 0
+        n = speedbench_db.import_jsonl(db_path(), HISTORY)
+        _DB_SYNCED[key] = mtime
+        return n
+
+
+# 旧 jsonl 直读：保留作应急回退与兼容测试用；Web API 已改走 SQLite（见下）。
 def read_history() -> list:
     if not HISTORY.exists():
         return []
@@ -75,14 +109,15 @@ def read_history() -> list:
 
 
 def latest_record() -> dict:
-    records = read_history()
-    return records[-1] if records else {}
+    sync_db()
+    return speedbench_db.latest_run(db_path())
 
 
 def slim_history() -> list:
     """Trend data: per run, per node, only the fields the chart needs."""
+    sync_db()
     out = []
-    for rec in read_history():
+    for rec in speedbench_db.all_runs(db_path()):
         out.append({
             "ts": rec.get("ts", ""),
             "results": [
@@ -139,6 +174,12 @@ def run_benchmark(params: dict) -> None:
         with STATE_LOCK:
             STATE["running"] = False
             STATE["proc"] = None
+        # 测速进程已把本轮结果追加进 jsonl，顺手增量入库；失败不影响面板状态
+        try:
+            sync_db()
+        except Exception as e:
+            with STATE_LOCK:
+                STATE["lines"].append(f"!! 历史入库失败: {e}")
 
 
 def cancel_benchmark() -> dict:
@@ -262,6 +303,24 @@ PAGE = r"""<!DOCTYPE html>
   tr.current td { background:#12261a; box-shadow:inset 3px 0 0 var(--good); }
   tr.current td:first-child { box-shadow:inset 3px 0 0 var(--good); }
   .cur-mark { color:var(--good); font-size:11px; margin-left:6px; }
+  #profile-bar { margin-bottom:10px; display:flex; gap:6px; align-items:center;
+                 flex-wrap:wrap; }
+  .pf-label { color:var(--dim); font-size:12px; }
+  button.mini.on { background:#1f6feb33; border-color:var(--accent); color:var(--accent); }
+  #board { margin-bottom:10px; }
+  #board-toggle { color:var(--dim); font-size:12px; cursor:pointer; user-select:none;
+                  margin-bottom:6px; }
+  #board-toggle:hover { color:var(--fg); }
+  .board-group { margin:4px 0; font-size:12px; }
+  .board-code { display:inline-block; min-width:56px; color:var(--accent); font-weight:600; }
+  .board-item { display:inline-block; background:#21262d; border:1px solid var(--border);
+                border-radius:6px; padding:1px 8px; margin:2px 4px 2px 0; cursor:pointer; }
+  .board-item:hover { border-color:var(--accent); }
+  .board-item b { color:var(--good); font-weight:600; }
+  .fav { cursor:pointer; color:var(--dim); margin-right:5px; user-select:none; }
+  .fav.on { color:#e3b341; }
+  .sc-num { color:var(--fg); }
+  #chart-sub { color:var(--dim); font-size:11px; margin:0 0 8px; min-height:14px; }
 </style>
 </head>
 <body>
@@ -286,6 +345,17 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="card">
   <div class="meta" id="latest-meta">暂无测速记录</div>
+  <div id="profile-bar">
+    <span class="pf-label">评分 Profile</span>
+    <button class="mini pf" data-p="all" title="后端综合评分（延迟+带宽+IP 画像加权）">综合推荐</button>
+    <button class="mini pf" data-p="daily" title="0.5×延迟 + 0.3×抖动 + 0.2×带宽，日常浏览体验优先">⚡ 日常</button>
+    <button class="mini pf" data-p="download" title="0.7×单线程带宽(300M封顶) + 0.3×多线程带宽(500M封顶)，下载优先">🚀 下载</button>
+    <button class="mini pf" data-p="ipclean" title="按出口 IP 属性打分：无标记 100 / 移动 75 / 托管 50 / 代理 20">🧼 IP</button>
+  </div>
+  <div id="board" style="display:none">
+    <div id="board-toggle"><span id="board-arrow">▸</span> 地区榜 · 各地区在当前 Profile 下的 Top 3（点击看趋势）</div>
+    <div id="board-body" style="display:none"></div>
+  </div>
   <div style="overflow:auto; max-height:480px;">
   <table>
     <thead><tr>
@@ -304,6 +374,7 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="card">
   <div id="chart-title">历史带宽趋势（点击表格中任意节点查看）</div>
+  <div id="chart-sub"></div>
   <canvas id="chart"></canvas>
 </div>
 
@@ -353,21 +424,83 @@ let latestData = null;
 let sortKey = 'score', sortAsc = false;
 let currentNode = '', currentGroup = '';
 
+// localStorage 在某些隐私模式下会抛异常，包一层静默降级
+function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+
+// —— 评分 Profile（纯前端换算，公式见 profileScore）——
+// all=综合推荐(后端 score 原样) / daily=⚡日常 / download=🚀下载 / ipclean=🧼IP
+const PROFILES = ['all','daily','download','ipclean'];
+let currentProfile = lsGet('sb_profile');
+if(!PROFILES.includes(currentProfile)) currentProfile = 'all';
+
+// 收藏节点集：localStorage 持久化；只影响 ★ 展示和地区榜顶部速览，不干扰表格排序
+let favs;
+try{ favs = new Set(JSON.parse(lsGet('sb_favs')||'[]')); }
+catch(e){ favs = new Set(); }
+
+function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+// 各 Profile 的评分公式；返回 null 表示"不通/无数据"，排序时统一沉底
+function profileScore(r){
+  switch(currentProfile){
+    case 'daily': {  // ⚡日常 = 0.5×latScore + 0.3×jitterScore + 0.2×bwScore
+      if(r.latency_ms==null) return null;
+      const lat = 100*clamp((800-r.latency_ms)/(800-80), 0, 1);   // ≤80ms→100，≥800ms→0
+      // 老数据没有 jitter 字段时按中性 50 计，不至于整行沉底
+      const jit = r.jitter_ms==null ? 50
+                  : 100*clamp((200-r.jitter_ms)/(200-10), 0, 1);  // ≤10ms→100，≥200ms→0
+      const bw  = Math.min(r.median_mbps||0, 100);                // min(mbps,100)
+      return 0.5*lat + 0.3*jit + 0.2*bw;
+    }
+    case 'download': {  // 🚀下载 = 0.7×bwScore + 0.3×multiScore
+      if(r.median_mbps==null) return null;
+      const bw = Math.min(r.median_mbps,300)/300*100;             // 300M 封顶
+      const multi = r.multi_mbps ?? r.median_mbps;                // multi 缺失用 median 兜底
+      const ms = Math.min(multi,500)/500*100;                     // 500M 封顶
+      return 0.7*bw + 0.3*ms;
+    }
+    case 'ipclean': {  // 🧼IP = 出口 IP 属性分，取最差标记
+      const ip = r.ip;
+      if(!ip || !ip.ok) return null;  // 查询失败/未知：沉底（用 null 而非 0，升序时也沉底）
+      if(ip.proxy)   return 20;
+      if(ip.hosting) return 50;
+      if(ip.mobile)  return 75;
+      return 100;
+    }
+    default: return r.score;  // 综合推荐：后端分数原样
+  }
+}
+
 // IP 列按类型固定优先级排序：ISP/非托管 > 移动网络 > 机房托管 > 代理/VPN > 未知。
 // 数值越大排越前（表格默认降序，与评分列习惯一致）；未识别的旧值按"未知"处理；
 // 查询失败（无 ip 或 !ok）返回 null，由排序逻辑统一沉底
 const KIND_RANK = {'ISP/非托管':4,'移动网络':3,'机房托管':2,'代理/VPN':1,'未知':0};
 function sortVal(r, k){
   if(k==='ip'){ const ip=r.ip; return (ip&&ip.ok)?(KIND_RANK[normKind(ip)]??0):null; }
+  if(k==='score') return profileScore(r);  // 评分列的排序键跟随当前 Profile
   return r[k];
+}
+
+function updateSortArrows(){
+  document.querySelectorAll('th.sort').forEach(th=>{
+    th.querySelector('.arr').textContent = th.dataset.k===sortKey ? (sortAsc?'▲':'▼') : '';
+  });
 }
 
 function setSort(k){
   if(sortKey===k){ sortAsc=!sortAsc; } else { sortKey=k; sortAsc=(k==='name'||k==='latency_ms'); }
-  document.querySelectorAll('th.sort').forEach(th=>{
-    th.querySelector('.arr').textContent = th.dataset.k===sortKey ? (sortAsc?'▲':'▼') : '';
-  });
+  updateSortArrows();
   renderTable();
+}
+
+// 切换评分 Profile：存 localStorage、高亮选中按钮、自动按新 Profile 分数降序
+function setProfile(p){
+  currentProfile = p;
+  lsSet('sb_profile', p);
+  document.querySelectorAll('#profile-bar .pf').forEach(b=>b.classList.toggle('on', b.dataset.p===p));
+  sortKey='score'; sortAsc=false; updateSortArrows();
+  renderTable(); renderBoard();
 }
 
 function renderTable(){
@@ -384,12 +517,16 @@ function renderTable(){
   });
   tbody.innerHTML = rows.map((r,i)=>{
     const isCur = r.name===currentNode;
+    const isFav = favs.has(r.name);
+    const sc = profileScore(r);
+    // 评分列 = 当前 Profile 分数（一位小数）+ 星标。星标选「始终显示后端 stars」：
+    // stars 是后端综合评级的直观符号，Profile 切换只改数值与排序，不同步换算以免误导。
     return `<tr${isCur?' class="current"':''}>
     <td>${i+1}</td>
-    <td>${esc(r.name)}${isCur?'<span class="cur-mark">✅ 当前</span>':''}</td>
+    <td><span class="fav${isFav?' on':''}" data-name="${esc(r.name)}" title="收藏/取消收藏">${isFav?'★':'☆'}</span>${esc(r.name)}${isCur?'<span class="cur-mark">✅ 当前</span>':''}</td>
     <td class="mono">${r.latency_ms??'-'}</td>
     <td class="mono">${r.median_mbps?r.median_mbps.toFixed(1):'-'}</td>
-    <td class="stars" title="查看历史趋势" data-name="${esc(r.name)}">${esc(r.stars)}</td>
+    <td class="stars" title="查看历史趋势" data-name="${esc(r.name)}"><span class="sc-num">${sc==null?'-':sc.toFixed(1)}</span> ${esc(r.stars||'')}</td>
     <td>${ipHtml(r.ip)}</td>
     <td>${tagHtml(r.tags)}</td>
     <td>${isCur?'<button class="mini" disabled>使用中</button>'
@@ -403,15 +540,94 @@ function renderCurrent(){
   renderTable();
 }
 
+// —— 地区榜 ——
+// 地区分组启发式（优先级从高到低）：
+// 1) IP 画像的 country_code（实测出口，最可靠）；
+// 2) 节点名开头的国旗 emoji：地区指示符（U+1F1E6–U+1F1FF）两两一对，减偏移即得字母代码；
+// 3) 节点名关键词：二位大写缩写带 \b 边界匹配（防 "Plus" 误中 "US"），再加常见中文地名；
+// 4) 都认不出归 '??' 组。
+function flagCode(name){
+  const cps = [...name];             // 按码点展开，避开 UTF-16 代理对问题
+  if(cps.length<2) return null;
+  const a = cps[0].codePointAt(0), b = cps[1].codePointAt(0);
+  if(a>=0x1F1E6 && a<=0x1F1FF && b>=0x1F1E6 && b<=0x1F1FF)
+    return String.fromCharCode(65+a-0x1F1E6) + String.fromCharCode(65+b-0x1F1E6);
+  return null;
+}
+const REGION_KEYS = [
+  [/\b(HK|HKG)\b|香港/, 'HK'], [/\b(TW|TWN)\b|台湾|台北/, 'TW'],
+  [/\b(JP|JPN)\b|日本|东京|大阪/, 'JP'], [/\b(SG|SGP)\b|新加坡|狮城/, 'SG'],
+  [/\b(US|USA)\b|美国|洛杉矶|圣何塞|西雅图|纽约/, 'US'],
+  [/\b(KR|KOR)\b|韩国|首尔/, 'KR'], [/\b(UK|GB|GBR)\b|英国|伦敦/, 'GB'],
+  [/\b(DE|DEU)\b|德国|法兰克福/, 'DE'], [/\b(FR|FRA)\b|法国|巴黎/, 'FR'],
+  [/\b(CA|CAN)\b|加拿大|多伦多/, 'CA'], [/\b(AU|AUS)\b|澳大利亚|澳洲|悉尼/, 'AU'],
+  [/\b(NL|NLD)\b|荷兰|阿姆斯特丹/, 'NL'], [/\b(IN|IND)\b|印度|孟买/, 'IN'],
+  [/\b(RU|RUS)\b|俄罗斯|莫斯科/, 'RU'], [/\b(TR|TUR)\b|土耳其|伊斯坦布尔/, 'TR'],
+  [/\b(MY|MYS)\b|马来西亚|吉隆坡/, 'MY'], [/\b(TH|THA)\b|泰国|曼谷/, 'TH'],
+  [/\b(PH|PHL)\b|菲律宾|马尼拉/, 'PH'], [/\b(VN|VNM)\b|越南|河内/, 'VN'],
+  [/\b(ID|IDN)\b|印尼|雅加达/, 'ID'], [/\b(CN|CHN)\b|中国|大陆/, 'CN'],
+];
+function keywordCode(name){
+  for(const [re, code] of REGION_KEYS){ if(re.test(name)) return code; }
+  return null;
+}
+function regionOf(r){
+  const ip = r.ip;
+  if(ip && ip.ok && ip.country_code) return ip.country_code.toUpperCase();
+  return flagCode(r.name||'') || keywordCode(r.name||'') || '??';
+}
+
+function boardItem(x){
+  return `<span class="board-item" data-name="${esc(x.name)}">${esc(x.name)} <b>${x.sc==null?'-':x.sc.toFixed(1)}</b>${x.mbps!=null?`·${x.mbps.toFixed(0)}M`:''}</span>`;
+}
+
+// 地区榜：按 regionOf 分组，每组取当前 Profile 下 Top 3；不通/无数据（分数 null）不进榜；
+// 顶部固定一行「⭐ 收藏」速览（无收藏时不显示）；整榜在无数据时隐藏
+function renderBoard(){
+  const bd = document.getElementById('board');
+  if(!latestData || !latestData.results || !latestData.results.length){ bd.style.display='none'; return; }
+  let html = '';
+  const favRows = latestData.results.filter(r=>favs.has(r.name))
+    .map(r=>({name:r.name, sc:profileScore(r), mbps:r.median_mbps}))
+    .sort((a,b)=>(b.sc??-1)-(a.sc??-1));
+  if(favRows.length)
+    html += `<div class="board-group"><span class="board-code">⭐ 收藏</span>${favRows.map(boardItem).join('')}</div>`;
+  const groups = {};
+  for(const r of latestData.results){
+    const sc = profileScore(r);
+    if(sc==null) continue;
+    const code = regionOf(r);
+    if(!groups[code]) groups[code] = [];
+    groups[code].push({name:r.name, sc, mbps:r.median_mbps});
+  }
+  const codes = Object.keys(groups).sort((a,b)=>{
+    const top = c=>Math.max(...groups[c].map(x=>x.sc));
+    return top(b)-top(a) || a.localeCompare(b);
+  });
+  for(const c of codes){
+    const top3 = groups[c].sort((a,b)=>b.sc-a.sc).slice(0,3);
+    html += `<div class="board-group"><span class="board-code">${esc(c)}</span>${top3.map(boardItem).join('')}</div>`;
+  }
+  if(!html){ bd.style.display='none'; return; }
+  bd.style.display='';
+  document.getElementById('board-body').innerHTML = html;
+}
+
+function toggleFav(name){
+  if(favs.has(name)) favs.delete(name); else favs.add(name);
+  lsSet('sb_favs', JSON.stringify([...favs]));
+  renderTable(); renderBoard();
+}
+
 async function loadLatest(){
   const rec = await (await fetch('/api/latest')).json();
   if(rec.results){
     latestData = rec;
     document.getElementById('latest-meta').textContent =
       `上次测速：${rec.ts} · ${rec.results.length} 个节点 · ${rec.mb}MB×${rec.rounds}轮`;
-    if(!chartNode && rec.results.length){ chartNode = rec.results[0].name; drawChart(); }
+    if(!chartNode && rec.results.length){ showChart(rec.results[0].name); }
   }
-  renderTable();
+  renderTable(); renderBoard();
 }
 
 async function loadCurrent(){
@@ -483,9 +699,33 @@ async function quitPanel(){
 }
 
 let histData = [];
+let chartSeries = null;  // {name, pts:[{ts,v}], ipNote}；null 或 name 与 chartNode 不符时回退 histData
 async function loadHistory(){ histData = await (await fetch('/api/history')).json(); drawChart(); }
 
-function showChart(name){ chartNode = name; drawChart(); }
+function showChart(name){ chartNode = name; fetchNodeSeries(name); drawChart(); }
+
+// 单节点图表数据源：优先 /api/node 的 30 天序列（含 IP 变化时间线），失败回退 histData
+async function fetchNodeSeries(name){
+  try{
+    const d = await (await fetch('/api/node?name='+encodeURIComponent(name)+'&days=30')).json();
+    if(chartNode!==name) return;  // 等待期间用户已改选别的节点，丢弃过期响应
+    if(d.series && d.series.length){
+      chartSeries = {
+        name,
+        pts: d.series.filter(s=>s.median_mbps!=null).map(s=>({ts:s.ts.slice(5,16), v:s.median_mbps})),
+        ipNote: ipChangeNote(d.ip_changes),
+      };
+      drawChart();
+    }
+  }catch(e){ /* 静默回退 histData，drawChart 已画过兜底版 */ }
+}
+
+// ip_changes 是「相邻不变则合并」的变化点时间线：首条是初始 IP，之后每条算一次变化
+function ipChangeNote(changes){
+  if(!changes || changes.length<2) return '';
+  const last = changes[changes.length-1], prev = changes[changes.length-2];
+  return `出口 IP 曾变化 ${changes.length-1} 次（最近：${prev.exit_ip||'?'} → ${last.exit_ip||'?'} @ ${last.ts.slice(0,16)}）`;
+}
 
 function drawChart(){
   const cv = document.getElementById('chart');
@@ -496,12 +736,19 @@ function drawChart(){
   ctx.clearRect(0,0,W,H);
   document.getElementById('chart-title').textContent =
     chartNode ? `历史带宽趋势：${chartNode}` : '历史带宽趋势（点击表格中任意节点查看）';
-  if(!chartNode || !histData.length) return;
+  // 数据源：/api/node 的 30 天序列优先；取不到（或序列不属于当前节点）回退 /api/history
+  const useSeries = chartSeries && chartSeries.name===chartNode && chartSeries.pts.length;
+  document.getElementById('chart-sub').textContent = useSeries ? (chartSeries.ipNote||'') : '';
   const pts = [];
-  for(const rec of histData){
-    const r = rec.results.find(x=>x.name===chartNode);
-    if(r && r.median_mbps!=null) pts.push({ts:rec.ts.slice(5,16), v:r.median_mbps});
+  if(useSeries){
+    pts.push(...chartSeries.pts);
+  }else if(chartNode && histData.length){
+    for(const rec of histData){
+      const r = rec.results.find(x=>x.name===chartNode);
+      if(r && r.median_mbps!=null) pts.push({ts:rec.ts.slice(5,16), v:r.median_mbps});
+    }
   }
+  if(!chartNode) return;
   if(pts.length<1){ ctx.fillStyle='#8b949e'; ctx.font=`${12*dpr}px sans-serif`;
     ctx.fillText('该节点暂无历史数据', 20*dpr, 30*dpr); return; }
   const pad=36*dpr, maxV=Math.max(...pts.map(p=>p.v))*1.15||1;
@@ -523,6 +770,8 @@ function drawChart(){
 
 // 事件绑定：节点名一律走 dataset（HTML 属性经 esc 转义），绝不拼接进 JS 源码
 document.getElementById('tbody').addEventListener('click', e=>{
+  const fv = e.target.closest('.fav');
+  if(fv && fv.dataset.name!=null){ toggleFav(fv.dataset.name); return; }
   const btn = e.target.closest('button.sw');
   if(btn){ switchNode(btn.dataset.name); return; }
   const cell = e.target.closest('td.stars');
@@ -530,6 +779,22 @@ document.getElementById('tbody').addEventListener('click', e=>{
 });
 document.querySelectorAll('th.sort').forEach(th=>
   th.addEventListener('click', ()=>setSort(th.dataset.k)));
+// Profile 按钮：初始化选中态（localStorage 恢复）+ 点击切换
+document.querySelectorAll('#profile-bar .pf').forEach(b=>{
+  b.classList.toggle('on', b.dataset.p===currentProfile);
+  b.addEventListener('click', ()=>setProfile(b.dataset.p));
+});
+// 地区榜：标题点击折叠/展开（默认折叠），条目点击看该节点趋势
+document.getElementById('board-toggle').addEventListener('click', ()=>{
+  const body = document.getElementById('board-body');
+  const open = body.style.display==='none';
+  body.style.display = open?'':'none';
+  document.getElementById('board-arrow').textContent = open?'▾':'▸';
+});
+document.getElementById('board-body').addEventListener('click', e=>{
+  const it = e.target.closest('.board-item');
+  if(it && it.dataset.name!=null) showChart(it.dataset.name);
+});
 document.getElementById('btn-run').addEventListener('click', startRun);
 document.getElementById('btn-cancel').addEventListener('click', cancelRun);
 document.getElementById('btn-quit').addEventListener('click', quitPanel);
@@ -579,6 +844,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json(get_current())
         elif path == "/api/history":
             self._json(slim_history())
+        elif path == "/api/node":
+            # 单节点详情：近 N 天测速序列 + 出口 IP 变化时间线（SQL 参数化防注入）
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = qs.get("name", [""])[0]
+            if not name:
+                self._json({"ok": False, "msg": "缺少 name 参数"}, 400)
+                return
+            try:
+                days = max(1, min(int(qs.get("days", ["30"])[0]), 3650))
+            except (ValueError, TypeError):
+                days = 30
+            sync_db()
+            self._json({
+                "series": speedbench_db.node_series(db_path(), name, days=days),
+                "ip_changes": speedbench_db.ip_changes(db_path(), name),
+            })
         elif path == "/api/run/status":
             with STATE_LOCK:
                 self._json({
@@ -650,6 +931,12 @@ def main() -> int:
 
     url = f"http://127.0.0.1:{args.port}"
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    try:
+        n = sync_db()  # 启动时先把 jsonl 历史增量入库（幂等）
+        if n:
+            print(f"历史库：新导入 {n} 轮测速记录 → {db_path().name}")
+    except Exception as e:
+        print(f"历史库导入失败（不影响面板使用）: {e}")
     print(f"Clash SpeedBench 面板: {url}")
     print("Ctrl+C 停止。测速期间 Mihomo 会临时切到 GLOBAL 模式，结束自动恢复。")
     if not args.no_browser:
