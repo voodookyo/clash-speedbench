@@ -13,6 +13,7 @@ echo "→ 拷贝程序文件"
 cp "$ROOT/clash_speedbench.py" \
    "$ROOT/speedbench_web.py" \
    "$ROOT/speedbench_switch.py" \
+   "$ROOT/speedbench_workers.py" \
    "$APP/Contents/Resources/app/"
 
 echo "→ 生成图标"

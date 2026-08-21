@@ -647,6 +647,26 @@ def auto_switch_best(api: MihomoAPI, proxies: Dict[str, dict],
         print(f"⚠️ 自动切换失败: {e}", file=sys.stderr)
 
 
+def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]) -> int:
+    """Shared reporting: box table + CSV + history + optional auto-switch."""
+    if not results:
+        print("没有产生有效测速结果。")
+        return 0
+    print_speedbench(results, args.top)
+    out = Path(args.output) if args.output else Path(
+        f"clash-speedtest-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    )
+    write_csv(results, out)
+    print(f"\nCSV 已保存: {out.resolve()}")
+    print("排序规则：按综合评分（带宽 55% + 延迟 25% + IP 风险 20%）从高到低。")
+    if not args.no_history:
+        append_history(results, Path(args.history), args.mb, args.rounds, out)
+    if args.auto_switch:
+        graph = build_selectable_graph(proxies)
+        auto_switch_best(api, proxies, graph, args.root_group, results, args.switch_group)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速（延迟 + 真实带宽 + IP 纯净度）"
@@ -688,6 +708,11 @@ def main() -> int:
                         help="历史记录 JSONL 路径，默认在脚本目录下")
     parser.add_argument("--no-history", action="store_true",
                         help="不写入历史记录")
+    parser.add_argument("--workers", type=int, default=6,
+                        help="并发 worker 数（起多个临时 mihomo 实例并行测速，不影响运行中的 Clash）；"
+                             "1=关闭并发，回退到串行 GLOBAL 切换模式。默认 6")
+    parser.add_argument("--config-file", default="",
+                        help="并发模式用的完整配置文件路径（含节点凭据），默认自动找 Clash Verge 的运行配置")
     parser.add_argument("--yes", action="store_true",
                         help="不询问确认直接开始")
     args = parser.parse_args()
@@ -734,6 +759,31 @@ def main() -> int:
     if not candidates:
         print("没有找到符合筛选条件的实际代理节点。", file=sys.stderr)
         return 1
+
+    if args.workers > 1:
+        try:
+            from speedbench_workers import WorkerUnavailable, run_pool
+        except ImportError:
+            print("错误：缺少 speedbench_workers.py（应与 clash_speedbench.py 同目录）。",
+                  file=sys.stderr)
+            return 1
+        proto_by_name = {n: str(info.get("type", "")) for n, info in leaves.items()}
+        print("Clash SpeedBench（并发 worker 模式，不影响正在运行的 Clash）")
+        print(f"候选节点: {len(candidates)}")
+        print(f"测速参数: {args.mb} MB × {args.rounds} 轮/节点，单轮最长 {args.max_time:g}s"
+              + ("，含出口 IP 画像" if not args.no_ip else "，已跳过 IP 画像"))
+        print(f"理论最大流量消耗约: {args.mb * args.rounds * len(candidates) / 1024:.2f} GiB")
+        if not args.yes:
+            ans = input("\n开始测速？[Y/n] ").strip().lower()
+            if ans not in ("", "y", "yes"):
+                print("已取消。")
+                return 0
+        try:
+            results = run_pool(candidates, proto_by_name, args)
+        except WorkerUnavailable as e:
+            print(f"并发模式不可用：{e}\n回退到串行模式。", file=sys.stderr)
+        else:
+            return report(results, args, api, proxies)
 
     mixed_port = config.get("mixed-port") or config.get("port") or 7897
     proxy_url = f"http://127.0.0.1:{mixed_port}"
@@ -883,22 +933,7 @@ def main() -> int:
             except Exception as e:
                 print(f"⚠️ 恢复原模式失败，请手动切回 {original_mode}: {e}", file=sys.stderr)
 
-    if results:
-        print_speedbench(results, args.top)
-        out = Path(args.output) if args.output else Path(
-            f"clash-speedtest-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
-        )
-        write_csv(results, out)
-        print(f"\nCSV 已保存: {out.resolve()}")
-        print("排序规则：按综合评分（带宽 55% + 延迟 25% + IP 风险 20%）从高到低。")
-        if not args.no_history:
-            append_history(results, Path(args.history), args.mb, args.rounds, out)
-        if args.auto_switch:
-            auto_switch_best(api, proxies, graph, root, results, args.switch_group)
-    else:
-        print("没有产生有效测速结果。")
-
-    return 0
+    return report(results, args, api, proxies)
 
 
 if __name__ == "__main__":

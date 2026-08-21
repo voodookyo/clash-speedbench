@@ -31,6 +31,22 @@ SpeedBench ── 逐节点切换 → 经 mixed-port 真实下载 → 查出口 
 - **可选自动切换**：`--auto-switch` 测完直接把主策略组切到冠军节点
 - **零依赖**：单文件 Python 3.8+，只用标准库 + 系统自带 curl
 
+## 并发模式（默认开启）
+
+默认以 `--workers 6` 运行：从 Clash Verge 的运行配置中提取节点定义，**起 6 个临时 mihomo
+进程并行下载**——100 节点约 1~2 分钟跑完，而且全程不碰你正在运行的 Clash（不切 GLOBAL、
+不占用 mixed 端口，你照常用网）。
+
+工作原理（针对 TUN 环境做了特殊处理）：
+
+- 节点凭据来自 Verge 生成的 `clash-verge.yaml`（用 macOS 自带 ruby 转 JSON，无第三方依赖）
+- 测试域名和节点服务器域名通过 DoH 预解析后写进 worker 的 `hosts`，避开主实例 TUN 的
+  fake-ip DNS 劫持
+- 每个节点拨号绑定物理网卡（`interface-name`），绕过主实例 TUN，不会产生「双重代理」
+
+并发不可用（非 Verge 安装、找不到配置/二进制、DoH 全挂）时自动回退到串行模式
+（临时切 GLOBAL，测完恢复）。也可用 `--workers 1` 强制串行，或 `--config-file` 指定配置。
+
 ## 快速开始
 
 前提：Clash Verge Rev（或其他 Mihomo 客户端）正在运行，且开启外部控制（默认即可）。
@@ -125,6 +141,8 @@ cp -R "dist/Clash SpeedBench.app" /Applications/
 | `--switch-group NAME` | 指定要切换的策略组 | 自动探测主 Selector |
 | `--controller URL` | 指定 controller（支持 `unix://` 前缀） | 自动探测 |
 | `--top N` | 表格只显示前 N 名 | 全部 |
+| `--workers N` | 并发 worker 数；1=关闭并发（串行模式） | 6 |
+| `--config-file PATH` | 并发模式用的配置文件（含节点凭据） | 自动探测 |
 | `--history PATH` | 历史记录 JSONL 路径 | 脚本目录下 |
 | `--no-history` | 不写历史记录 | 关 |
 
