@@ -11,6 +11,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/app"
 
 echo "→ 拷贝程序文件"
 cp "$ROOT/clash_speedbench.py" \
+   "$ROOT/speedbench_db.py" \
    "$ROOT/speedbench_web.py" \
    "$ROOT/speedbench_switch.py" \
    "$ROOT/speedbench_workers.py" \
