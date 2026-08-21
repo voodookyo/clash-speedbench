@@ -55,11 +55,18 @@ class WebServerCase(unittest.TestCase):
 
     def request(self, method, path, body=None, headers=None):
         """发一次 HTTP 请求，返回 (status, raw_body bytes)。"""
+        status, _, raw = self.request_full(method, path, body=body, headers=headers)
+        return status, raw
+
+    def request_full(self, method, path, body=None, headers=None):
+        """同 request，但额外返回响应头（dict，键小写），供 MIME 等断言用。"""
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         try:
             conn.request(method, path, body=body, headers=headers or {})
             resp = conn.getresponse()
-            return resp.status, resp.read()
+            return (resp.status,
+                    {k.lower(): v for k, v in resp.getheaders()},
+                    resp.read())
         finally:
             conn.close()
 

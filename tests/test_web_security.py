@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Web 面板安全基线（v0.4）。
+"""Web 面板安全基线（v0.4；v0.6 起前端改为 web/ 静态文件服务）。
 
 在 127.0.0.1 随机空闲端口用线程起真实 HTTP server，http.client 发请求验证：
-- GET / 返回的 HTML 把 __SB_TOKEN__ 占位符替换成真实 WEB_TOKEN（<meta> 注入）
+- GET /（及别名 /index.html）返回的 HTML 把 __SB_TOKEN__ 占位符替换成真实
+  WEB_TOKEN（<meta> 注入），磁盘上的 web/index.html 模板里仍是占位符
+- index.html 引用 /static/app.js 与 /static/style.css；两者 200 且 MIME 正确
 - 所有 POST 路径先过 _check_post 闸门：无令牌/错令牌/坏 Host/坏 Origin → 403 JSON
 - 正确令牌 + 同源 Origin（或 curl 式无 Origin）→ 放行（非 403）
 - 不存在的 POST 路径也在闸门之后：无令牌 → 403，有令牌 → 404
 - GET 只读接口不需要令牌
-- 前端无 inline onclick（事件委托 + data-name）
+- 前端（index.html 与 app.js）无 inline 事件属性（事件委托 + data-name）
 
 全程只打本机随机端口，不起 mihomo、不碰真 Clash、不发外网请求。
 """
@@ -28,18 +30,36 @@ SAFE_POST = "/api/run/cancel"
 ALL_POST_PATHS = ("/api/run", "/api/switch", "/api/run/cancel", "/api/quit",
                   "/no-such-endpoint")
 
+# 前端静态文件目录（v0.6：PAGE 内嵌字符串已抽成 web/ 下的真实文件）
+WEB_FILES = Path(web.__file__).resolve().parent / "web"
+
+
+def read_web(name):
+    """读 web/ 下的前端文件原文（磁盘模板，未经令牌注入）。"""
+    return (WEB_FILES / name).read_text(encoding="utf-8")
+
 
 class TokenInjectionTest(WebServerCase):
     def test_index_meta_has_real_token(self):
-        status, body = self.request("GET", "/")
-        self.assertEqual(status, 200)
-        html = body.decode("utf-8")
-        self.assertIn(f'<meta name="sb-token" content="{TOKEN}">', html)
-        self.assertNotIn("__SB_TOKEN__", html)  # 占位符必须被替换干净
+        # / 与别名 /index.html 都走同一条注入路径
+        for path in ("/", "/index.html"):
+            with self.subTest(path=path):
+                status, body = self.request("GET", path)
+                self.assertEqual(status, 200)
+                html = body.decode("utf-8")
+                self.assertIn(f'<meta name="sb-token" content="{TOKEN}">', html)
+                self.assertNotIn("__SB_TOKEN__", html)  # 占位符必须被替换干净
 
-    def test_page_template_keeps_placeholder(self):
-        # 模板里仍是占位符，替换发生在响应时（令牌每进程随机生成）
-        self.assertIn("__SB_TOKEN__", web.PAGE)
+    def test_index_template_keeps_placeholder(self):
+        # 磁盘模板里仍是占位符，替换发生在响应时（令牌每进程随机生成）
+        html = read_web("index.html")
+        self.assertIn('<meta name="sb-token" content="__SB_TOKEN__">', html)
+
+    def test_index_references_static_assets(self):
+        # v0.6 白名单分发只认这两个静态文件，模板必须引用它们
+        html = read_web("index.html")
+        self.assertIn('<script src="/static/app.js"></script>', html)
+        self.assertIn('<link rel="stylesheet" href="/static/style.css">', html)
 
     def test_web_token_format(self):
         # secrets.token_hex(16) → 32 位小写十六进制
@@ -56,6 +76,30 @@ class TokenInjectionTest(WebServerCase):
         status, body = self.request("GET", "/nope")
         self.assertEqual(status, 404)
         self.assertFalse(json.loads(body)["ok"])
+
+
+class StaticFilesTest(WebServerCase):
+    """白名单内静态文件：200 + 正确 MIME + 内容与磁盘一致。"""
+
+    def test_app_js_200_with_mime(self):
+        status, headers, body = self.request_full("GET", "/static/app.js")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("content-type"),
+                         "application/javascript; charset=utf-8")
+        self.assertEqual(body, (WEB_FILES / "app.js").read_bytes())
+
+    def test_style_css_200_with_mime(self):
+        status, headers, body = self.request_full("GET", "/static/style.css")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("content-type"), "text/css; charset=utf-8")
+        self.assertEqual(body, (WEB_FILES / "style.css").read_bytes())
+
+    def test_static_files_need_no_token(self):
+        # 静态资源与 GET / 一样是只读的，不应要求写令牌
+        for path in ("/static/app.js", "/static/style.css"):
+            with self.subTest(path=path):
+                status, _ = self.request("GET", path)
+                self.assertEqual(status, 200)
 
 
 class PostGateTest(WebServerCase):
@@ -126,15 +170,22 @@ class PostGateTest(WebServerCase):
 
 
 class FrontendSourceTest(unittest.TestCase):
-    def test_no_inline_onclick(self):
-        # v0.4 移除了全部 inline onclick，改事件委托；这里防回退
-        src = Path(web.__file__).read_text(encoding="utf-8").lower()
-        self.assertNotIn("onclick=", src)
-        self.assertNotIn("onclick=", web.PAGE.lower())
+    def test_no_inline_event_handlers(self):
+        # v0.4 移除了全部 inline 事件属性，改事件委托；v0.6 抽成静态文件后
+        # 对 index.html 与 app.js 两份源都防回退
+        handlers = ("onclick=", "oninput=", "onchange=", "onload=", "onerror=",
+                    "onsubmit=", "onkeydown=", "onkeyup=", "onmouseover=",
+                    "onfocus=", "onblur=")
+        for name in ("index.html", "app.js"):
+            src = read_web(name).lower()
+            for h in handlers:
+                with self.subTest(file=name, handler=h):
+                    self.assertNotIn(h, src)
 
     def test_event_delegation_present(self):
-        self.assertIn("addEventListener", web.PAGE)
-        self.assertIn("dataset.name", web.PAGE)
+        app_js = read_web("app.js")
+        self.assertIn("addEventListener", app_js)
+        self.assertIn("dataset.name", app_js)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,13 @@ cp "$ROOT/clash_speedbench.py" \
    "$ROOT/speedbench_workers.py" \
    "$APP/Contents/Resources/app/"
 
+echo "→ 拷贝前端静态文件"
+if [ ! -f "$ROOT/web/index.html" ]; then
+  echo "✗ 缺少 web/index.html：前端文件不完整，终止打包（避免打出残包）" >&2
+  exit 1
+fi
+cp -R "$ROOT/web" "$APP/Contents/Resources/app/"
+
 echo "→ 生成图标"
 python3 "$ROOT/scripts/make_icon.py" "$APP/Contents/Resources/AppIcon.icns"
 

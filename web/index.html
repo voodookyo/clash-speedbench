@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="sb-token" content="__SB_TOKEN__">
+<title>Clash SpeedBench</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidenav">
+    <div class="logo">⚡ Clash SpeedBench</div>
+    <nav id="nav">
+      <a class="nav-item" data-view="nodes" href="#/nodes">🗂 节点</a>
+      <a class="nav-item" data-view="history" href="#/history">📈 历史</a>
+      <a class="nav-item" data-view="about" href="#/about">ℹ️ 关于</a>
+    </nav>
+    <div class="nav-foot"><button class="mini" id="btn-quit">停止面板</button></div>
+  </aside>
+
+  <main id="main">
+
+    <!-- ============ 节点视图 ============ -->
+    <section id="view-nodes">
+      <div class="card">
+        <div class="controls">
+          <div><label>节点过滤（正则，留空=全部）</label>
+            <input type="text" id="f-include" placeholder="例如 香港|HK"></div>
+          <div><label>每轮 MB</label><input type="number" id="f-mb" value="30" min="1" max="95"></div>
+          <div><label>轮数</label><input type="number" id="f-rounds" value="1" min="1" max="5"></div>
+          <div><label>&nbsp;</label><label class="chk">
+            <input type="checkbox" id="f-autoswitch"> 测完自动切到冠军</label></div>
+          <div><label>&nbsp;</label><button id="btn-run">开始测速</button></div>
+          <div><label>&nbsp;</label><button id="btn-cancel" class="danger" style="display:none">中断测速</button></div>
+        </div>
+        <div class="warn">⚠️ 测速期间 Mihomo 会临时切到 GLOBAL 模式，全网流量跟随被测节点；结束自动恢复。</div>
+        <progress id="prog" max="100" value="0"></progress>
+        <div id="log-toggle" style="display:none"><span id="log-arrow">▸</span> 运行日志</div>
+        <div id="log"></div>
+      </div>
+
+      <div class="card">
+        <div class="meta-line">
+          <span id="latest-meta">暂无测速记录</span>
+          <span id="cur-line"></span>
+        </div>
+        <div class="toolbar">
+          <div id="profile-bar">
+            <span class="pf-label">评分 Profile</span>
+            <button class="mini pf" data-p="all" title="后端综合评分（延迟+带宽+IP 画像加权）">综合推荐</button>
+            <button class="mini pf" data-p="daily" title="0.5×延迟 + 0.3×抖动 + 0.2×带宽，日常浏览体验优先">⚡ 日常</button>
+            <button class="mini pf" data-p="download" title="0.7×单线程带宽(300M封顶) + 0.3×多线程带宽(500M封顶)，下载优先">🚀 下载</button>
+            <button class="mini pf" data-p="ipclean" title="按出口 IP 属性打分：无标记 100 / 移动 75 / 托管 50 / 代理 20">🧼 IP</button>
+          </div>
+          <input type="text" id="f-search" placeholder="🔍 搜索节点名…">
+        </div>
+        <div id="board" style="display:none">
+          <div id="board-toggle"><span id="board-arrow">▸</span> 地区榜 · 各地区在当前 Profile 下的 Top 3（点击看趋势）</div>
+          <div id="board-body" style="display:none"></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>#</th>
+              <th class="sort" data-k="name">节点 <span class="arr"></span></th>
+              <th class="sort" data-k="latency_ms">延迟 <span class="arr"></span></th>
+              <th class="sort" data-k="median_mbps">带宽 <span class="arr"></span></th>
+              <th class="sort" data-k="score">评分 <span class="arr">▼</span></th>
+              <th class="sort" data-k="ip">IP画像 <span class="arr"></span></th>
+              <th>标签</th><th></th>
+            </tr></thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 历史视图 ============ -->
+    <section id="view-history" style="display:none">
+      <div class="hist-layout">
+        <div class="card hist-side">
+          <div class="card-title">测速轮次</div>
+          <div id="hist-list"></div>
+        </div>
+        <div class="hist-main">
+          <div class="card">
+            <div class="card-title" id="hist-run-title">选择左侧一轮测速查看结果</div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr>
+                  <th>#</th>
+                  <th class="hsort" data-k="name">节点 <span class="arr"></span></th>
+                  <th class="hsort" data-k="latency_ms">延迟 <span class="arr"></span></th>
+                  <th class="hsort" data-k="median_mbps">带宽 <span class="arr"></span></th>
+                  <th class="hsort" data-k="score">评分 <span class="arr">▼</span></th>
+                  <th>IP画像</th>
+                  <th>标签</th><th></th>
+                </tr></thead>
+                <tbody id="hist-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title" id="chart-title">30 天带宽趋势（选择节点后展示）</div>
+            <div id="chart-sub"></div>
+            <canvas id="chart"></canvas>
+            <div id="ip-timeline"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 关于视图 ============ -->
+    <section id="view-about" style="display:none">
+      <div class="card about">
+        <div class="card-title">⚡ Clash SpeedBench · v0.6</div>
+        <p>Clash Verge Rev / Mihomo 节点的本地综合测速面板：延迟 + 真实带宽 + IP 画像 + 综合评分，一键切换最优节点。</p>
+
+        <h2>两阶段测速原理</h2>
+        <ul>
+          <li><b>Phase 1 · 并发粗筛</b>：对所有候选节点并发探测连通性、延迟、抖动与建连耗时，快速排除不通/龟速节点。</li>
+          <li><b>Phase 2 · 串行精测</b>：只对延迟最优的 Top-N 连通节点逐个做真实下载测速（curl 经 mixed-port），得单流中位/最佳带宽，可选 4 路并发流测峰值；样本大小随带宽自适应。</li>
+          <li><b>IP 画像</b>：逐节点查询出口 IP 的国家/ASN/ISP 与代理、托管、移动标记，识别「脏 IP」。</li>
+        </ul>
+
+        <h2>安全说明</h2>
+        <ul>
+          <li>面板只绑定 127.0.0.1，不对外暴露；零第三方依赖，纯 Python 标准库 + 原生前端。</li>
+          <li>每次启动生成随机写操作令牌注入本页 <code>&lt;meta&gt;</code>，所有 POST 需携带令牌并通过 Host / Origin 校验，防跨站写请求（CSRF / DNS rebinding）。</li>
+          <li>前端无任何 inline 事件属性与第三方脚本，节点名等动态文本一律转义后经 <code>data-*</code> 传递，杜绝注入。</li>
+        </ul>
+
+        <h2>项目链接</h2>
+        <p><a href="https://github.com/voodookyo/clash-speedbench" target="_blank" rel="noopener">github.com/voodookyo/clash-speedbench</a></p>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div id="toasts"></div>
+
+<div id="modal-mask" style="display:none">
+  <div class="modal">
+    <div id="modal-text"></div>
+    <div class="modal-btns">
+      <button class="mini" id="modal-no">取消</button>
+      <button class="danger" id="modal-yes">确认</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

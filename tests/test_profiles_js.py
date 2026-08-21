@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""前端内联 JS（speedbench_web.PAGE 的 <script>）逻辑测试：抽取后用 node 真执行。
+"""前端 JS（web/app.js 全文）逻辑测试：抽取后用 node 真执行。
 
-做法：stub 最小 DOM / localStorage / fetch，把页面脚本原样跑一遍（含末尾的
-事件绑定与 loadLatest/loadHistory/loadCurrent），再在同一词法作用域追加驱动
-代码直接调用其顶层函数，结果 JSON 打到 stdout 由 Python 断言：
+做法：stub 最小 DOM / localStorage / fetch，把 app.js 原样跑一遍（含末尾的
+init() 事件绑定与 loadLatest/loadHistory/loadCurrent 启动链路），再在同一词法
+作用域追加驱动代码直接调用其顶层函数，结果 JSON 打到 stdout 由 Python 断言：
 
 - 4 个评分 Profile（all/daily/download/ipclean）公式数值样例 + 沉底规则（返回 null）
 - regionOf 地区启发式：country_code 优先 > 国旗 emoji > 中/英关键词 > '??' 兜底
@@ -12,7 +12,6 @@
 系统没有 node（shutil.which）时执行类测试整组 skip；抽取/结构测试不需要 node。
 """
 import json
-import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import speedbench_web as web
 
 NODE = shutil.which("node")
+
+# v0.6 起前端从内嵌 PAGE 抽成静态文件；被测对象即服务端分发的 app.js 原文
+APP_JS = Path(web.__file__).resolve().parent / "web" / "app.js"
 
 # 只实现页面脚本实际用到的那一面的最小 stub
 STUB_JS = r"""
@@ -39,9 +41,11 @@ function __el(id){
     __elements[id] = {
       style:{}, dataset:{}, innerHTML:"", textContent:"", value:"",
       checked:false, disabled:false, scrollTop:0, scrollHeight:0,
-      clientWidth:800, clientHeight:220, width:0, height:0,
+      clientWidth:800, clientHeight:240, width:0, height:0,
+      classList:{ add(){}, remove(){}, toggle(){}, contains(){ return false; } },
       addEventListener(){}, getContext(){ return __ctx2d; },
       querySelector(){ return {textContent:""}; },
+      appendChild(){}, remove(){},
     };
   }
   return __elements[id];
@@ -50,6 +54,8 @@ const document = {
   querySelector(){ return {content:"stub-token", textContent:""}; },
   querySelectorAll(){ return []; },
   getElementById: __el,
+  createElement(){ return { className:"", textContent:"",
+    classList:{add(){},remove(){}}, remove(){} }; },
   body: {},
 };
 const window = { devicePixelRatio:1, addEventListener(){} };
@@ -117,18 +123,16 @@ console.log("##RESULTS##" + JSON.stringify(R));
 """
 
 
-def extract_page_js():
-    """PAGE 里唯一的 <script> 块内容。"""
-    blocks = re.findall(r"<script>\n(.*?)\n</script>", web.PAGE, re.S)
-    assert len(blocks) == 1, f"PAGE 应有唯一 <script> 块，实际 {len(blocks)} 个"
-    return blocks[0]
+def extract_app_js():
+    """web/app.js 全文：顶层绑定名与旧版内嵌 <script> 一致，可整文件直接执行。"""
+    return APP_JS.read_text(encoding="utf-8")
 
 
-class PageJsExtractionTest(unittest.TestCase):
-    """不需要 node：验证 <script> 可抽取且被测函数都在。"""
+class AppJsExtractionTest(unittest.TestCase):
+    """不需要 node：验证 app.js 可读且被测函数都在。"""
 
-    def test_single_script_block_with_target_functions(self):
-        js = extract_page_js()
+    def test_app_js_has_target_functions(self):
+        js = extract_app_js()
         for fn in ("function profileScore", "function regionOf",
                    "function flagCode", "function keywordCode",
                    "function setProfile", "function toggleFav"):
@@ -136,7 +140,7 @@ class PageJsExtractionTest(unittest.TestCase):
 
 
 @unittest.skipIf(NODE is None, "系统没有 node，跳过前端 JS 执行测试")
-class PageJsLogicTest(unittest.TestCase):
+class AppJsLogicTest(unittest.TestCase):
     MARK = "##RESULTS##"
 
     PROFILE_EXPECTED = {
@@ -176,16 +180,16 @@ class PageJsLogicTest(unittest.TestCase):
         "keyword_plus": "__NULL__",
     }
 
-    def run_page_js(self, preseed=None):
+    def run_app_js(self, preseed=None):
         js = (STUB_JS.replace("__PRESEED__", json.dumps(preseed or {}))
-              + extract_page_js() + DRIVER_JS)
+              + extract_app_js() + DRIVER_JS)
         with tempfile.TemporaryDirectory() as td:
-            script = Path(td) / "page_test.js"
+            script = Path(td) / "app_test.js"
             script.write_text(js, encoding="utf-8")
             proc = subprocess.run([NODE, str(script)], capture_output=True,
                                   encoding="utf-8", timeout=30)
         self.assertEqual(proc.returncode, 0,
-                         msg=f"node 执行页面脚本失败:\n{proc.stderr}\n{proc.stdout[-2000:]}")
+                         msg=f"node 执行 app.js 失败:\n{proc.stderr}\n{proc.stdout[-2000:]}")
         for line in proc.stdout.splitlines():
             if line.startswith(self.MARK):
                 return json.loads(line[len(self.MARK):])
@@ -203,17 +207,17 @@ class PageJsLogicTest(unittest.TestCase):
                     self.assertAlmostEqual(got, want, places=6)
 
     def test_profile_formulas_and_null_rule(self):
-        r = self.run_page_js()
+        r = self.run_app_js()
         self.check_expected(r, self.PROFILE_EXPECTED)
         self.assertEqual(r["initial_profile"], "all")  # 空存储默认综合推荐
 
     def test_region_of_heuristics(self):
-        r = self.run_page_js()
+        r = self.run_app_js()
         self.check_expected(r, self.REGION_EXPECTED)
 
     def test_localstorage_persistence(self):
-        r = self.run_page_js(preseed={"sb_profile": "download",
-                                      "sb_favs": '["节点A"]'})
+        r = self.run_app_js(preseed={"sb_profile": "download",
+                                     "sb_favs": '["节点A"]'})
         self.assertEqual(r["initial_profile"], "download")  # 启动恢复上次 Profile
         self.assertIs(r["fav_seeded"], True)                # 启动恢复收藏集
         self.assertIsInstance(r["favs_json"], str)
