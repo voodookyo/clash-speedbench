@@ -144,9 +144,27 @@ def do_switch(name: str) -> dict:
             return {"ok": False, "msg": f"找不到包含 {name} 的 Selector 组"}
         current = proxies.get(group, {}).get("now")
         if current == name:
-            return {"ok": True, "msg": f"{group} 已是 {name}"}
+            return {"ok": True, "msg": f"{group} 已是 {name}", "group": group, "now": name}
         api.select(group, name)
-        return {"ok": True, "msg": f"已切换 {group} → {name}"}
+        return {"ok": True, "msg": f"已切换 {group} → {name}", "group": group, "now": name}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+
+def get_current() -> dict:
+    """The main selector group (largest non-GLOBAL Selector) and its current node."""
+    try:
+        base, needs_secret = detect_controller(os.environ.get("MIHOMO_SECRET", ""), None)
+        if needs_secret:
+            return {"ok": False, "msg": "需要 Secret"}
+        api = MihomoAPI(base, secret=os.environ.get("MIHOMO_SECRET", ""))
+        proxies = api.get("/proxies").get("proxies", {})
+        graph = build_selectable_graph(proxies)
+        cands = [g for g in graph
+                 if g != "GLOBAL" and proxies.get(g, {}).get("type") == "Selector"]
+        group = max(cands, key=lambda g: len(graph[g])) if cands else "GLOBAL"
+        return {"ok": True, "group": group,
+                "now": str(proxies.get(group, {}).get("now", ""))}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
 
@@ -198,11 +216,17 @@ PAGE = r"""<!DOCTYPE html>
            border:1px solid var(--border); border-radius:6px; }
   #chart-title { color:var(--dim); font-size:12px; margin-bottom:8px; }
   .mono { font-family:ui-monospace,monospace; }
+  th.sort { cursor:pointer; user-select:none; }
+  th.sort:hover { color:var(--fg); }
+  th.sort .arr { color:var(--accent); font-size:10px; }
+  tr.current td { background:#12261a; box-shadow:inset 3px 0 0 var(--good); }
+  tr.current td:first-child { box-shadow:inset 3px 0 0 var(--good); }
+  .cur-mark { color:var(--good); font-size:11px; margin-left:6px; }
 </style>
 </head>
 <body>
 <h1>⚡ Clash SpeedBench <button class="mini" style="float:right" onclick="quitPanel()">停止面板</button></h1>
-<div class="sub">延迟 + 真实带宽 + IP 纯净度 + 综合评分 · 本地面板（127.0.0.1）</div>
+<div class="sub">延迟 + 真实带宽 + IP 纯净度 + 综合评分 · 本地面板（127.0.0.1）<span id="cur-line"></span></div>
 
 <div class="card">
   <div class="controls">
@@ -224,8 +248,13 @@ PAGE = r"""<!DOCTYPE html>
   <div style="overflow:auto; max-height:480px;">
   <table>
     <thead><tr>
-      <th>#</th><th>节点</th><th>延迟</th><th>带宽</th><th>评分</th>
-      <th>IP画像</th><th>标签</th><th></th>
+      <th>#</th>
+      <th class="sort" data-k="name" onclick="setSort('name')">节点 <span class="arr"></span></th>
+      <th class="sort" data-k="latency_ms" onclick="setSort('latency_ms')">延迟 <span class="arr"></span></th>
+      <th class="sort" data-k="median_mbps" onclick="setSort('median_mbps')">带宽 <span class="arr"></span></th>
+      <th class="sort" data-k="score" onclick="setSort('score')">评分 <span class="arr">▼</span></th>
+      <th class="sort" data-k="ip" onclick="setSort('ip')">IP画像 <span class="arr"></span></th>
+      <th>标签</th><th></th>
     </tr></thead>
     <tbody id="tbody"></tbody>
   </table>
@@ -258,23 +287,73 @@ function ipHtml(ip){
   return `${esc(ip.country_code||ip.country)}·${esc(ip.kind)}·风险${esc(ip.risk)}`;
 }
 
-async function loadLatest(){
-  const rec = await (await fetch('/api/latest')).json();
+let latestData = null;
+let sortKey = 'score', sortAsc = false;
+let currentNode = '', currentGroup = '';
+
+function sortVal(r, k){
+  if(k==='ip'){ const ip=r.ip; return (ip&&ip.ok)?(100-(+ip.risk||0)):null; }
+  return r[k];
+}
+
+function setSort(k){
+  if(sortKey===k){ sortAsc=!sortAsc; } else { sortKey=k; sortAsc=(k==='name'||k==='latency_ms'); }
+  document.querySelectorAll('th.sort').forEach(th=>{
+    th.querySelector('.arr').textContent = th.dataset.k===sortKey ? (sortAsc?'▲':'▼') : '';
+  });
+  renderTable();
+}
+
+function renderTable(){
   const tbody = document.getElementById('tbody');
-  if(!rec.results){ tbody.innerHTML=''; return; }
-  document.getElementById('latest-meta').textContent =
-    `上次测速：${rec.ts} · ${rec.results.length} 个节点 · ${rec.mb}MB×${rec.rounds}轮`;
-  tbody.innerHTML = rec.results.map((r,i)=>`<tr>
+  if(!latestData || !latestData.results){ tbody.innerHTML=''; return; }
+  const rows = latestData.results.slice();
+  rows.sort((a,b)=>{
+    const va=sortVal(a,sortKey), vb=sortVal(b,sortKey);
+    if(va==null && vb==null) return 0;
+    if(va==null) return 1;   // 不通的永远排最后
+    if(vb==null) return -1;
+    const cmp = (typeof va==='string') ? va.localeCompare(vb,'zh') : va-vb;
+    return sortAsc ? cmp : -cmp;
+  });
+  tbody.innerHTML = rows.map((r,i)=>{
+    const isCur = r.name===currentNode;
+    return `<tr${isCur?' class="current"':''}>
     <td>${i+1}</td>
-    <td>${esc(r.name)}</td>
+    <td>${esc(r.name)}${isCur?'<span class="cur-mark">✅ 当前</span>':''}</td>
     <td class="mono">${r.latency_ms??'-'}</td>
     <td class="mono">${r.median_mbps?r.median_mbps.toFixed(1):'-'}</td>
     <td class="stars" title="查看历史趋势" onclick="showChart('${esc(r.name)}')">${esc(r.stars)}</td>
     <td>${ipHtml(r.ip)}</td>
     <td>${tagHtml(r.tags)}</td>
-    <td><button class="mini" onclick="switchNode('${esc(r.name)}')">切换</button></td>
-  </tr>`).join('');
-  if(!chartNode && rec.results.length){ chartNode = rec.results[0].name; drawChart(); }
+    <td>${isCur?'<button class="mini" disabled>使用中</button>'
+               :`<button class="mini" onclick="switchNode('${esc(r.name)}')">切换</button>`}</td>
+  </tr>`;}).join('');
+}
+
+function renderCurrent(){
+  document.getElementById('cur-line').textContent =
+    currentNode ? ` · 当前：${currentGroup} = ${currentNode}` : '';
+  renderTable();
+}
+
+async function loadLatest(){
+  const rec = await (await fetch('/api/latest')).json();
+  if(rec.results){
+    latestData = rec;
+    document.getElementById('latest-meta').textContent =
+      `上次测速：${rec.ts} · ${rec.results.length} 个节点 · ${rec.mb}MB×${rec.rounds}轮`;
+    if(!chartNode && rec.results.length){ chartNode = rec.results[0].name; drawChart(); }
+  }
+  renderTable();
+}
+
+async function loadCurrent(){
+  try{
+    const r = await (await fetch('/api/current')).json();
+    if(r.ok){ currentGroup=r.group; currentNode=r.now; }
+  }catch(e){}
+  renderCurrent();
 }
 
 async function startRun(){
@@ -307,13 +386,19 @@ async function pollStatus(){
   if(!s.running){
     clearInterval(pollTimer);
     document.getElementById('btn-run').disabled = false;
-    loadLatest(); loadHistory();
+    loadLatest(); loadHistory(); loadCurrent();
   }
 }
 
 async function switchNode(name){
   const r = await (await fetch('/api/switch',{method:'POST',body:JSON.stringify({name})})).json();
-  alert(r.msg);
+  if(r.ok){
+    currentNode = name;
+    if(r.group) currentGroup = r.group;
+    renderCurrent();
+  }else{
+    alert(r.msg);
+  }
 }
 
 async function quitPanel(){
@@ -361,7 +446,7 @@ function drawChart(){
   pts.forEach((p,i)=>{ if(pts.length<=12||i%2===0) ctx.fillText(p.ts, x(i)-20*dpr, H-10*dpr); });
 }
 
-loadLatest(); loadHistory();
+loadLatest(); loadHistory(); loadCurrent();
 window.addEventListener('resize', drawChart);
 </script>
 </body>
@@ -401,6 +486,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif path == "/api/latest":
             self._json(latest_record())
+        elif path == "/api/current":
+            self._json(get_current())
         elif path == "/api/history":
             self._json(slim_history())
         elif path == "/api/run/status":
