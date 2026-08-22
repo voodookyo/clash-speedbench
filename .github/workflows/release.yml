@@ -1,0 +1,43 @@
+name: release
+
+# 打 tag（v*）时自动构建 macOS App 并发布到 GitHub Releases。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 单元测试（发版前先跑测试）
+        run: python3 -m unittest discover -s tests -v
+
+      - name: 构建 App
+        run: bash build_app.sh
+
+      - name: 打包 zip（ditto 保留 macOS 元数据）
+        run: |
+          cd dist
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
+            "Clash SpeedBench.app" "Clash-SpeedBench-${GITHUB_REF_NAME}-macos.zip"
+          shasum -a 256 "Clash-SpeedBench-${GITHUB_REF_NAME}-macos.zip" \
+            > "Clash-SpeedBench-${GITHUB_REF_NAME}-macos.zip.sha256"
+          ls -la
+
+      - name: 发布到 Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Clash SpeedBench $GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md \
+            "dist/Clash-SpeedBench-${GITHUB_REF_NAME}-macos.zip" \
+            "dist/Clash-SpeedBench-${GITHUB_REF_NAME}-macos.zip.sha256" || \
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/Clash-SpeedBench-${GITHUB_REF_NAME}-macos.zip" \
+            "dist/Clash-SpeedBench-${GITHUB_REF_NAME}-macos.zip.sha256" --clobber

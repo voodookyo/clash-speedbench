@@ -57,6 +57,16 @@ Phase 2 精测（严格串行）：warmup 1MB → 自适应样本（10~95MB）�
 
 前提：Clash Verge Rev（或其他 Mihomo 客户端）正在运行，且开启外部控制（默认即可）。
 
+### 方式一：下载 App（推荐，无需拉源码）
+
+从 [Releases](https://github.com/voodookyo/clash-speedbench/releases) 下载
+`Clash-SpeedBench-*-macos.zip`，解压后拖进「应用程序」。首次打开需**右键 → 打开**
+（应用未做付费开发者签名，Gatekeeper 会拦一次）。需要系统自带 python3
+（装过 Xcode 命令行工具或 Homebrew Python 即可，没有的话 App 会弹窗提示）。
+保持 Clash Verge 运行，双击图标即打开 Web 面板。
+
+### 方式二：源码运行
+
 ```bash
 git clone https://github.com/voodookyo/clash-speedbench.git
 cd clash-speedbench
