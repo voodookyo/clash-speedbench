@@ -3,11 +3,14 @@
 """
 Clash SpeedBench — concurrent worker pool (two-phase).
 
-Phase 1 粗筛：spawns several throwaway mihomo processes (reusing the binary that
-ships with Clash Verge) with a minimal generated config, probing nodes in
-parallel — latency/jitter, connectivity and exit-IP profile only, NO bandwidth
-download, so the user's running Clash instance is never touched and the WAN
-link stays idle.
+Phase 1 粗筛：latency/connectivity is measured through the MAIN mihomo
+instance's /delay API — same caliber as Clash Verge's ping (no node switching;
+the main instance dials the HTTPS probe through the named proxy itself), so the
+numbers match what Verge shows. The throwaway worker pool (several temporary
+mihomo processes reusing the binary that ships with Clash Verge, minimal
+generated config) is narrowed to exit-IP profiling plus a latency fallback for
+nodes whose main-instance /delay failed — NO bandwidth download, so the user's
+running Clash instance is never touched and the WAN link stays idle.
 
 Phase 2 精测：one extra throwaway mihomo worker measures the Top-N nodes' real
 download speed strictly one node at a time, so parallel downloads never fight
@@ -46,7 +49,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from clash_speedbench import (
     DEFAULT_DOWNLOAD_URL,
@@ -315,10 +318,46 @@ class Worker:
         self.api.select("GLOBAL", name)
 
 
-def _probe_node_in_worker(worker: Worker, name: str, proto: str, args) -> Result:
-    """Phase 1 粗筛：只做延迟/抖动 + 连通性判定 + 出口 IP 画像，不跑带宽下载。"""
+def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
+                       max_workers: int = 10
+                       ) -> Dict[str, Tuple[Optional[int], Optional[float]]]:
+    """Phase 1 第 1 步：经主实例 /delay API 并发测全部节点延迟，
+    返回 {节点名: (中位延迟 ms, 抖动 ms)}；完全不通的节点值为 (None, None)。
+    固定 10 路并发：/delay 是小流量 HTTPS 探测（Clash Verge 的「全部测速」
+    就是这么并发打的），与临时 worker 进程数（--workers）无关。"""
+    # 主实例 HTTP 超时默认 5s，慢节点的 /delay 探测可能刚好顶到 --delay-timeout
+    # 才被本地 HTTP 超时砍掉（proxy_delay 对一切异常返回 None，会把「慢但通」
+    # 误判成不通），探测期间放宽到 delay_timeout + 3s
+    api.timeout = max(api.timeout, timeout_ms / 1000 + 3.0)
+    out: Dict[str, Tuple[Optional[int], Optional[float]]] = {}
+    lock = threading.Lock()
+    done = {"n": 0}
+    total = len(names)
+
+    def one(name: str) -> None:
+        lat, jit = probe_latency(api, name, timeout_ms)
+        with lock:
+            out[name] = (lat, jit)
+            done["n"] += 1
+            idx = done["n"]
+        jitter_brief = f"±{jit:.0f}" if jit else ""
+        print(f"Phase 1 粗筛 [{idx:>3}/{total}] {name} | "
+              f"{fmt_ms(lat)}{jitter_brief} ms（主实例）")
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, total))) as pool:
+        list(pool.map(one, names))
+    return out
+
+
+def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
+                          latency: Optional[int] = None,
+                          jitter: Optional[float] = None) -> Result:
+    """Phase 1 第 2 步：worker 职责已收窄为出口 IP 画像探测（不跑带宽下载）。
+    latency/jitter 来自主实例 /delay 探测结果；为 None 的节点（主实例探测失败，
+    或调用方未提供主实例 api）在 worker 内兜底重测一次，worker 也失败才标「不通」。"""
     assert worker.api is not None
-    latency, jitter = probe_latency(worker.api, name, args.delay_timeout)
+    if latency is None:
+        latency, jitter = probe_latency(worker.api, name, args.delay_timeout)
     if latency is None:
         return Result(name=name, provider="", proto=proto, latency_ms=None,
                       speeds_mbps=[], median_mbps=None, best_mbps=None,
@@ -400,9 +439,12 @@ def relabel_unmeasured(r: Result) -> None:
                           for t in r.tags.split(","))
 
 
-def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args) -> List[Result]:
+def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
+             main_api: Optional[MihomoAPI] = None) -> List[Result]:
     """两阶段测速，从不触碰用户正在运行的实例：
-    Phase 1 用并发 worker 池粗筛（延迟/抖动/连通性/IP 画像，不跑带宽），
+    Phase 1 的延迟/连通性经主实例 /delay API 并发探测（与 Clash Verge 的 ping
+    同口径；main_api 缺省时退回 worker 内探测，即旧行为），worker 池只做出口
+    IP 画像 + 主实例探测失败节点的延迟兜底，不跑带宽；
     Phase 2 新建单个 worker 对 Top-N 连通节点严格串行精测真实带宽，
     保证同一时刻全网只有一路测速下载。Raises WorkerUnavailable 触发回退。"""
     mihomo_bin = find_mihomo_bin()
@@ -437,69 +479,111 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args) -> List
     # 依赖闭包内前置节点的 server 域名也要钉住，否则前置节点拨号会拿到 fake-ip
     hosts = build_hosts(with_dependencies(selected, all_proxies))
 
-    worker_count = max(1, min(args.workers, len(selected)))
-    print(f"Phase 1 粗筛: 启动 {worker_count} 个并发 worker"
-          f"（仅延迟/连通性/IP 画像，不下载，不打扰正在运行的 Clash）…")
+    started = time.time()
+    total = len(selected)
 
-    # Round-robin 分片，尽量均匀
-    shards: List[List[dict]] = [[] for _ in range(worker_count)]
-    for i, p in enumerate(selected):
-        shards[i % worker_count].append(p)
+    # ---- Phase 1 第 1 步：主实例 /delay 并发延迟探测 ----
+    # 进度展示方案：延迟先行快速刷完一轮「Phase 1 粗筛 [N/M]」，随后 worker 的
+    # IP 画像再计第二轮 [N/M]——Web 端只认最后一条 [N/M] 计数（app.js 正则），
+    # 表现为进度条涨满后回退再涨，阶段标签始终是「Phase 1 粗筛」，无需改 Web。
+    latency_map: Dict[str, Tuple[Optional[int], Optional[float]]] = {}
+    if main_api is not None:
+        print(f"Phase 1 粗筛 · 延迟探测: 经主实例 /delay 并发测 {total} 个节点"
+              f"（Clash Verge ping 同口径，不切换节点）…")
+        try:
+            latency_map = probe_latency_pool(
+                main_api, [str(p.get("name")) for p in selected], args.delay_timeout)
+        except KeyboardInterrupt:
+            print("\n\n收到 Ctrl+C，停止测速……")
+            raise
+        n_ok = sum(1 for lat, _jit in latency_map.values() if lat is not None)
+        print(f"Phase 1 延迟探测完成: {n_ok}/{total} 连通"
+              + (f"；主实例失败的 {total - n_ok} 个将在 worker 内兜底重测"
+                 if n_ok < total else ""))
+
+    # ---- Phase 1 第 2 步：worker 池出口 IP 画像 + 延迟兜底 ----
+    # 需进 worker 的节点：未跳过 IP 画像时是全部节点；--no-ip 时只剩主实例
+    # /delay 失败、需要 worker 兜底复测的节点（main_api 缺省时 latency_map 为空，
+    # 全部节点都进 worker 测延迟，即旧行为）。全部连通且 --no-ip 时 worker 无活可干，
+    # 直接跳过，省得起一批临时 mihomo 进程。
+    ip_pending = [p for p in selected
+                  if not args.no_ip
+                  or latency_map.get(str(p.get("name")), (None, None))[0] is None]
 
     results: List[Result] = []
     results_lock = threading.Lock()
     done_counter = {"n": 0}
-    total = len(selected)
 
-    def shard_loop(shard: List[dict]) -> None:
-        # worker 配置 = 分片节点 + 各自的 dialer-proxy 依赖闭包；
-        # 探测仍只针对分片内的入选节点，依赖节点仅供链式拨号、不计入结果
-        worker = Worker(mihomo_bin, with_dependencies(shard, all_proxies), hosts, iface)
-        worker.start()
+    if not ip_pending:
+        for p in selected:
+            name = str(p.get("name"))
+            lat, jit = latency_map.get(name, (None, None))
+            results.append(Result(name=name, provider="", proto=str(p.get("type", "")),
+                                  latency_ms=lat, speeds_mbps=[], median_mbps=None,
+                                  best_mbps=None,
+                                  status="ok" if lat is not None else "unreachable",
+                                  jitter_ms=jit))
+    else:
+        worker_count = max(1, min(args.workers, len(ip_pending)))
+        print(f"Phase 1 粗筛 · IP 画像: 启动 {worker_count} 个并发 worker"
+              f"（{len(ip_pending)} 节点，仅出口 IP 探测/延迟兜底，不下载，"
+              f"不打扰正在运行的 Clash）…")
+
+        # Round-robin 分片，尽量均匀
+        shards: List[List[dict]] = [[] for _ in range(worker_count)]
+        for i, p in enumerate(ip_pending):
+            shards[i % worker_count].append(p)
+
+        ip_total = len(ip_pending)
+
+        def shard_loop(shard: List[dict]) -> None:
+            # worker 配置 = 分片节点 + 各自的 dialer-proxy 依赖闭包；
+            # 探测仍只针对分片内的入选节点，依赖节点仅供链式拨号、不计入结果
+            worker = Worker(mihomo_bin, with_dependencies(shard, all_proxies), hosts, iface)
+            worker.start()
+            try:
+                for p in shard:
+                    name = str(p.get("name"))
+                    proto = str(p.get("type", ""))
+                    lat, jit = latency_map.get(name, (None, None))
+                    try:
+                        r = _probe_node_in_worker(worker, name, proto, args, lat, jit)
+                    except Exception as e:
+                        r = Result(name=name, provider="", proto=proto, latency_ms=None,
+                                   speeds_mbps=[], median_mbps=None, best_mbps=None,
+                                   status=f"error: {e}"[:160])
+                    with results_lock:
+                        results.append(r)
+                        done_counter["n"] += 1
+                        idx = done_counter["n"]
+                    ip_txt = f" | {ip_brief(r.ip)}" if r.ip and r.ip.ok else ""
+                    jitter_brief = f"±{r.jitter_ms:.0f}" if r.jitter_ms else ""
+                    print(f"Phase 1 粗筛 [{idx:>3}/{ip_total}] {name} | "
+                          f"{fmt_ms(r.latency_ms)}{jitter_brief} ms{ip_txt}")
+            finally:
+                worker.stop()
+
+        def guarded(shard: List[dict]) -> None:
+            try:
+                shard_loop(shard)
+            except Exception as e:
+                # 整 shard 失败：给每个节点登记失败结果
+                for p in shard:
+                    with results_lock:
+                        results.append(Result(
+                            name=str(p.get("name")), provider="",
+                            proto=str(p.get("type", "")), latency_ms=None,
+                            speeds_mbps=[], median_mbps=None, best_mbps=None,
+                            status=f"worker-failed: {e}"[:160]))
+                        done_counter["n"] += 1
+
         try:
-            for p in shard:
-                name = str(p.get("name"))
-                proto = str(p.get("type", ""))
-                try:
-                    r = _probe_node_in_worker(worker, name, proto, args)
-                except Exception as e:
-                    r = Result(name=name, provider="", proto=proto, latency_ms=None,
-                               speeds_mbps=[], median_mbps=None, best_mbps=None,
-                               status=f"error: {e}"[:160])
-                with results_lock:
-                    results.append(r)
-                    done_counter["n"] += 1
-                    idx = done_counter["n"]
-                ip_txt = f" | {ip_brief(r.ip)}" if r.ip and r.ip.ok else ""
-                jitter_brief = f"±{r.jitter_ms:.0f}" if r.jitter_ms else ""
-                print(f"Phase 1 粗筛 [{idx:>3}/{total}] {name} | "
-                      f"{fmt_ms(r.latency_ms)}{jitter_brief} ms{ip_txt}")
-        finally:
-            worker.stop()
-
-    def guarded(shard: List[dict]) -> None:
-        try:
-            shard_loop(shard)
-        except Exception as e:
-            # 整 shard 失败：给每个节点登记失败结果
-            for p in shard:
-                with results_lock:
-                    results.append(Result(
-                        name=str(p.get("name")), provider="",
-                        proto=str(p.get("type", "")), latency_ms=None,
-                        speeds_mbps=[], median_mbps=None, best_mbps=None,
-                        status=f"worker-failed: {e}"[:160]))
-                    done_counter["n"] += 1
-
-    started = time.time()
-    try:
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            list(pool.map(guarded, [s for s in shards if s]))
-    except KeyboardInterrupt:
-        print("\n\n收到 Ctrl+C，停止测速（worker 均为临时进程，正在清理）……")
-        raise
-    print(f"Phase 1 粗筛完成，耗时 {time.time() - started:.1f}s"
-          f"（{total} 节点 × {worker_count} workers）")
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                list(pool.map(guarded, [s for s in shards if s]))
+        except KeyboardInterrupt:
+            print("\n\n收到 Ctrl+C，停止测速（worker 均为临时进程，正在清理）……")
+            raise
+    print(f"Phase 1 粗筛完成，耗时 {time.time() - started:.1f}s（{total} 节点）")
 
     # Phase 2 选节点：剔除不通节点后按延迟升序，取 Top N（--all 时取全部连通节点）
     chosen = select_phase2_nodes(results, getattr(args, "top_n", 15),

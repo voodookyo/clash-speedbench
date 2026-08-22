@@ -842,7 +842,7 @@ def main() -> int:
     parser.add_argument("--no-history", action="store_true",
                         help="不写入历史记录")
     parser.add_argument("--workers", type=int, default=6,
-                        help="并发 worker 数（起多个临时 mihomo 实例并行粗筛，不影响运行中的 Clash）；"
+                        help="并发 worker 数（起多个临时 mihomo 实例并行做出口 IP 画像，不影响运行中的 Clash）；"
                              "1=关闭并发，回退到串行 GLOBAL 切换模式。默认 6")
     parser.add_argument("--top-n", type=int, default=15,
                         help="两阶段模式：Phase 2 只对延迟最优的前 N 个连通节点串行精测带宽，默认 15")
@@ -920,7 +920,7 @@ def main() -> int:
         est_mb = max_mb * args.rounds * n_phase2 * (5 if args.multi else 1)
         print("Clash SpeedBench（两阶段并发模式，不影响正在运行的 Clash）")
         print(f"候选节点: {len(candidates)}")
-        print(f"流程: Phase 1 并发粗筛（延迟/连通性/IP 画像，不跑带宽） → "
+        print(f"流程: Phase 1 粗筛（延迟经主实例 /delay 并发探测 + worker 出口 IP 画像，不跑带宽） → "
               f"Phase 2 {'全部' if args.all else f'Top {n_phase2}'} 串行精测带宽")
         print(f"测速参数: {sample_desc} × {args.rounds} 轮/节点，单轮最长 {args.max_time:g}s"
               + ("，追加 4 路并发峰值" if args.multi else "")
@@ -932,7 +932,7 @@ def main() -> int:
                 print("已取消。")
                 return 0
         try:
-            results = run_pool(candidates, proto_by_name, args)
+            results = run_pool(candidates, proto_by_name, args, main_api=api)
         except WorkerUnavailable as e:
             print(f"并发模式不可用：{e}\n回退到串行模式。", file=sys.stderr)
         else:

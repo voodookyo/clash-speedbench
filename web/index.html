@@ -16,7 +16,7 @@
       <a class="nav-item" data-view="history" href="#/history">📈 历史</a>
       <a class="nav-item" data-view="about" href="#/about">ℹ️ 关于</a>
     </nav>
-    <div class="nav-foot"><button class="mini" id="btn-quit">停止面板</button></div>
+    <div class="nav-foot"><button class="quit-btn" id="btn-quit">⏻ 退出 SpeedBench</button></div>
   </aside>
 
   <main id="main">
@@ -35,7 +35,10 @@
           <div><label>&nbsp;</label><button id="btn-cancel" class="danger" style="display:none">中断测速</button></div>
         </div>
         <div class="warn">⚠️ 测速期间 Mihomo 会临时切到 GLOBAL 模式，全网流量跟随被测节点；结束自动恢复。</div>
-        <progress id="prog" max="100" value="0"></progress>
+        <div id="prog-wrap" style="display:none">
+          <progress id="prog" max="100" value="0"></progress>
+          <span id="prog-text"></span>
+        </div>
         <div id="log-toggle" style="display:none"><span id="log-arrow">▸</span> 运行日志</div>
         <div id="log"></div>
       </div>
@@ -133,6 +136,10 @@
 
         <h2>项目链接</h2>
         <p><a href="https://github.com/voodookyo/clash-speedbench" target="_blank" rel="noopener">github.com/voodookyo/clash-speedbench</a></p>
+
+        <h2>退出面板</h2>
+        <p>停止 SpeedBench 面板；若测速仍在进行，会先中断测速并恢复 Clash 配置。与左侧导航底部的按钮相同。</p>
+        <p><button class="quit-btn" id="btn-quit-2">⏻ 退出 SpeedBench</button></p>
       </div>
     </section>
 

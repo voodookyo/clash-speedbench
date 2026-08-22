@@ -1,6 +1,6 @@
 // Clash SpeedBench v0.6 前端：零依赖原生 SPA
 // 三视图 hash 路由（#/nodes #/history #/about），视图常驻 DOM 只切 display，
-// 测速轮询为全局单例，切视图不中断。
+// 测速轮询为全局单例，切视图不中断；boot 时若已有任务在跑（菜单栏触发/页面刷新）则接管续播。
 // 纪律：无 inline 事件属性；节点名一律经 esc() + data-name/dataset 传递，绝不拼进 JS 源码。
 "use strict";
 
@@ -540,12 +540,29 @@ async function loadCurrent(){
 function setRunUi(running){
   document.getElementById('btn-run').disabled = running;
   document.getElementById('btn-cancel').style.display = running ? '' : 'none';
-  document.getElementById('prog').style.display = running ? 'block' : 'none';
+  document.getElementById('prog-wrap').style.display = running ? 'flex' : 'none';
   if(running){
     document.getElementById('log-toggle').style.display = '';
     document.getElementById('log').style.display = 'block';
     document.getElementById('log-arrow').textContent = '▾';
   }
+}
+
+// 启动状态轮询（全局单例）：startRun 与 boot 接管共用；已在轮询时不重复起定时器
+function startPolling(){
+  if(pollTimer) return;
+  pollTimer = setInterval(pollStatus, 1200);
+  pollStatus();
+}
+
+// boot 接管：测速可能由菜单栏（SwiftBar）触发、或页面刷新前已开始；
+// 在跑则恢复运行态 UI 并续上轮询，首次 pollStatus 会把已有 lines 填进日志区
+async function resumeRun(){
+  let s;
+  try{ s = await getJSON('/api/run/status'); }catch(e){ return; }
+  if(!s || !s.running) return;
+  setRunUi(true);
+  startPolling();
 }
 
 async function startRun(){
@@ -560,8 +577,7 @@ async function startRun(){
   catch(e){ toast('启动请求失败', false); return; }
   if(!r.ok){ toast(r.msg||'启动失败', false); return; }
   setRunUi(true);
-  pollTimer = setInterval(pollStatus, 1200);
-  pollStatus();
+  startPolling();
 }
 
 async function pollStatus(){
@@ -571,12 +587,18 @@ async function pollStatus(){
   const log = document.getElementById('log');
   log.textContent = lines.join('\n');
   log.scrollTop = log.scrollHeight;
-  let cur=0, total=0;
+  // 进度解析：通用 [N/M] 计数定进度条；两阶段模式额外认「Phase 1 粗筛 / Phase 2 精测」标签
+  let cur=0, total=0, phase='';
   for(const ln of lines){
     const m = ln.match(/\[\s*(\d+)\/(\d+)\]/);
     if(m){ cur=+m[1]; total=+m[2]; }
+    const pm = ln.match(/Phase\s*([12])\s*(粗筛|精测)\s*\[\s*(\d+)\/(\d+)\]/);
+    if(pm) phase = `Phase ${pm[1]} ${pm[2]} ${+pm[3]}/${+pm[4]}`;
   }
   if(total) document.getElementById('prog').value = cur/total*100;
+  // 进度条旁文本：认得出阶段就显示「Phase 2 精测 3/15」，否则退化显示百分比
+  document.getElementById('prog-text').textContent =
+    phase || (total ? Math.round(cur/total*100)+'%' : '');
   if(!s.running){
     clearInterval(pollTimer); pollTimer = null;
     setRunUi(false);
@@ -737,7 +759,9 @@ function init(){
   });
   document.getElementById('btn-run').addEventListener('click', startRun);
   document.getElementById('btn-cancel').addEventListener('click', cancelRun);
+  // 退出按钮两处：导航底部 + 「关于」视图，复用同一 quitPanel
   document.getElementById('btn-quit').addEventListener('click', quitPanel);
+  document.getElementById('btn-quit-2').addEventListener('click', quitPanel);
   // 确认对话框
   document.getElementById('modal-yes').addEventListener('click', ()=>{
     const f = modalYes; closeModal(); if(f) f();
@@ -757,5 +781,6 @@ function boot(){
   renderTable();      // latestData=null → 骨架屏，loadLatest 完成后替换
   updateSortArrows('th.sort', sortKey, sortAsc);
   loadLatest(); loadCurrent();
+  resumeRun();        // 接管进行中的测速（若有）：恢复运行态 UI 并启动轮询
 }
 boot();
