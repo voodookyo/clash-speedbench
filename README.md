@@ -83,6 +83,25 @@ python3 clash_speedbench.py --include '香港|HK|日本|JP|新加坡|SG' --auto-
 
 macOS 用户也可以直接**双击 `speedbench.command`**（可拖到桌面或 Dock 当按钮用），双击后出现菜单：终端全量测速 / 打开 Web 面板 / 测速并自动切换冠军。
 
+## Windows
+
+**依赖**：Windows 10/11、正在运行的 Clash Verge Rev、Python 3.9+
+（推荐从 Microsoft Store 安装，免手动配置 PATH）、无需管理员权限。
+
+**安装**：从 [Releases](https://github.com/voodookyo/clash-speedbench/releases) 下载
+`Clash-SpeedBench-*-windows.zip`，解压后**双击 `SpeedBench.bat`** 即可。
+若未检测到 Python，会自动打开 Microsoft Store 的 Python 3 页面，装好后重新双击即可；
+数据（历史记录 / Web 令牌）存放在 `%APPDATA%\ClashSpeedBench\`，不污染源码目录。
+
+**使用**：与 macOS 一致——浏览器自动打开 `http://127.0.0.1:8950`，在面板里一键测速、
+排序、切换节点；「中断测速」在 Windows 下通过 CTRL_BREAK_EVENT 优雅中断，
+同样自动恢复 Clash 的运行模式与节点选择。为此面板会保留一个最小化的
+"Clash SpeedBench" 控制台窗口（中断信号需要控制台存在，属正常设计）——
+最小化放着即可，关闭该窗口即退出 SpeedBench（面板里的「退出 SpeedBench」按钮同样可用）。
+
+**与 macOS 的差异**：没有 .app 安装包与菜单栏小工具（SwiftBar 是 macOS 上的可选附加），
+Windows 的入口就是 `SpeedBench.bat`。
+
 ## 输出示例
 
 ```

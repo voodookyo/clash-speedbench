@@ -15,6 +15,8 @@ import speedbench_web as web
 
 class TokenFileTest(unittest.TestCase):
     def test_writes_token_with_0600(self):
+        if os.name == "nt":
+            self.skipTest("Windows 无 POSIX 权限位语义，os.chmod 0600 不适用")
         with tempfile.TemporaryDirectory() as td:
             tf = Path(td) / "web-token"
             with mock.patch.object(web, "TOKEN_FILE", tf):

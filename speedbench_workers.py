@@ -18,7 +18,9 @@ over the same WAN bandwidth.
 
 Key tricks (validated against Clash Verge Rev + TUN on macOS):
 - The Verge-generated clash-verge.yaml holds full proxy credentials; we extract
-  the `proxies` list via macOS's built-in ruby (YAML -> JSON), no pip needed.
+  the `proxies` list via a fallback chain: PyYAML (if the user installed it) ->
+  macOS/Linux built-in ruby (YAML -> JSON) -> built-in mini YAML parser (zero
+  dependency, covers only the serde_yaml-style subset Verge emits). No pip needed.
 - Worker configs are written as JSON (valid YAML) with three test domains pinned
   in `hosts` — the main instance's TUN DNS hijack would otherwise return fake-ips.
 - Selected nodes are expanded with their `dialer-proxy` dependency closure, so
@@ -29,16 +31,18 @@ Key tricks (validated against Clash Verge Rev + TUN on macOS):
   option is unset — see component/dialer), so deliberate per-node settings are
   never overridden.
 
-Anything missing (ruby / binary / config / DoH) -> WorkerUnavailable, and the
-caller falls back to the sequential in-place mode. A default route that already
-lives on a virtual interface (global TUN / other VPN) raises VirtualDefaultRoute
-(a WorkerUnavailable subclass) and takes the same fallback.
+Anything missing (PyYAML / ruby / 内置解析器均失败, binary / config / DoH) ->
+WorkerUnavailable, and the caller falls back to the sequential in-place mode.
+A default route that already lives on a virtual interface (global TUN / other VPN)
+raises VirtualDefaultRoute (a WorkerUnavailable subclass) and takes the same
+fallback.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import statistics
@@ -56,6 +60,7 @@ from clash_speedbench import (
     IpInfo,
     MihomoAPI,
     Result,
+    _no_window_kwargs,
     adaptive_sample,
     classify_ip,
     compute_score,
@@ -80,16 +85,37 @@ class VirtualDefaultRoute(WorkerUnavailable):
     继承 WorkerUnavailable，main() 走同一条「并发不可用 -> 回退串行」路径。"""
 
 
-MIHOMO_BIN_CANDIDATES = (
-    "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo",
-    os.path.expanduser("~/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo"),
-)
+if sys.platform == "win32":
+    # Clash Verge Rev 的 Windows 安装位置：NSIS 每用户安装（%LOCALAPPDATA%）优先，
+    # 其次机器级安装。expandvars 在环境变量不存在时原样返回（路径里残留 %），
+    # 这种展开失败的路径直接过滤掉。
+    MIHOMO_BIN_CANDIDATES = tuple(
+        p for p in (
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Clash Verge\verge-mihomo.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Clash Verge\verge-mihomo.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Clash Verge\verge-mihomo.exe"),
+        )
+        if "%" not in p
+    )
+    CONFIG_CANDIDATES = tuple(
+        p for p in (
+            os.path.expandvars(
+                r"%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\clash-verge.yaml"
+            ),
+        )
+        if "%" not in p
+    )
+else:
+    MIHOMO_BIN_CANDIDATES = (
+        "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo",
+        os.path.expanduser("~/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo"),
+    )
 
-CONFIG_CANDIDATES = (
-    os.path.expanduser(
-        "~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"
-    ),
-)
+    CONFIG_CANDIDATES = (
+        os.path.expanduser(
+            "~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"
+        ),
+    )
 
 TEST_DOMAINS = ("speed.cloudflare.com", "cp.cloudflare.com", "ip-api.com")
 
@@ -103,9 +129,13 @@ DOH_SERVERS = (
 
 
 def find_mihomo_bin() -> Optional[str]:
+    # os.access(p, os.X_OK) 在 Windows 上对 .exe 基本可用（实际按文件存在性判断），保留
     for p in MIHOMO_BIN_CANDIDATES:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
+    if sys.platform == "win32":
+        # PATH 兜底：Clash Verge 自带的内核名在前，独立安装的 mihomo 在后
+        return shutil.which("verge-mihomo") or shutil.which("mihomo")
     return shutil.which("mihomo")
 
 
@@ -116,8 +146,522 @@ def find_config_file() -> Optional[str]:
     return None
 
 
-def extract_proxies(config_path: str) -> List[dict]:
-    """YAML -> JSON via macOS built-in ruby; returns the proxies list."""
+# ---------------- 内置迷你 YAML 解析器 ----------------
+# 零依赖，只覆盖 Clash Verge Rev 机器生成配置（serde_yaml 风格）的语法子集：
+#   顶层 mapping、block sequence（元素为 block mapping 或标量）、按缩进递归的
+#   嵌套 block mapping（ws-opts/reality-opts/headers 等）、与键同级的缩进对齐
+#   序列（indentless sequence）、flow list [a, b]、flow dict {k: v}、空集合 []/{}、
+#   标量（null/~/bool/int/float/单引号('' 转义)/双引号(常见转义)/plain）、
+#   整行与行尾注释（引号感知）、--- 文档标记、带引号的键。
+# anchors/aliases(& *)/多行字符串(| >)/tag(!)/多文档 等超出子集的内容一律抛
+# VergeYAMLError，由 extract_proxies 的 fallback 链转成清晰报错——绝不静默解析错。
+# 标量解读与 ruby Psych / PyYAML 的 YAML 1.1  resolver 对齐（yes/no/on/off 也算
+# 布尔），保证三条解析路径在同一份配置上结果一致。
+
+
+class VergeYAMLError(ValueError):
+    """内置迷你 YAML 解析器遇到超出语法子集或 malformed 的内容。"""
+
+
+class _NotYamlMappingEntry(Exception):
+    """内部信号：该行不含「键: 值」分隔（按标量处理），不是解析错误。"""
+
+
+def _strip_yaml_comment(line: str) -> str:
+    """剥掉行尾注释，引号感知：# 在单/双引号内不算注释；引号外的 # 前面必须是
+    行首或空白才算注释起始（URL、密码、节点名里的 # 不受影响）。
+    单/双引号只在「值起始位置」（行首，或紧跟空白 : [ { , 之后）才被当作引号，
+    plain 标量中间的撇号（如 it's）不会误判为引号。"""
+    in_s = in_d = False
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if in_s:
+            if c == "'":
+                if i + 1 < n and line[i + 1] == "'":  # '' 是单引号内的转义
+                    i += 2
+                    continue
+                in_s = False
+        elif in_d:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_d = False
+        elif c == "#":
+            if i == 0 or line[i - 1] in " \t":
+                return line[:i]
+        elif c == "'":
+            if i == 0 or line[i - 1] in " \t:[{,":
+                in_s = True
+        elif c == '"':
+            if i == 0 or line[i - 1] in " \t:[{,":
+                in_d = True
+        i += 1
+    return line
+
+
+def _yaml_logical_lines(text: str) -> List[Tuple[int, str, int]]:
+    """把 YAML 文本切成逻辑行 [(缩进, 内容, 行号)]：跳过空行/整行注释，
+    剥掉行尾注释；--- 只允许出现在开头（多文档超出子集），... 表示文档结束。"""
+    out: List[Tuple[int, str, int]] = []
+    doc_started = False
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        indent_part = raw[:len(raw) - len(raw.lstrip(" \t"))]
+        if "\t" in indent_part:
+            raise VergeYAMLError(f"第 {lineno} 行：缩进含有 Tab（YAML 不允许）")
+        line = _strip_yaml_comment(raw).rstrip()
+        if not line.strip():
+            continue
+        content = line.strip()
+        if content == "---":
+            if doc_started:
+                raise VergeYAMLError(f"第 {lineno} 行：多文档 YAML（第二个 ---）超出支持范围")
+            doc_started = True
+            continue
+        if content == "...":
+            break
+        doc_started = True
+        indent = len(line) - len(line.lstrip(" "))
+        out.append((indent, content, lineno))
+    return out
+
+
+_YAML_NULLS = {"~", "null", "Null", "NULL"}
+_YAML_TRUE = {"true", "True", "TRUE", "yes", "Yes", "YES", "on", "On", "ON"}
+_YAML_FALSE = {"false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"}
+# 整数解读对齐 YAML 1.1 resolver（Psych/PyYAML）：二进制 0b、前导零八进制、
+# 十六进制 0x、六十进制（12:34）、下划线分隔；0o17/089 这类是字符串
+_YAML_INT_DEC_RE = re.compile(r"^[-+]?(0|[1-9][0-9_]*)$")
+_YAML_INT_BIN_RE = re.compile(r"^([-+]?)0b([0-1_]+)$")
+_YAML_INT_OCT_RE = re.compile(r"^([-+]?)0([0-7_]+)$")
+_YAML_INT_HEX_RE = re.compile(r"^([-+]?)0x([0-9a-fA-F_]+)$")
+_YAML_INT_SEX_RE = re.compile(r"^([-+]?[1-9][0-9_]*(?::[0-5]?[0-9])+)$")
+# 与 Psych/PyYAML 对齐：float 必须带小数点（1e5 在 YAML 1.1 里是字符串），
+# 且指数必须带显式符号（1.5e2 是字符串，1.5e+2 才是 float）
+_YAML_FLOAT_RE = re.compile(r"^[-+]?([0-9]+\.[0-9]*|\.[0-9]+)([eE][-+][0-9]+)?$")
+
+
+def _resolve_plain_scalar(text: str):
+    """plain 标量 -> Python 值；解读规则对齐 ruby Psych / PyYAML（YAML 1.1）。"""
+    if text in _YAML_NULLS:
+        return None
+    if text in _YAML_TRUE:
+        return True
+    if text in _YAML_FALSE:
+        return False
+    if _YAML_INT_DEC_RE.match(text):
+        return int(text.replace("_", ""))
+    m = _YAML_INT_BIN_RE.match(text)
+    if m:
+        return int(m.group(1) + m.group(2).replace("_", ""), 2)
+    m = _YAML_INT_OCT_RE.match(text)
+    if m:
+        return int(m.group(1) + m.group(2).replace("_", ""), 8)
+    m = _YAML_INT_HEX_RE.match(text)
+    if m:
+        return int(m.group(1) + m.group(2).replace("_", ""), 16)
+    m = _YAML_INT_SEX_RE.match(text)
+    if m:
+        parts = m.group(1).replace("_", "").split(":")
+        sign = 1
+        if parts[0].startswith("-"):
+            sign, parts[0] = -1, parts[0][1:]
+        elif parts[0].startswith("+"):
+            parts[0] = parts[0][1:]
+        value = 0
+        for part in parts:
+            value = value * 60 + int(part)
+        return sign * value
+    if _YAML_FLOAT_RE.match(text):
+        return float(text)
+    if text in (".inf", ".Inf", ".INF"):
+        return float("inf")
+    if text in ("-.inf", "-.Inf", "-.INF", "+.inf", "+.Inf", "+.INF"):
+        return float("inf") if text[0] == "+" else float("-inf")
+    if text in (".nan", ".NaN", ".NAN"):
+        return float("nan")
+    return text
+
+
+def _parse_squote(text: str, lineno: int) -> Tuple[str, int]:
+    """解析单引号字符串（'' 转义），text[0] 必须是 '；返回 (值, 结束位置)。"""
+    out: List[str] = []
+    i = 1
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "'":
+            if i + 1 < n and text[i + 1] == "'":
+                out.append("'")
+                i += 2
+                continue
+            return "".join(out), i + 1
+        out.append(c)
+        i += 1
+    raise VergeYAMLError(f"第 {lineno} 行：单引号字符串未闭合（跨行字符串超出支持范围）")
+
+
+_DQUOTE_ESCAPES = {
+    "0": "\0", "a": "\a", "b": "\b", "t": "\t", "n": "\n", "v": "\v",
+    "f": "\f", "r": "\r", "e": "\x1b", '"': '"', "/": "/", "\\": "\\",
+    " ": " ", "_": "\xa0", "N": "\x85", "L": "\u2028", "P": "\u2029",
+}
+
+
+def _parse_dquote(text: str, lineno: int) -> Tuple[str, int]:
+    r"""解析双引号字符串（\" \\ \n \xNN \uNNNN \UNNNNNNNN 等转义），
+    text[0] 必须是 "；返回 (值, 结束位置)。未知转义报错，不静默放过。"""
+    out: List[str] = []
+    i = 1
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            return "".join(out), i + 1
+        if c == "\\":
+            if i + 1 >= n:
+                break
+            e = text[i + 1]
+            if e in _DQUOTE_ESCAPES:
+                out.append(_DQUOTE_ESCAPES[e])
+                i += 2
+                continue
+            width = {"x": 2, "u": 4, "U": 8}.get(e)
+            if width is not None:
+                hexpart = text[i + 2:i + 2 + width]
+                try:
+                    out.append(chr(int(hexpart, 16)))
+                except ValueError:
+                    raise VergeYAMLError(
+                        f"第 {lineno} 行：非法的十六进制转义 \\{e}{hexpart}")
+                i += 2 + width
+                continue
+            raise VergeYAMLError(f"第 {lineno} 行：不支持的转义 \\{e}")
+        out.append(c)
+        i += 1
+    raise VergeYAMLError(f"第 {lineno} 行：双引号字符串未闭合（跨行字符串超出支持范围）")
+
+
+class _FlowYaml:
+    """单行 flow 集合解析：[a, b]、{k: v}、空集合 []/{}、嵌套。
+    机器生成配置的 flow 集合都在一行内；括号未闭合（跨行）即报错。"""
+
+    def __init__(self, text: str, lineno: int):
+        self.s = text
+        self.i = 0
+        self.lineno = lineno
+
+    def at_end(self) -> bool:
+        return self.i >= len(self.s)
+
+    def skip_ws(self) -> None:
+        while not self.at_end() and self.s[self.i] in " \t":
+            self.i += 1
+
+    def _err(self, msg: str) -> VergeYAMLError:
+        return VergeYAMLError(f"第 {self.lineno} 行：{msg}")
+
+    def parse_value(self):
+        self.skip_ws()
+        if self.at_end():
+            raise self._err("flow 集合里缺少值")
+        c = self.s[self.i]
+        if c == "[":
+            return self.parse_list()
+        if c == "{":
+            return self.parse_dict()
+        if c == "'":
+            value, pos = _parse_squote(self.s[self.i:], self.lineno)
+            self.i += pos
+            return value
+        if c == '"':
+            value, pos = _parse_dquote(self.s[self.i:], self.lineno)
+            self.i += pos
+            return value
+        if c in "&*":
+            raise self._err("anchor/alias（& *）超出支持范围")
+        if c in "|>":
+            raise self._err("多行字符串（| >）超出支持范围")
+        if c == "!":
+            raise self._err("tag（!）超出支持范围")
+        start = self.i
+        while not self.at_end() and self.s[self.i] not in ",]}":
+            self.i += 1
+        return _resolve_plain_scalar(self.s[start:self.i].strip())
+
+    def parse_list(self) -> list:
+        self.i += 1  # 跳过 [
+        out = []
+        self.skip_ws()
+        if not self.at_end() and self.s[self.i] == "]":
+            self.i += 1
+            return out
+        while True:
+            out.append(self.parse_value())
+            self.skip_ws()
+            if self.at_end():
+                raise self._err("flow list 未闭合（跨行集合超出支持范围）")
+            c = self.s[self.i]
+            if c == ",":
+                self.i += 1
+                continue
+            if c == "]":
+                self.i += 1
+                return out
+            raise self._err(f"flow list 里出现意外的字符 {c!r}")
+
+    def parse_dict(self) -> dict:
+        self.i += 1  # 跳过 {
+        out: dict = {}
+        self.skip_ws()
+        if not self.at_end() and self.s[self.i] == "}":
+            self.i += 1
+            return out
+        while True:
+            self.skip_ws()
+            if self.at_end():
+                raise self._err("flow dict 未闭合（跨行集合超出支持范围）")
+            quoted_key = False
+            if self.s[self.i] == "'":
+                key, pos = _parse_squote(self.s[self.i:], self.lineno)
+                self.i += pos
+                quoted_key = True
+            elif self.s[self.i] == '"':
+                key, pos = _parse_dquote(self.s[self.i:], self.lineno)
+                self.i += pos
+                quoted_key = True
+            else:
+                start = self.i
+                while not self.at_end() and self.s[self.i] not in ":,}":
+                    self.i += 1
+                key = self.s[start:self.i].strip()
+            if not key:
+                raise self._err("flow dict 里键为空")
+            if not quoted_key and key == "<<":
+                # 与 block 级（_split_yaml_key）一致：merge key 超出支持范围，
+                # 对齐 PyYAML 的 ConstructorError；带引号的 '<<' 是普通键名
+                raise self._err("merge key（<<）超出支持范围")
+            self.skip_ws()
+            if self.at_end() or self.s[self.i] != ":":
+                raise self._err("flow dict 缺少冒号")
+            self.i += 1
+            out[str(key)] = self.parse_value()
+            self.skip_ws()
+            if self.at_end():
+                raise self._err("flow dict 未闭合（跨行集合超出支持范围）")
+            c = self.s[self.i]
+            if c == ",":
+                self.i += 1
+                continue
+            if c == "}":
+                self.i += 1
+                return out
+            raise self._err(f"flow dict 里出现意外的字符 {c!r}")
+
+
+def _parse_yaml_scalar(text: str, lineno: int):
+    """解析单个值（标量或单行 flow 集合），必须恰好消费完整个字符串。"""
+    c = text[:1]
+    if c in "[{":
+        parser = _FlowYaml(text, lineno)
+        value = parser.parse_value()
+        parser.skip_ws()
+        if not parser.at_end():
+            raise VergeYAMLError(f"第 {lineno} 行：flow 集合后有多余内容")
+        return value
+    if c == "'":
+        value, pos = _parse_squote(text, lineno)
+        if text[pos:].strip():
+            raise VergeYAMLError(f"第 {lineno} 行：引号字符串后有多余内容")
+        return value
+    if c == '"':
+        value, pos = _parse_dquote(text, lineno)
+        if text[pos:].strip():
+            raise VergeYAMLError(f"第 {lineno} 行：引号字符串后有多余内容")
+        return value
+    if c in "|>":
+        raise VergeYAMLError(f"第 {lineno} 行：多行字符串（| >）超出支持范围")
+    if c in "&*":
+        raise VergeYAMLError(f"第 {lineno} 行：anchor/alias（& *）超出支持范围")
+    if c == "!":
+        raise VergeYAMLError(f"第 {lineno} 行：tag（!）超出支持范围")
+    return _resolve_plain_scalar(text)
+
+
+def _split_yaml_key(text: str, lineno: int) -> Tuple[str, Optional[str]]:
+    """把 'key: value' 拆成 (键, 值文本)；值文本 None 表示冒号后无内容
+    （值在后续缩进块里，或就是 null）。键本身可以是带引号的字符串。
+    找不到「冒号+空格/行尾」分隔时抛 _NotYamlMappingEntry（由调用方决定
+    按标量处理还是报错）。"""
+    in_s = in_d = False
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if in_s:
+            if c == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_s = False
+        elif in_d:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_d = False
+        elif c == "'":
+            in_s = True
+        elif c == '"':
+            in_d = True
+        elif c == ":":
+            if i + 1 >= n or text[i + 1] in " \t":
+                key_text = text[:i].strip()
+                if not key_text:
+                    raise VergeYAMLError(f"第 {lineno} 行：键为空")
+                if key_text[:1] in "'\"":
+                    key = _parse_yaml_scalar(key_text, lineno)
+                else:
+                    key = key_text
+                if key == "<<":
+                    raise VergeYAMLError(f"第 {lineno} 行：merge key（<<）超出支持范围")
+                value_text = text[i + 1:].strip()
+                return str(key), (value_text if value_text else None)
+        i += 1
+    raise _NotYamlMappingEntry()
+
+
+class _BlockYaml:
+    """按缩进递归的 block 解析：逻辑行列表 -> 顶层 dict。"""
+
+    def __init__(self, text: str):
+        self.lines = _yaml_logical_lines(text)
+        self.i = 0
+
+    def parse(self) -> dict:
+        if not self.lines:
+            raise VergeYAMLError("配置内容为空")
+        value = self.parse_block(self.lines[0][0])
+        if self.i != len(self.lines):
+            lineno = self.lines[self.i][2]
+            raise VergeYAMLError(f"第 {lineno} 行：缩进层级无法归属（解析中断）")
+        if not isinstance(value, dict):
+            raise VergeYAMLError("顶层必须是 mapping（key: value 列表）")
+        return value
+
+    def _peek(self) -> Optional[Tuple[int, str, int]]:
+        return self.lines[self.i] if self.i < len(self.lines) else None
+
+    def parse_block(self, indent: int):
+        cur = self._peek()
+        assert cur is not None and cur[0] == indent
+        if cur[1] == "-" or cur[1].startswith("- "):
+            return self.parse_sequence(indent)
+        return self.parse_mapping(indent)
+
+    def parse_mapping(self, indent: int) -> dict:
+        out: dict = {}
+        while True:
+            cur = self._peek()
+            if cur is None or cur[0] < indent:
+                break
+            ind, content, lineno = cur
+            if ind > indent:
+                raise VergeYAMLError(f"第 {lineno} 行：缩进异常（找不到归属的键）")
+            if content == "-" or content.startswith("- "):
+                break  # 序列行属于外层（如 indentless sequence 结束后回到本层）
+            try:
+                key, value_text = _split_yaml_key(content, lineno)
+            except _NotYamlMappingEntry:
+                raise VergeYAMLError(f"第 {lineno} 行：不是 key: value 形式（缺少冒号分隔）")
+            self.i += 1
+            if value_text is None:
+                out[key] = self.parse_nested(ind)
+            else:
+                out[key] = _parse_yaml_scalar(value_text, lineno)
+        return out
+
+    def parse_nested(self, parent_indent: int):
+        """'key:' 冒号后无内容时解析后续缩进块；没有更深的块则值为 null。
+        与键同级的 block sequence 仍属于该键（YAML 允许的 indentless sequence，
+        如顶层 proxies: 下面的 - name: ... 与 proxies: 同在缩进 0）。"""
+        cur = self._peek()
+        if cur is None or cur[0] < parent_indent:
+            return None
+        ind, content, _ln = cur
+        if ind == parent_indent:
+            if content == "-" or content.startswith("- "):
+                return self.parse_sequence(ind)
+            return None
+        return self.parse_block(ind)
+
+    def parse_sequence(self, indent: int) -> list:
+        out: list = []
+        while True:
+            cur = self._peek()
+            if cur is None or cur[0] != indent:
+                break
+            ind, content, lineno = cur
+            if content != "-" and not content.startswith("- "):
+                break
+            self.i += 1
+            rest = content[1:].strip()
+            if not rest:
+                # 裸 "-" 项：内容只接受比 "-" 缩进更深的块；同缩进的下一个 "-"
+                # 是兄弟项（本项为 null），同缩进或更浅一律交还给上层。
+                # indentless sequence 规则只适用于 mapping 里 "key:" 的值位置
+                # （见 parse_nested），不适用于 "-" 项的内容。
+                nxt = self._peek()
+                if nxt is not None and nxt[0] > ind:
+                    out.append(self.parse_block(nxt[0]))
+                else:
+                    out.append(None)
+                continue
+            try:
+                key_value = _split_yaml_key(rest, lineno)
+            except _NotYamlMappingEntry:
+                # 标量元素（rules、策略组成员列表等）
+                out.append(_parse_yaml_scalar(rest, lineno))
+                continue
+            # block mapping 元素：第一个键在 - 行上，
+            # 其虚拟缩进 = 「- 」之后内容的起始列，后续键按缩进对齐
+            key, value_text = key_value
+            virtual_indent = ind + (len(content) - len(content[1:].lstrip(" ")))
+            item: dict = {}
+            if value_text is None:
+                item[key] = self.parse_nested(virtual_indent)
+            else:
+                item[key] = _parse_yaml_scalar(value_text, lineno)
+            nxt = self._peek()
+            if nxt is not None and nxt[0] > ind:
+                more = self.parse_block(nxt[0])
+                if not isinstance(more, dict):
+                    raise VergeYAMLError(f"第 {nxt[2]} 行：序列元素的后续内容不是键值对")
+                item.update(more)
+            out.append(item)
+        return out
+
+
+def _parse_verge_yaml(text: str) -> dict:
+    """内置迷你 YAML 解析器入口：返回顶层 dict（调用方取 ["proxies"]）。
+    超出语法子集时抛 VergeYAMLError。"""
+    return _BlockYaml(text).parse()
+
+
+def _proxies_from_cfg(cfg) -> List[dict]:
+    """从解析后的配置 dict 里取 proxies 列表并校验（三条解析路径共用）。"""
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("proxies"), list):
+        raise WorkerUnavailable("配置文件中没有可用的 proxies 列表")
+    proxies = cfg["proxies"]
+    if not proxies:
+        raise WorkerUnavailable("配置文件 proxies 为空")
+    return proxies
+
+
+def _extract_proxies_ruby(config_path: str) -> List[dict]:
+    """macOS/Linux 自带 ruby 路径（v0.7 以来的既有实现，行为不变）。"""
     ruby = shutil.which("ruby") or "/usr/bin/ruby"
     if not os.path.isfile(ruby):
         raise WorkerUnavailable("未找到 ruby（macOS 自带，用于解析 YAML 配置）")
@@ -128,18 +672,60 @@ def extract_proxies(config_path: str) -> List[dict]:
     )
     try:
         p = subprocess.run([ruby, "-e", script, config_path],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=30,
+                           **_no_window_kwargs())
     except subprocess.TimeoutExpired:
         raise WorkerUnavailable("解析配置文件超时")
     if p.returncode != 0:
         raise WorkerUnavailable(f"解析配置文件失败: {p.stderr.strip()[:200]}")
     try:
-        proxies = json.loads(p.stdout)["proxies"]
-    except (json.JSONDecodeError, KeyError):
+        cfg = json.loads(p.stdout)
+    except json.JSONDecodeError:
         raise WorkerUnavailable("配置文件中没有可用的 proxies 列表")
-    if not proxies:
-        raise WorkerUnavailable("配置文件 proxies 为空")
-    return proxies
+    return _proxies_from_cfg(cfg)
+
+
+def extract_proxies(config_path: str) -> List[dict]:
+    """从 clash-verge.yaml 提取完整 proxies 列表（含节点凭据）。三级 fallback：
+    1) PyYAML——用户装了 pyyaml 就优先用（最完整的 YAML 支持）；
+    2) macOS/Linux 自带 ruby（YAML -> JSON 子进程，既有路径，行为不变）；
+    3) 内置迷你 YAML 解析器 _parse_verge_yaml——零依赖，只覆盖 Verge 机器生成
+       配置的语法子集（Windows 没有自带 ruby，主要靠它）。
+    全部失败抛 WorkerUnavailable（main() 据此回退串行模式）。"""
+    errors: List[str] = []
+
+    try:
+        import yaml  # PyYAML：可选依赖，装了就优先用；没装不影响后续 fallback
+    except ImportError:
+        yaml = None
+    if yaml is not None:
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                return _proxies_from_cfg(yaml.safe_load(f))
+        except WorkerUnavailable:
+            raise  # 解析成功但内容不可用（没有 proxies / 为空），直接报
+        except Exception as e:
+            errors.append(f"PyYAML 解析失败: {e}")
+
+    if sys.platform != "win32":
+        try:
+            return _extract_proxies_ruby(config_path)
+        except WorkerUnavailable as e:
+            errors.append(str(e))
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            return _proxies_from_cfg(_parse_verge_yaml(f.read()))
+    except WorkerUnavailable:
+        raise
+    except (OSError, VergeYAMLError) as e:
+        errors.append(f"内置 YAML 解析失败: {e}")
+
+    raise WorkerUnavailable(
+        "无法解析 Clash Verge 配置文件 clash-verge.yaml（"
+        + "；".join(errors)
+        + "）。可执行 pip install pyyaml 后重试；若配置文件尚不存在，"
+          "请确认 Clash Verge 已安装并正在运行（配置才会生成）")
 
 
 def with_dependencies(selected: List[dict], all_proxies: List[dict]) -> List[dict]:
@@ -170,6 +756,26 @@ def with_dependencies(selected: List[dict], all_proxies: List[dict]) -> List[dic
 
 
 def physical_interface() -> Optional[str]:
+    if sys.platform == "win32":
+        # Windows 没有 route get default；用 PowerShell 查默认路由所在接口的别名。
+        # 中文系统上网卡名可能是「以太网」，PowerShell 默认输出编码不是 UTF-8，
+        # 先把 [Console]::OutputEncoding 钉成 UTF-8，再按 utf-8/replace 解码。
+        ps = shutil.which("powershell") or "powershell.exe"
+        try:
+            p = subprocess.run(
+                [ps, "-NoProfile", "-Command",
+                 "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                 "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
+                 "Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias"],
+                capture_output=True, timeout=10,
+                encoding="utf-8", errors="replace",
+                **_no_window_kwargs())
+            name = (p.stdout or "").strip()
+            if p.returncode == 0 and name:
+                return name
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return None
     try:
         p = subprocess.run(["route", "get", "default"],
                            capture_output=True, text=True, timeout=5)
@@ -185,10 +791,23 @@ def physical_interface() -> Optional[str]:
 # 已接管系统流量，worker 绑它拨号等于在别人的隧道里测速，结果无意义
 VIRTUAL_IFACE_PREFIXES = ("utun", "ipsec", "ppp", "tun", "tap")
 
+# Windows 虚拟网卡的常见接口别名前缀：Clash/mihomo 的 TUN 网卡（wintun/mihomo/
+# clash）与主流 VPN 客户端（openvpn/wireguard/tailscale），以及 loopback、
+# Hyper-V 的 vEthernet。Windows 接口别名大小写不固定（Wintun/vEthernet/中文名），
+# 仅 win32 分支使用，比较时统一先 lower。
+WIN_VIRTUAL_IFACE_PREFIXES = ("wintun", "mihomo", "clash", "openvpn", "wireguard",
+                              "tailscale", "loopback", "vethernet")
+
 
 def is_virtual_iface(name: Optional[str]) -> bool:
-    """接口名是否为虚拟隧道接口（utun*/ipsec*/ppp*/tun*/tap*）。"""
-    return bool(name) and name.startswith(VIRTUAL_IFACE_PREFIXES)
+    """接口名是否为虚拟隧道接口。
+    POSIX（macOS 接口名恒小写）保持原有的精确小写前缀匹配；
+    Windows 接口别名大小写不固定，lower 后再做前缀匹配（含 Windows 专有前缀）。"""
+    if not name:
+        return False
+    if sys.platform == "win32":
+        return name.lower().startswith(VIRTUAL_IFACE_PREFIXES + WIN_VIRTUAL_IFACE_PREFIXES)
+    return name.startswith(VIRTUAL_IFACE_PREFIXES)
 
 
 def doh_resolve(domain: str) -> Optional[str]:
@@ -199,7 +818,8 @@ def doh_resolve(domain: str) -> Optional[str]:
                  "--resolve", f"{host}:443:{ip}",
                  "-H", "accept: application/dns-json",
                  f"https://{host}{path}?name={domain}&type=A"],
-                capture_output=True, text=True, timeout=9)
+                capture_output=True, text=True, timeout=9,
+                **_no_window_kwargs())
             if p.returncode == 0 and p.stdout:
                 data = json.loads(p.stdout)
                 for ans in data.get("Answer", []):
@@ -286,6 +906,7 @@ class Worker:
         self.proc = subprocess.Popen(
             [self.bin, "-f", str(cfg_path), "-d", self.dir.name],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **_no_window_kwargs(),
         )
         self.api = MihomoAPI(f"http://127.0.0.1:{ctl_port}", timeout=8.0)
         self.proxy_url = f"http://127.0.0.1:{mix_port}"
@@ -449,9 +1070,20 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     保证同一时刻全网只有一路测速下载。Raises WorkerUnavailable 触发回退。"""
     mihomo_bin = find_mihomo_bin()
     if not mihomo_bin:
+        if sys.platform == "win32":
+            raise WorkerUnavailable(
+                "未找到 verge-mihomo.exe（Clash Verge 自带的内核）。"
+                "请确认 Clash Verge 已安装并正在运行；默认安装在 "
+                r"%LOCALAPPDATA%\Programs\Clash Verge\ 或 %ProgramFiles%\Clash Verge\ 下")
         raise WorkerUnavailable("未找到 mihomo 二进制（Clash Verge 自带的 verge-mihomo）")
     config_file = getattr(args, "config_file", "") or find_config_file()
     if not config_file:
+        if sys.platform == "win32":
+            raise WorkerUnavailable(
+                "未找到 Clash Verge 的运行配置 clash-verge.yaml（通常在 "
+                r"%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\ 下）。"
+                "请确认 Clash Verge 已安装并至少运行过一次（配置才会生成），"
+                "或用 --config-file 指定")
         raise WorkerUnavailable("未找到 Clash Verge 的运行配置 clash-verge.yaml，"
                                 "可用 --config-file 指定")
 

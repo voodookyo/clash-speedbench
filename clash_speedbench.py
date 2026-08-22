@@ -22,6 +22,7 @@ import http.client
 import json
 import os
 import re
+import signal
 import socket
 import statistics
 import subprocess
@@ -38,10 +39,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Clash Verge Rev (recent versions) launches mihomo with -ext-ctl-unix instead of
 # a TCP external-controller, so the Unix socket is probed first.
-DEFAULT_CONTROLLERS = (
+# Windows 没有 unix socket，候选里直接剔除 unix:// 项，只保留 TCP 候选
+# （用户仍可用 --controller 显式指定任意地址）；macOS/Linux 行为不变。
+_ALL_CONTROLLERS = (
     "unix:///tmp/verge/verge-mihomo.sock",
     "http://127.0.0.1:9097",
     "http://127.0.0.1:9090",
+)
+DEFAULT_CONTROLLERS = tuple(
+    c for c in _ALL_CONTROLLERS
+    if sys.platform != "win32" or not c.startswith("unix://")
 )
 DEFAULT_DELAY_URL = "https://cp.cloudflare.com/generate_204"
 DEFAULT_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
@@ -308,6 +315,20 @@ def restore_groups(api: MihomoAPI, saved: Dict[str, Tuple[str, Optional[str]]]) 
             print(f"⚠️ 恢复策略组失败: {group}: {e}", file=sys.stderr)
 
 
+def _no_window_kwargs() -> dict:
+    """Windows 下给子进程（curl/mihomo/powershell 等）加 CREATE_NO_WINDOW，
+    防止面板以 pythonw 无控制台方式启动时每跑一个子进程就弹黑色控制台窗口；
+    这些子进程的输出全部走管道/DEVNULL，不依赖控制台。POSIX 返回空 dict，
+    调用处用 ** 展开，对既有调用签名零影响。
+    注意：Web 面板的测速子进程不能用这个（会导致 CTRL_BREAK_EVENT 无法投递），
+    见 speedbench_web.run_benchmark。"""
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if flags:
+            return {"creationflags": flags}
+    return {}
+
+
 def curl_speed(proxy_url: str, download_url: str, max_time: float,
                connect_timeout: float) -> Tuple[Optional[float], str, Optional[float], float]:
     """
@@ -331,7 +352,9 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
         download_url,
     ]
     try:
-        p = subprocess.run(cmd, text=True, capture_output=True, timeout=max_time + connect_timeout + 5)
+        p = subprocess.run(cmd, text=True, capture_output=True,
+                           timeout=max_time + connect_timeout + 5,
+                           **_no_window_kwargs())
     except FileNotFoundError:
         raise RuntimeError("未找到 curl。macOS 自带 curl；Windows 10/11 通常也自带 curl。")
     except subprocess.TimeoutExpired:
@@ -442,7 +465,8 @@ def fetch_ip_info(proxy_url: str, timeout: float) -> Optional[dict]:
         DEFAULT_IP_API_URL,
     ]
     try:
-        p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout + 5)
+        p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout + 5,
+                           **_no_window_kwargs())
     except subprocess.TimeoutExpired:
         return None
     if p.returncode != 0 or not p.stdout:
@@ -865,6 +889,16 @@ def main() -> int:
     if args.top_n < 1:
         print("错误：--top-n 至少为 1。", file=sys.stderr)
         return 2
+
+    # Windows：Web 面板「停止测速」发来的是 CTRL_BREAK_EVENT（Python 映射为
+    # SIGBREAK）。本文件没有显式 SIGINT handler——Ctrl+C 靠解释器默认把 SIGINT
+    # 转成 KeyboardInterrupt；这里给 SIGBREAK 注册同样的转换，让 CTRL_BREAK_EVENT
+    # 走与 Ctrl+C 完全相同的优雅中断路径（except KeyboardInterrupt + finally
+    # 恢复策略组/原模式）。terminate=TerminateProcess 不会跑 finally，不能用它。
+    if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
+        def _on_sigbreak(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGBREAK, _on_sigbreak)
 
     try:
         base, needs_secret = detect_controller(args.secret, args.controller)

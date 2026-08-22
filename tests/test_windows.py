@@ -1,0 +1,518 @@
+# -*- coding: utf-8 -*-
+"""Windows（win32）平台分支测试：在 macOS/Linux 上用 unittest.mock 模拟
+sys.platform="win32" 运行，不起真子进程、不碰真文件系统、不改真信号状态以外的
+进程资源（SIGBREAK 用例注册到真实信号号上但 finally 恢复原 handler）。
+
+覆盖：
+- DEFAULT_CONTROLLERS：win32 剔除 unix:// 候选（import 时常量，reload 重算，
+  finally 再 reload 恢复，不污染其他测试）
+- find_mihomo_bin：候选顺序、os.access 过滤、which 兜底顺序（verge-mihomo 优先）
+- MIHOMO_BIN_CANDIDATES/CONFIG_CANDIDATES 的 expandvars 展开与 % 残留过滤
+  （os.path.expandvars 按 %VAR% 语法 fake，模拟环境变量缺失场景）
+- physical_interface：PowerShell Get-NetRoute 输出解析（含中文「以太网」）、
+  encoding/errors/timeout 参数、非零/超时/空输出/进程不存在 → None
+- is_virtual_iface：win32 大小写不敏感 + WIN_VIRTUAL_IFACE_PREFIXES 并集；
+  posix 分支行为不变
+- cancel_benchmark：win32 首发 CTRL_BREAK_EVENT、5s 等待、terminate→kill 兜底；
+  posix 首发 SIGINT 不变
+- run_benchmark 的 Popen：win32 带 CREATE_NEW_PROCESS_GROUP，posix 不带
+- _no_window_kwargs：win32/posix 两分支 + curl_speed 集成
+- main() 的 SIGBREAK 注册：win32 注册 KeyboardInterrupt 转换 handler；posix 不注册
+"""
+import contextlib
+import importlib
+import io
+import os
+import re
+import signal
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import clash_speedbench as csb
+import speedbench_workers as sbw
+import speedbench_web as web
+
+TIMEOUT = subprocess.TimeoutExpired(cmd="fake", timeout=5)
+
+
+@contextlib.contextmanager
+def reload_with_platform(module, platform):
+    """以指定 sys.platform 重载模块（import 时常量按新平台重算）；
+    退出时再按真实平台 reload 一次恢复，避免污染其他测试。"""
+    with mock.patch.object(sys, "platform", platform):
+        importlib.reload(module)
+    try:
+        yield module
+    finally:
+        importlib.reload(module)
+
+
+class DefaultControllersTest(unittest.TestCase):
+    def test_win32_filters_out_unix_controllers(self):
+        with reload_with_platform(csb, "win32"):
+            self.assertTrue(csb._ALL_CONTROLLERS[0].startswith("unix://"))  # 全量表不变
+            self.assertNotEqual(csb.DEFAULT_CONTROLLERS, csb._ALL_CONTROLLERS)
+            self.assertEqual([c for c in csb.DEFAULT_CONTROLLERS
+                              if c.startswith("unix://")], [])
+            # TCP 候选全部保留、顺序不变
+            self.assertEqual(csb.DEFAULT_CONTROLLERS,
+                             tuple(c for c in csb._ALL_CONTROLLERS
+                                   if not c.startswith("unix://")))
+            # detect_controller 的候选来自 DEFAULT_CONTROLLERS：报错信息里不含 unix
+            with mock.patch.object(csb.MihomoAPI, "get",
+                                   side_effect=csb.ApiError("down")):
+                with self.assertRaises(csb.ApiError) as cm:
+                    csb.detect_controller("", None)
+            self.assertNotIn("unix://", str(cm.exception))
+            self.assertIn("http://127.0.0.1:9097", str(cm.exception))
+
+    def test_posix_keeps_unix_controller_first(self):
+        with reload_with_platform(csb, "darwin"):
+            self.assertEqual(csb.DEFAULT_CONTROLLERS, csb._ALL_CONTROLLERS)
+            self.assertTrue(csb.DEFAULT_CONTROLLERS[0].startswith("unix://"))
+
+
+# 模拟 Windows 环境变量：故意不设 ProgramFiles(x86)，验证 % 残留项被过滤
+FAKE_WIN_ENV = {
+    "LOCALAPPDATA": r"C:\Users\tester\AppData\Local",
+    "ProgramFiles": r"C:\Program Files",
+    "APPDATA": r"C:\Users\tester\AppData\Roaming",
+}
+
+
+def fake_win_expandvars(env):
+    """按 Windows %VAR% 语法展开的 expandvars fake；未设置的变量原样保留（残留 %）。"""
+    def expand(s):
+        return re.sub(r"%([^%]+)%",
+                      lambda m: env.get(m.group(1), m.group(0)), s)
+    return expand
+
+
+class WinCandidatePathsTest(unittest.TestCase):
+    """win32 下 MIHOMO_BIN_CANDIDATES / CONFIG_CANDIDATES 的构造（import 时常量）。"""
+
+    @contextlib.contextmanager
+    def reload_workers_win32(self, env):
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch("os.path.expandvars", fake_win_expandvars(env)):
+            importlib.reload(sbw)
+        try:
+            yield sbw
+        finally:
+            importlib.reload(sbw)
+
+    def test_candidates_expanded_and_residue_filtered(self):
+        with self.reload_workers_win32(FAKE_WIN_ENV):
+            self.assertEqual(sbw.MIHOMO_BIN_CANDIDATES, (
+                r"C:\Users\tester\AppData\Local\Programs\Clash Verge\verge-mihomo.exe",
+                r"C:\Program Files\Clash Verge\verge-mihomo.exe",
+            ))  # %ProgramFiles(x86)% 未设置 → 残留 % → 被过滤
+            self.assertEqual(sbw.CONFIG_CANDIDATES, (
+                r"C:\Users\tester\AppData\Roaming"
+                r"\io.github.clash-verge-rev.clash-verge-rev\clash-verge.yaml",
+            ))
+
+    def test_all_env_missing_yields_empty_candidates(self):
+        with self.reload_workers_win32({}):
+            self.assertEqual(sbw.MIHOMO_BIN_CANDIDATES, ())
+            self.assertEqual(sbw.CONFIG_CANDIDATES, ())
+
+
+class FindMihomoBinWinTest(unittest.TestCase):
+    CANDIDATES = (r"C:\a\verge-mihomo.exe", r"C:\b\verge-mihomo.exe")
+
+    def run_find(self, isfile_side, access_side=None, which_side=None,
+                 platform="win32"):
+        with mock.patch.object(sbw, "MIHOMO_BIN_CANDIDATES", self.CANDIDATES), \
+                mock.patch.object(sys, "platform", platform), \
+                mock.patch("os.path.isfile", side_effect=isfile_side) as m_isfile, \
+                mock.patch("os.access",
+                           side_effect=access_side or (lambda p, m: True)) as m_access, \
+                mock.patch.object(sbw.shutil, "which",
+                                  side_effect=which_side) as m_which:
+            return sbw.find_mihomo_bin(), m_isfile, m_access, m_which
+
+    def test_first_candidate_hit(self):
+        got, m_isfile, m_access, m_which = self.run_find([True])
+        self.assertEqual(got, self.CANDIDATES[0])
+        m_which.assert_not_called()
+
+    def test_candidate_order_preserved(self):
+        got, m_isfile, m_access, _ = self.run_find([False, True])
+        self.assertEqual(got, self.CANDIDATES[1])
+        # 先查第一个（不存在）再查第二个；access 只对存在的文件调用
+        self.assertEqual([c.args[0] for c in m_isfile.call_args_list],
+                         list(self.CANDIDATES))
+        m_access.assert_called_once_with(self.CANDIDATES[1], os.X_OK)
+
+    def test_non_executable_candidate_skipped(self):
+        got, _f, _a, m_which = self.run_find(
+            [True, False], access_side=lambda p, m: False,
+            which_side=lambda name: r"C:\tools\verge-mihomo.exe")
+        self.assertEqual(got, r"C:\tools\verge-mihomo.exe")
+        m_which.assert_called_once_with("verge-mihomo")
+
+    def test_which_fallback_verge_mihomo_first(self):
+        # PATH 兜底：verge-mihomo 命中则不再查 mihomo
+        got, _f, _a, m_which = self.run_find(
+            [False, False], which_side=lambda name: r"C:\tools\verge-mihomo.exe")
+        self.assertEqual(got, r"C:\tools\verge-mihomo.exe")
+        self.assertEqual([c.args[0] for c in m_which.call_args_list],
+                         ["verge-mihomo"])
+
+    def test_which_fallback_mihomo_second(self):
+        got, _f, _a, m_which = self.run_find(
+            [False, False],
+            which_side=lambda name: {"verge-mihomo": None,
+                                     "mihomo": r"C:\tools\mihomo.exe"}[name])
+        self.assertEqual(got, r"C:\tools\mihomo.exe")
+        self.assertEqual([c.args[0] for c in m_which.call_args_list],
+                         ["verge-mihomo", "mihomo"])  # 兜底顺序：自带内核名优先
+
+    def test_nothing_found_returns_none(self):
+        got, *_ = self.run_find([False, False], which_side=lambda name: None)
+        self.assertIsNone(got)
+
+    def test_posix_never_tries_verge_mihomo_name(self):
+        got, _f, _a, m_which = self.run_find(
+            [False, False], which_side=lambda name: "/usr/local/bin/mihomo",
+            platform="darwin")
+        self.assertEqual(got, "/usr/local/bin/mihomo")
+        m_which.assert_called_once_with("mihomo")  # posix 只查 mihomo
+
+
+class PhysicalInterfaceWinTest(unittest.TestCase):
+    def run_iface(self, run_side_effect=None, run_return=None, which=None,
+                  platform="win32"):
+        with mock.patch.object(sys, "platform", platform), \
+                mock.patch.object(sbw.shutil, "which", return_value=which), \
+                mock.patch.object(sbw.subprocess, "run",
+                                  side_effect=run_side_effect,
+                                  return_value=run_return) as m_run:
+            return sbw.physical_interface(), m_run
+
+    @staticmethod
+    def cp(stdout="", returncode=0):
+        return subprocess.CompletedProcess(args=["powershell"], returncode=returncode,
+                                           stdout=stdout)
+
+    def test_parses_powershell_output(self):
+        got, m_run = self.run_iface(run_return=self.cp("Ethernet\n"), which=None)
+        self.assertEqual(got, "Ethernet")
+        cmd, kwargs = m_run.call_args
+        self.assertEqual(cmd[0][0], "powershell.exe")   # which 未命中时用 .exe 兜底
+        self.assertIn("Get-NetRoute", cmd[0][-1])
+        # 中文系统网卡名解码依赖这两个参数
+        self.assertEqual(kwargs["encoding"], "utf-8")
+        self.assertEqual(kwargs["errors"], "replace")
+        self.assertEqual(kwargs["timeout"], 10)
+        self.assertTrue(kwargs["capture_output"])
+
+    def test_chinese_iface_name(self):
+        got, _ = self.run_iface(run_return=self.cp("以太网\r\n"),
+                                which=r"C:\Windows\powershell.exe")
+        self.assertEqual(got, "以太网")   # CRLF 与中文都正确处理
+
+    def test_nonzero_returncode_returns_none(self):
+        got, _ = self.run_iface(run_return=self.cp("Ethernet", returncode=1))
+        self.assertIsNone(got)
+
+    def test_empty_output_returns_none(self):
+        for out in ("", "  \r\n"):
+            with self.subTest(out=out):
+                got, _ = self.run_iface(run_return=self.cp(out))
+                self.assertIsNone(got)
+
+    def test_timeout_returns_none(self):
+        got, _ = self.run_iface(
+            run_side_effect=subprocess.TimeoutExpired(cmd="powershell", timeout=10))
+        self.assertIsNone(got)
+
+    def test_powershell_missing_returns_none(self):
+        got, _ = self.run_iface(run_side_effect=FileNotFoundError("powershell"))
+        self.assertIsNone(got)
+
+    def test_posix_route_get_default_unchanged(self):
+        got, m_run = self.run_iface(
+            platform="darwin",
+            run_return=subprocess.CompletedProcess(
+                args=["route"], returncode=0,
+                stdout="   route to: default\n    interface: en0\n"))
+        self.assertEqual(got, "en0")
+        self.assertEqual(m_run.call_args[0][0][:2], ["route", "get"])
+
+
+class IsVirtualIfaceWinTest(unittest.TestCase):
+    def check(self, name, platform):
+        with mock.patch.object(sys, "platform", platform):
+            return sbw.is_virtual_iface(name)
+
+    def test_win_virtual_prefixes_constant(self):
+        self.assertEqual(set(sbw.WIN_VIRTUAL_IFACE_PREFIXES),
+                         {"wintun", "mihomo", "clash", "openvpn", "wireguard",
+                          "tailscale", "loopback", "vethernet"})
+
+    def test_win32_virtual_ifaces_true(self):
+        for name in ("Wintun", "wintun", "Mihomo", "mihomo-tun", "Clash",
+                     "clash-tun", "TAP-Windows Adapter V9", "tun0", "OpenVPN TAP",
+                     "WireGuard Tunnel", "Tailscale", "Loopback Pseudo-Interface 1",
+                     "vEthernet (Default Switch)", "VETHERNET (WSL)"):
+            with self.subTest(name=name):
+                self.assertTrue(self.check(name, "win32"))
+
+    def test_win32_physical_ifaces_false(self):
+        for name in ("Ethernet", "以太网", "WLAN", "本地连接", "Wi-Fi"):
+            with self.subTest(name=name):
+                self.assertFalse(self.check(name, "win32"))
+
+    def test_win32_case_insensitive(self):
+        # posix 下大写 UTUN0 判非虚拟；win32 下接口别名大小写不固定，统一 lower
+        self.assertTrue(self.check("UTUN0", "win32"))
+        self.assertFalse(self.check("UTUN0", "darwin"))
+
+    def test_none_and_empty_false_both_platforms(self):
+        for platform in ("win32", "darwin"):
+            with self.subTest(platform=platform):
+                self.assertFalse(self.check(None, platform))
+                self.assertFalse(self.check("", platform))
+
+    def test_posix_branch_byte_identical_behavior(self):
+        # posix：精确小写前缀匹配，posix 集合之外的（wintun 等）不算虚拟
+        for name, want in (("utun4", True), ("tap9", True), ("en0", False),
+                           ("wintun", False), ("mihomo", False), ("Wintun", False)):
+            with self.subTest(name=name):
+                self.assertIs(self.check(name, "darwin"), want)
+
+
+def make_proc(alive=True, wait_side_effect=None):
+    """造假测速子进程（与 tests/test_cancel.py 同款）。"""
+    proc = mock.MagicMock(name="FakeBenchmarkProc")
+    proc.poll.return_value = None if alive else 0
+    if wait_side_effect is not None:
+        proc.wait.side_effect = wait_side_effect
+    else:
+        proc.wait.return_value = 0
+    return proc
+
+
+class WebStateCase(unittest.TestCase):
+    """快照/恢复 web.STATE 的基座（同 test_cancel.py 的隔离手法）。"""
+
+    def setUp(self):
+        with web.STATE_LOCK:
+            self._snapshot = dict(web.STATE)
+            web.STATE["lines"] = list(web.STATE["lines"])
+
+    def tearDown(self):
+        with web.STATE_LOCK:
+            web.STATE.clear()
+            web.STATE.update(self._snapshot)
+
+    def arm(self, proc, running=True):
+        with web.STATE_LOCK:
+            web.STATE["running"] = running
+            web.STATE["proc"] = proc
+
+
+class CancelBenchmarkWinTest(WebStateCase):
+    """win32：首发 CTRL_BREAK_EVENT（macOS 上 signal 没有该常量，patch 假值进去）。"""
+
+    FAKE_CTRL_BREAK = 9876  # 真实值是 1；mock 子进程下任意哨兵值即可
+
+    @contextlib.contextmanager
+    def win32_signal(self):
+        with mock.patch.object(sys, "platform", "win32"):
+            if hasattr(signal, "CTRL_BREAK_EVENT"):
+                yield signal.CTRL_BREAK_EVENT     # 真 Windows：用真常量
+            else:
+                with mock.patch.object(signal, "CTRL_BREAK_EVENT",
+                                       self.FAKE_CTRL_BREAK, create=True):
+                    yield self.FAKE_CTRL_BREAK
+
+    def test_win32_first_signal_is_ctrl_break(self):
+        with self.win32_signal() as expected:
+            proc = make_proc()
+            self.arm(proc)
+            r = web.cancel_benchmark()
+        self.assertTrue(r["ok"])
+        proc.send_signal.assert_called_once_with(expected)
+        proc.wait.assert_called_once_with(timeout=5)   # 先发信号再等 5s
+        proc.terminate.assert_not_called()             # 优雅退出后不强杀
+        proc.kill.assert_not_called()
+
+    def test_win32_escalates_to_terminate(self):
+        with self.win32_signal() as expected:
+            proc = make_proc(wait_side_effect=[TIMEOUT, 0])
+            self.arm(proc)
+            r = web.cancel_benchmark()
+        self.assertTrue(r["ok"])
+        proc.send_signal.assert_called_once_with(expected)
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_not_called()
+        self.assertEqual(proc.wait.call_count, 2)
+
+    def test_win32_escalates_to_kill(self):
+        with self.win32_signal():
+            proc = make_proc(wait_side_effect=[TIMEOUT, TIMEOUT])
+            self.arm(proc)
+            r = web.cancel_benchmark()
+        self.assertTrue(r["ok"])
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
+
+    @unittest.skipIf(hasattr(signal, "CTRL_BREAK_EVENT"),
+                     "本平台 signal 自带 CTRL_BREAK_EVENT，无法模拟常量缺失")
+    def test_win32_missing_constant_falls_back_to_sigint(self):
+        proc = make_proc()
+        self.arm(proc)
+        with mock.patch.object(sys, "platform", "win32"):
+            r = web.cancel_benchmark()
+        self.assertTrue(r["ok"])
+        proc.send_signal.assert_called_once_with(signal.SIGINT)
+
+    def test_posix_first_signal_is_sigint(self):
+        proc = make_proc()
+        self.arm(proc)
+        with mock.patch.object(sys, "platform", "darwin"):
+            r = web.cancel_benchmark()
+        self.assertTrue(r["ok"])
+        proc.send_signal.assert_called_once_with(signal.SIGINT)
+
+
+class BenchmarkPopenFlagsTest(WebStateCase):
+    """run_benchmark 的 Popen：win32 加 CREATE_NEW_PROCESS_GROUP，posix 不加。"""
+
+    FAKE_NEW_GROUP = 0x00000200
+
+    def run_web(self, platform):
+        proc = make_proc()
+        proc.stdout = []          # 无输出，直接结束
+        proc.wait.return_value = 0
+        with mock.patch.object(sys, "platform", platform), \
+                mock.patch.object(web.subprocess, "Popen",
+                                  return_value=proc) as m_popen, \
+                mock.patch.object(web, "sync_db"), \
+                mock.patch.object(subprocess, "CREATE_NEW_PROCESS_GROUP",
+                                  self.FAKE_NEW_GROUP, create=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            web.run_benchmark({})
+        return m_popen
+
+    def test_win32_sets_create_new_process_group(self):
+        m_popen = self.run_web("win32")
+        kwargs = m_popen.call_args.kwargs
+        self.assertEqual(kwargs.get("creationflags"), self.FAKE_NEW_GROUP)
+
+    def test_posix_no_creationflags(self):
+        m_popen = self.run_web("darwin")
+        self.assertNotIn("creationflags", m_popen.call_args.kwargs)
+
+    def test_baseline_popen_kwargs_both_platforms(self):
+        # 既有参数两平台都不变：-u 无缓冲、输出走管道、面板数据目录作 cwd
+        for platform in ("win32", "darwin"):
+            with self.subTest(platform=platform):
+                m_popen = self.run_web(platform)
+                cmd, kwargs = m_popen.call_args.args[0], m_popen.call_args.kwargs
+                self.assertEqual(cmd[0], sys.executable)
+                self.assertIn("-u", cmd)
+                self.assertIn("--yes", cmd)
+                self.assertEqual(kwargs["stdout"], subprocess.PIPE)
+                self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+
+
+class NoWindowKwargsTest(unittest.TestCase):
+    FAKE_FLAG = 0x08000000
+
+    def test_win32_with_constant(self):
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.object(subprocess, "CREATE_NO_WINDOW",
+                                  self.FAKE_FLAG, create=True):
+            self.assertEqual(csb._no_window_kwargs(),
+                             {"creationflags": self.FAKE_FLAG})
+
+    def test_win32_without_constant(self):
+        # 常量缺失/为 0 时退回空 dict（getattr 默认值路径）
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.object(subprocess, "CREATE_NO_WINDOW", 0, create=True):
+            self.assertEqual(csb._no_window_kwargs(), {})
+
+    def test_posix_always_empty(self):
+        # 即使环境里混入了该常量，posix 也恒返回空 dict
+        with mock.patch.object(sys, "platform", "darwin"), \
+                mock.patch.object(subprocess, "CREATE_NO_WINDOW",
+                                  self.FAKE_FLAG, create=True):
+            self.assertEqual(csb._no_window_kwargs(), {})
+
+    def test_curl_speed_applies_creationflags_on_win32(self):
+        out = "50000000\t1.0\t8000000\t200\t0.05\t0.2\t0.9"
+        proc = subprocess.CompletedProcess(args=["curl"], returncode=0,
+                                           stdout=out, stderr="")
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.object(subprocess, "CREATE_NO_WINDOW",
+                                  self.FAKE_FLAG, create=True), \
+                mock.patch.object(csb.subprocess, "run", return_value=proc) as m_run:
+            csb.curl_speed("http://127.0.0.1:7897", "https://example.com/x",
+                           max_time=4.0, connect_timeout=3.0)
+        self.assertEqual(m_run.call_args.kwargs.get("creationflags"), self.FAKE_FLAG)
+
+    def test_curl_speed_no_creationflags_on_posix(self):
+        out = "50000000\t1.0\t8000000\t200\t0.05\t0.2\t0.9"
+        proc = subprocess.CompletedProcess(args=["curl"], returncode=0,
+                                           stdout=out, stderr="")
+        with mock.patch.object(sys, "platform", "darwin"), \
+                mock.patch.object(csb.subprocess, "run", return_value=proc) as m_run:
+            csb.curl_speed("http://127.0.0.1:7897", "https://example.com/x",
+                           max_time=4.0, connect_timeout=3.0)
+        self.assertNotIn("creationflags", m_run.call_args.kwargs)
+
+
+class SigbreakRegistrationTest(unittest.TestCase):
+    """main() 在 win32 给 SIGBREAK 注册 KeyboardInterrupt 转换 handler。
+
+    macOS 上 signal 没有 SIGBREAK：patch 一个真实可用的信号号进去
+    （Windows 的 SIGBREAK 编号恰好是 21，posix 上 21=SIGTTIN，可注册可恢复），
+    测试结束 finally 恢复原 handler，进程信号状态不留痕。
+    """
+
+    FAKE_SIGBREAK = getattr(signal, "SIGBREAK", 21)
+
+    def run_main(self, platform):
+        with mock.patch.object(sys, "platform", platform), \
+                mock.patch.object(signal, "SIGBREAK", self.FAKE_SIGBREAK,
+                                  create=True), \
+                mock.patch.object(sys, "argv", ["clash_speedbench.py", "--yes"]), \
+                mock.patch.object(csb, "detect_controller",
+                                  side_effect=csb.ApiError("停止于 controller 探测")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return csb.main()
+
+    def test_win32_registers_keyboard_interrupt_handler(self):
+        old_handler = signal.getsignal(self.FAKE_SIGBREAK)
+        try:
+            rc = self.run_main("win32")
+            self.assertEqual(rc, 1)  # detect_controller 失败路径，注册已发生
+            handler = signal.getsignal(self.FAKE_SIGBREAK)
+            self.assertTrue(callable(handler))
+            self.assertNotIn(handler, (signal.SIG_DFL, signal.SIG_IGN,
+                                       signal.default_int_handler))
+            # handler 语义：CTRL_BREAK_EVENT → KeyboardInterrupt（与 Ctrl+C 同路径）
+            with self.assertRaises(KeyboardInterrupt):
+                handler(self.FAKE_SIGBREAK, None)
+        finally:
+            signal.signal(self.FAKE_SIGBREAK, old_handler)
+        self.assertIs(signal.getsignal(self.FAKE_SIGBREAK), old_handler)
+
+    def test_posix_does_not_touch_sigbreak(self):
+        with mock.patch.object(csb.signal, "signal") as m_signal:
+            rc = self.run_main("darwin")
+        self.assertEqual(rc, 1)
+        m_signal.assert_not_called()  # posix 不注册任何自定义 handler
+
+
+if __name__ == "__main__":
+    unittest.main()

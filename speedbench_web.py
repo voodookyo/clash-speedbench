@@ -173,10 +173,19 @@ def run_benchmark(params: dict) -> None:
         STATE["exit_code"] = None
 
     try:
+        # Windows：测速子进程放进独立进程组，cancel 时才能把 CTRL_BREAK_EVENT
+        # 只投递给它（不殃及面板进程自身）。这里不能加 CREATE_NO_WINDOW——
+        # 子进程没有可依附的控制台时 CTRL_BREAK_EVENT 无法投递，取消功能会失效。
+        popen_kwargs: dict = {}
+        if sys.platform == "win32":
+            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if flags:
+                popen_kwargs["creationflags"] = flags
         proc = subprocess.Popen(
             cmd, cwd=str(DATA_HOME),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
+            **popen_kwargs,
         )
         with STATE_LOCK:
             STATE["proc"] = proc
@@ -207,7 +216,10 @@ def run_benchmark(params: dict) -> None:
 def cancel_benchmark() -> dict:
     """中断正在运行的测速子进程。
 
-    先发 SIGINT：clash_speedbench.py 的 finally 会恢复 Clash 策略组/模式；
+    POSIX 先发 SIGINT；Windows 发 CTRL_BREAK_EVENT（测速子进程里注册的
+    SIGBREAK handler 会把它转成 KeyboardInterrupt）——两者都走
+    clash_speedbench.py 的 finally 恢复 Clash 策略组/模式。Windows 的
+    terminate 是 TerminateProcess，不跑 finally，所以只作兜底：
     最多等 5 秒，未退出再 terminate（再兜底 kill）。
     """
     with STATE_LOCK:
@@ -216,7 +228,11 @@ def cancel_benchmark() -> dict:
     if not running or proc is None or proc.poll() is not None:
         return {"ok": False, "msg": "当前没有正在进行的测速"}
     try:
-        proc.send_signal(signal.SIGINT)
+        if sys.platform == "win32":
+            first_sig = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT)
+        else:
+            first_sig = signal.SIGINT
+        proc.send_signal(first_sig)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -402,7 +418,7 @@ class Handler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 busy = STATE["running"]
             if busy:
-                cancel_benchmark()  # 先中断测速（SIGINT 恢复 Clash 配置），再停面板
+                cancel_benchmark()  # 先中断测速（SIGINT/CTRL_BREAK 走 finally 恢复 Clash 配置），再停面板
             msg = "面板已停止" + ("，已先中断进行中的测速" if busy else "")
             self._json({"ok": True, "msg": msg})
             threading.Thread(target=self.server.shutdown, daemon=True).start()

@@ -1,6 +1,6 @@
 name: release
 
-# 打 tag（v*）时自动构建 macOS App 并发布到 GitHub Releases。
+# 打 tag（v*）时自动构建 macOS App 与 Windows 源码包，并发布到 GitHub Releases。
 on:
   push:
     tags: ["v*"]
@@ -41,3 +41,39 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" \
             "dist/Clash-SpeedBench-${GITHUB_REF_NAME}-macos.zip" \
             "dist/Clash-SpeedBench-${GITHUB_REF_NAME}-macos.zip.sha256" --clobber
+
+  # Windows 包：纯源码 zip（不含 tests/、packaging/、scripts/、swiftbar/ 等开发/平台目录），
+  # 入口为根目录的 SpeedBench.bat。
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 单元测试（发版前先跑测试）
+        run: python -m unittest discover -s tests -v
+
+      - name: 整理发布文件并打 zip
+        shell: pwsh
+        run: |
+          $zip = "Clash-SpeedBench-$env:GITHUB_REF_NAME-windows.zip"
+          # staging：保证 zip 里是一层干净目录结构（Clash-SpeedBench/...）
+          $stage = "release-stage/Clash-SpeedBench"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item clash_speedbench.py, speedbench_db.py, speedbench_switch.py, `
+            speedbench_web.py, speedbench_workers.py -Destination $stage
+          Copy-Item SpeedBench.bat, README.md, LICENSE -Destination $stage
+          Copy-Item web -Destination $stage -Recurse
+          Compress-Archive -Path $stage -DestinationPath $zip -Force
+          # sha256 与 macOS 的 shasum 输出格式一致：<hash>  <filename>
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText((Join-Path $PWD "$zip.sha256"), "$hash  $zip`n")
+          Get-ChildItem $zip, "$zip.sha256"
+
+      - name: 发布到 Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 与 macOS job 并发：先到的 create、后到的 upload --clobber
+          $zip = "Clash-SpeedBench-$env:GITHUB_REF_NAME-windows.zip"
+          gh release create "$env:GITHUB_REF_NAME" --title "Clash SpeedBench $env:GITHUB_REF_NAME" --notes-file .github/release-notes.md $zip "$zip.sha256" || gh release upload "$env:GITHUB_REF_NAME" $zip "$zip.sha256" --clobber

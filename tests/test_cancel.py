@@ -75,7 +75,10 @@ class CancelStateMachineTest(unittest.TestCase):
     def test_sigint_preferred_no_force_when_process_exits(self):
         proc = make_proc()
         self.arm(proc)
-        r = web.cancel_benchmark()
+        # 钉住 posix 平台：win32 分支首发 CTRL_BREAK_EVENT（见 tests/test_windows.py），
+        # 本用例只验证 posix 的 SIGINT 优先语义
+        with mock.patch.object(sys, "platform", "darwin"):
+            r = web.cancel_benchmark()
         self.assertTrue(r["ok"])
         proc.send_signal.assert_called_once_with(signal.SIGINT)
         proc.wait.assert_called_once_with(timeout=5)
@@ -86,7 +89,8 @@ class CancelStateMachineTest(unittest.TestCase):
     def test_sigint_timeout_escalates_to_terminate(self):
         proc = make_proc(wait_side_effect=[TIMEOUT, 0])
         self.arm(proc)
-        r = web.cancel_benchmark()
+        with mock.patch.object(sys, "platform", "darwin"):  # 钉住 posix 分支
+            r = web.cancel_benchmark()
         self.assertTrue(r["ok"])
         proc.send_signal.assert_called_once_with(signal.SIGINT)
         proc.terminate.assert_called_once_with()
@@ -118,7 +122,8 @@ class CancelEndpointTest(WebServerCase):
     def test_cancel_endpoint_sigints_running_proc(self):
         proc = make_proc()
         self.set_state(running=True, proc=proc)
-        status, body = self.post_authorized("/api/run/cancel", {})
+        with mock.patch.object(sys, "platform", "darwin"):  # 钉住 posix 分支
+            status, body = self.post_authorized("/api/run/cancel", {})
         data = json.loads(body)
         self.assertEqual(status, 200)
         self.assertTrue(data["ok"])

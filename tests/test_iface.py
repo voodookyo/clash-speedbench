@@ -47,10 +47,13 @@ class IsVirtualIfaceTest(unittest.TestCase):
 
     def test_case_sensitive(self):
         # macOS 接口名恒小写（route get default 输出的就是小写），
-        # 大写形式不是真实接口命名，按非虚拟接口处理
-        for name in ("UTUN0", "Utun0", "TUN0", "IPSEC0", "Tap0"):
-            with self.subTest(name=name):
-                self.assertFalse(sbw.is_virtual_iface(name))
+        # 大写形式不是真实接口命名，按非虚拟接口处理；
+        # 本用例锁定 posix 分支语义（win32 分支是大小写不敏感的，
+        # 见 tests/test_windows.py），手动钉住平台避免在 Windows CI 上误判
+        with mock.patch.object(sys, "platform", "darwin"):
+            for name in ("UTUN0", "Utun0", "TUN0", "IPSEC0", "Tap0"):
+                with self.subTest(name=name):
+                    self.assertFalse(sbw.is_virtual_iface(name))
 
     def test_prefixes_constant(self):
         self.assertEqual(set(sbw.VIRTUAL_IFACE_PREFIXES),

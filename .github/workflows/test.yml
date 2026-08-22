@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ['3.9', '3.12']
     steps:
       - uses: actions/checkout@v4
@@ -26,15 +26,11 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
+      # heredoc（python - <<'EOF'）在 Windows 默认 shell（pwsh）下不可用；
+      # 改成单行 python -c，bash 与 pwsh 都能原样执行
       - name: AST syntax check
-        run: |
-          python - <<'EOF'
-          import ast
-          from pathlib import Path
-          files = ["clash_speedbench.py", "speedbench_workers.py",
-                   "speedbench_web.py", "speedbench_switch.py"]
-          for f in files:
-              src = Path(f).read_text(encoding="utf-8")
-              ast.parse(src, filename=f)
-              print(f"{f}: syntax OK")
-          EOF
+        run: >-
+          python -c "import ast; from pathlib import Path;
+          files = ['clash_speedbench.py', 'speedbench_workers.py', 'speedbench_web.py', 'speedbench_switch.py'];
+          [ast.parse(Path(f).read_text(encoding='utf-8'), filename=f) for f in files];
+          print('AST syntax OK:', ', '.join(files))"
