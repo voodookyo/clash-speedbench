@@ -521,7 +521,11 @@ class ExtractProxiesFallbackTest(unittest.TestCase):
             with self.assertRaises(sbw.WorkerUnavailable) as cm:
                 sbw.extract_proxies(path)
         msg = str(cm.exception)
-        self.assertIn("no ruby", msg)              # ruby 失败原因被聚合
+        # ruby 分支在 win32 上按设计整体跳过，聚合信息里没有 "no ruby"
+        if sys.platform == "win32":
+            self.assertNotIn("no ruby", msg)
+        else:
+            self.assertIn("no ruby", msg)          # ruby 失败原因被聚合
         self.assertIn("内置 YAML 解析失败", msg)     # 迷你解析器失败原因被聚合
 
     def test_win32_skips_ruby_branch(self):
