@@ -154,7 +154,9 @@ def slim_history() -> list:
 
 
 def run_benchmark(params: dict) -> None:
-    cmd = [sys.executable, str(SCRIPT), "--yes", "--history", str(HISTORY)]
+    # -u：子进程 stdout 走管道时默认块缓冲，进度行会堵在缓冲区里，
+    # 面板看不到实时进度；无缓冲模式让每行立即到达。
+    cmd = [sys.executable, "-u", str(SCRIPT), "--yes", "--history", str(HISTORY)]
     if params.get("include"):
         cmd += ["--include", str(params["include"])]
     if params.get("mb"):
