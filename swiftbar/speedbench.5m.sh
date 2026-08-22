@@ -104,4 +104,18 @@ printf '开始全量测速（终端） | shell="/usr/bin/open" param1="-a" param
 WEB_CMD="if [ -d '/Applications/Clash SpeedBench.app' ]; then /usr/bin/open -a 'Clash SpeedBench'; else if ! /usr/bin/nc -z 127.0.0.1 ${WEB_PORT} >/dev/null 2>&1; then nohup ${PYTHON3} ${WEB_PY} >/dev/null 2>&1 & sleep 1; fi; /usr/bin/open http://127.0.0.1:${WEB_PORT}; fi"
 printf '打开 Web 面板 | shell="/bin/bash" param1="-c" param2="%s" terminal=false\n' "$WEB_CMD"
 printf '%s\n' '---'
+
+# ---- 面板状态 + 退出 ----
+# 面板每次启动把随机 token 写进数据目录 web-token（0600），scripts/stop_panel.sh 读它调 /api/quit。
+if /usr/bin/nc -z 127.0.0.1 ${WEB_PORT} >/dev/null 2>&1; then
+    printf '面板：运行中（127.0.0.1:%s） | color=green size=12\n' "$WEB_PORT"
+    printf '停止 Web 面板 | shell="/bin/bash" param1="%s" terminal=false refresh=true\n' \
+        "$REPO_DIR/scripts/stop_panel.sh"
+else
+    printf '面板：已停止 | color=gray size=12\n'
+fi
+# 菜单栏图标本体属于 SwiftBar：退出它图标才消失。
+printf '退出菜单栏图标 | shell="/bin/bash" param1="%s" terminal=false\n' \
+    "$REPO_DIR/scripts/quit_swiftbar.sh"
+printf '%s\n' '---'
 printf '刷新 | refresh=true\n'

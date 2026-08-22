@@ -76,6 +76,18 @@ MAX_LINES = 500
 # 防止其他网页跨站向本地面板发写请求（CSRF）。
 WEB_TOKEN = secrets.token_hex(16)
 
+# 令牌同时写入数据目录（0600 仅本人可读），供本机受信脚本（SwiftBar 菜单栏
+# 插件等）调用写操作 API（如 /api/quit）。每次启动覆盖，面板停掉后自然失效。
+TOKEN_FILE = DATA_HOME / "web-token"
+
+
+def write_token_file() -> None:
+    try:
+        TOKEN_FILE.write_text(WEB_TOKEN, encoding="utf-8")
+        os.chmod(TOKEN_FILE, 0o600)
+    except OSError:
+        pass  # 写不进去只是菜单栏无法停止面板，不影响面板本身
+
 # jsonl → DB 的同步策略：读取前惰性增量同步。每次读 API 先比对 jsonl mtime，
 # 有变化才 import_jsonl（导入本身按 ts 去重，幂等），面板读到的永远是最新数据，
 # mtime 不变时代价只是一次 stat；启动时与 /api/run 结束后再各显式同步一次，
@@ -411,6 +423,7 @@ def main() -> int:
     except Exception as e:
         print(f"历史库导入失败（不影响面板使用）: {e}")
     print(f"Clash SpeedBench 面板: {url}")
+    write_token_file()
     print("Ctrl+C 停止。测速期间 Mihomo 会临时切到 GLOBAL 模式，结束自动恢复。")
     if not args.no_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
