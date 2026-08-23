@@ -98,9 +98,11 @@ macOS 用户也可以直接**双击 `speedbench.command`**（可拖到桌面或 
 同样自动恢复 Clash 的运行模式与节点选择。为此面板会保留一个最小化的
 "Clash SpeedBench" 控制台窗口（中断信号需要控制台存在，属正常设计）——
 最小化放着即可，关闭该窗口即退出 SpeedBench（面板里的「退出 SpeedBench」按钮同样可用）。
+同时右下角托盘会出现 SpeedBench 图标：**左键点一下打开面板**，右键菜单可「打开面板 /
+退出 SpeedBench」；托盘随面板自动出现、自动消失，无需手动管理。
 
-**与 macOS 的差异**：没有 .app 安装包与菜单栏小工具（SwiftBar 是 macOS 上的可选附加），
-Windows 的入口就是 `SpeedBench.bat`。
+**与 macOS 的差异**：没有 .app 安装包与 SwiftBar 菜单栏小工具（macOS 上的可选附加），
+Windows 的对应物是随 `SpeedBench.bat` 一起启动的托盘图标。
 
 ## 输出示例
 
