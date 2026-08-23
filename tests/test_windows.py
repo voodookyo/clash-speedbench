@@ -23,6 +23,8 @@ sys.platform="win32" 运行，不起真子进程、不碰真文件系统、不�
 - pipe:// 命名管道 controller：候选按平台过滤（win32 含 pipe、posix 剔除），
   scheme 解析、假 plumbing 上的 HTTP 往返（Content-Length + chunked）、
   posix 明确报错、_PipeSock 关闭幂等
+- 子进程文本输出钉 UTF-8（curl_speed / fetch_ip_info / doh_resolve）：
+  中文 Windows 的 GBK 默认解码会炸 UnicodeDecodeError（真机实测）
 """
 import contextlib
 import importlib
@@ -598,6 +600,41 @@ class PipeControllerTest(unittest.TestCase):
                 sock.close()
                 sock.close()
             m_close.assert_called_once_with(456)
+
+
+class SubprocessEncodingTest(unittest.TestCase):
+    """子进程文本输出必须钉 encoding="utf-8" + errors="replace"：中文 Windows
+    默认按 GBK 解码，遇到 UTF-8/非 GBK 字节（ip-api 的中文地名、curl 报错里
+    的服务端字节等）会在 subprocess 读取线程里炸 UnicodeDecodeError，表现为
+    IP 画像列空、日志刷异常（v0.8.0 真机验收实测复现）。"""
+
+    @staticmethod
+    def _last_run_kwargs(module, func, *args):
+        proc = subprocess.CompletedProcess(args=["curl"], returncode=0,
+                                           stdout="x", stderr="")
+        with mock.patch.object(module.subprocess, "run", return_value=proc) as m:
+            try:
+                func(*args)
+            except Exception:
+                pass  # 只关心 subprocess.run 的调用参数，不关心后续解析
+        return m.call_args.kwargs
+
+    def test_curl_speed_pins_utf8(self):
+        kw = self._last_run_kwargs(csb, csb.curl_speed, "http://127.0.0.1:7897",
+                                   "https://example.com/x", 4.0, 3.0)
+        self.assertEqual(kw.get("encoding"), "utf-8")
+        self.assertEqual(kw.get("errors"), "replace")
+
+    def test_fetch_ip_info_pins_utf8(self):
+        kw = self._last_run_kwargs(csb, csb.fetch_ip_info,
+                                   "http://127.0.0.1:7897", 8.0)
+        self.assertEqual(kw.get("encoding"), "utf-8")
+        self.assertEqual(kw.get("errors"), "replace")
+
+    def test_doh_resolve_pins_utf8(self):
+        kw = self._last_run_kwargs(sbw, sbw.doh_resolve, "example.com")
+        self.assertEqual(kw.get("encoding"), "utf-8")
+        self.assertEqual(kw.get("errors"), "replace")
 
 
 class SpeedBenchBatTest(unittest.TestCase):

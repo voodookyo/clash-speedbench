@@ -563,7 +563,10 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
         download_url,
     ]
     try:
+        # 钉 UTF-8：中文 Windows 的默认 GBK 解码遇到 curl 输出里的非 GBK 字节
+        # 会在 subprocess 读取线程里炸 UnicodeDecodeError（真机实测）
         p = subprocess.run(cmd, text=True, capture_output=True,
+                           encoding="utf-8", errors="replace",
                            timeout=max_time + connect_timeout + 5,
                            **_no_window_kwargs())
     except FileNotFoundError:
@@ -676,7 +679,11 @@ def fetch_ip_info(proxy_url: str, timeout: float) -> Optional[dict]:
         DEFAULT_IP_API_URL,
     ]
     try:
-        p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout + 5,
+        # 钉 UTF-8：ip-api 返回体是 UTF-8 JSON（lang=zh-CN 时含中文地名），
+        # 中文 Windows 按 GBK 解码必炸 UnicodeDecodeError（真机实测）
+        p = subprocess.run(cmd, text=True, capture_output=True,
+                           encoding="utf-8", errors="replace",
+                           timeout=timeout + 5,
                            **_no_window_kwargs())
     except subprocess.TimeoutExpired:
         return None

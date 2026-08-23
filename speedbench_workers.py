@@ -813,12 +813,15 @@ def is_virtual_iface(name: Optional[str]) -> bool:
 def doh_resolve(domain: str) -> Optional[str]:
     for host, ip, path in DOH_SERVERS:
         try:
+            # 钉 UTF-8：与 fetch_ip_info/curl_speed 保持一致，避免中文 Windows
+            # 上 GBK 解码遇到非 GBK 字节在读取线程里炸 UnicodeDecodeError
             p = subprocess.run(
                 ["curl", "-s", "-m", "6",
                  "--resolve", f"{host}:443:{ip}",
                  "-H", "accept: application/dns-json",
                  f"https://{host}{path}?name={domain}&type=A"],
                 capture_output=True, text=True, timeout=9,
+                encoding="utf-8", errors="replace",
                 **_no_window_kwargs())
             if p.returncode == 0 and p.stdout:
                 data = json.loads(p.stdout)
