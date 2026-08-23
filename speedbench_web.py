@@ -428,6 +428,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    # Windows 非中文区域设置下 stdout 默认 cp1252，print 中文启动信息会直接
+    # UnicodeEncodeError 崩掉面板（CI windows-latest 实测）。只把 errors 钉成
+    # replace：GBK 中文控制台行为不变（该编码能表示中文），cp1252 下退化
+    # 成 ? 但不崩——真正的用户界面在浏览器里，控制台文案仅是辅助。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass  # 非 TextIOWrapper 环境（IDLE/嵌入式）没有 reconfigure，跳过即可
+
     parser = argparse.ArgumentParser(description="Clash SpeedBench 本地 Web 面板")
     parser.add_argument("--port", type=int, default=8950)
     parser.add_argument("--no-browser", action="store_true")
