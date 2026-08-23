@@ -879,6 +879,10 @@ class Worker:
         self.dir: Optional[tempfile.TemporaryDirectory] = None
         self.api: Optional[MihomoAPI] = None
         self.proxy_url = ""
+        # stop() 幂等保护：中断路径（run_pool 的 worker 注册表统一清理）与
+        # shard_loop 的 finally 可能并发/重复调用，必须只真正执行一次
+        self._stop_lock = threading.Lock()
+        self._stopped = False
 
     def start(self) -> None:
         self.dir = tempfile.TemporaryDirectory(prefix="speedbench-worker-")
@@ -925,17 +929,21 @@ class Worker:
         raise WorkerUnavailable(f"worker 进程启动超时（端口 {mix_port}）")
 
     def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=3)
-            except Exception:
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            if self.proc and self.proc.poll() is None:
                 try:
-                    self.proc.kill()
+                    self.proc.terminate()
+                    self.proc.wait(timeout=3)
                 except Exception:
-                    pass
-        if self.dir:
-            self.dir.cleanup()
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+            if self.dir:
+                self.dir.cleanup()
 
     def select(self, name: str) -> None:
         assert self.api is not None
@@ -1171,13 +1179,37 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
 
         ip_total = len(ip_pending)
 
+        # 中断收队机制：CTRL_BREAK/SIGINT 只会打断主线程的 pool.map，分片线程
+        # 原本感知不到、会继续逐节点探测（真机验收实测：面板 5 秒兜底强杀后
+        # 留下 5 个孤儿 worker 进程）。引入取消标志 + 已启动 worker 注册表：
+        # 中断时置标志并立即停掉全部临时 mihomo，在途探测因出口进程消失而
+        # 立刻失败返回，池 shutdown 随之秒级完成，等不到面板的强杀兜底。
+        cancel_event = threading.Event()
+        workers_lock = threading.Lock()
+        live_workers: List[Worker] = []
+
+        def stop_live_workers() -> None:
+            with workers_lock:
+                ws = list(live_workers)
+            for w in ws:
+                try:
+                    w.stop()  # Worker.stop 幂等，与 shard_loop 的 finally 不冲突
+                except Exception:
+                    pass
+
         def shard_loop(shard: List[dict]) -> None:
+            if cancel_event.is_set():
+                return
             # worker 配置 = 分片节点 + 各自的 dialer-proxy 依赖闭包；
             # 探测仍只针对分片内的入选节点，依赖节点仅供链式拨号、不计入结果
             worker = Worker(mihomo_bin, with_dependencies(shard, all_proxies), hosts, iface)
             worker.start()
+            with workers_lock:
+                live_workers.append(worker)
             try:
                 for p in shard:
+                    if cancel_event.is_set():  # 节点间检查取消标志，尽快收队
+                        return
                     name = str(p.get("name"))
                     proto = str(p.get("type", ""))
                     lat, jit = latency_map.get(name, (None, None))
@@ -1212,12 +1244,19 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                             status=f"worker-failed: {e}"[:160]))
                         done_counter["n"] += 1
 
+        # 不用 with 管理池：with 的 __exit__ 会先 shutdown(wait=True) 再进
+        # except，中断时白白等到面板强杀。显式 try/finally，中断分支先置
+        # 取消标志、停 worker（在途探测随即快速失败），shutdown 才能秒级完成。
+        pool = ThreadPoolExecutor(max_workers=worker_count)
         try:
-            with ThreadPoolExecutor(max_workers=worker_count) as pool:
-                list(pool.map(guarded, [s for s in shards if s]))
+            list(pool.map(guarded, [s for s in shards if s]))
         except KeyboardInterrupt:
-            print("\n\n收到 Ctrl+C，停止测速（worker 均为临时进程，正在清理）……")
+            print("\n\n收到 Ctrl+C，停止测速（正在清理临时 worker）……")
+            cancel_event.set()
+            stop_live_workers()
             raise
+        finally:
+            pool.shutdown(wait=True)
     print(f"Phase 1 粗筛完成，耗时 {time.time() - started:.1f}s（{total} 节点）")
 
     # Phase 2 选节点：剔除不通节点后按延迟升序，取 Top N（--all 时取全部连通节点）

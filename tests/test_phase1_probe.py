@@ -323,5 +323,83 @@ class RunPoolMainApiTest(unittest.TestCase):
         self.assertGreaterEqual(worker_cls.call_count, 2)  # Phase 1 分片 + Phase 2
 
 
+class Phase1InterruptCleanupTest(unittest.TestCase):
+    """Phase 1 池化阶段被 KeyboardInterrupt 打断时的临时 worker 清理。
+
+    v0.8.0 Windows 真机验收实测复现：面板中断测速后残留 5 个孤儿
+    verge-mihomo 进程——CTRL_BREAK 只打断主线程的 pool.map，分片线程感知
+    不到、继续逐节点探测，with 池 __exit__ 的 shutdown(wait=True) 卡到
+    面板 5 秒强杀兜底，worker 的 stop() 永远跑不到。修复 = 取消标志
+    （节点间检查）+ 已启动 worker 注册表（中断即统停，在途探测立刻失败）。
+    """
+
+    PROXIES = [{"name": "A", "type": "ss", "server": "a.example.com"},
+               {"name": "B", "type": "trojan", "server": "b.example.com"}]
+
+    def test_keyboard_interrupt_stops_all_started_workers(self):
+        started, stopped = [], []
+
+        class FakeWorker:
+            def __init__(self, *a, **k):
+                self.api = None
+                self.proxy_url = ""
+
+            def start(self):
+                self.api = object()
+                started.append(self)
+
+            def stop(self):
+                if self not in stopped:  # 模拟真实 Worker.stop 的幂等语义
+                    stopped.append(self)
+
+        buf = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                sbw, "find_mihomo_bin", return_value="/fake/mihomo"))
+            stack.enter_context(mock.patch.object(
+                sbw, "extract_proxies", return_value=list(self.PROXIES)))
+            stack.enter_context(mock.patch.object(
+                sbw, "physical_interface", return_value="en0"))
+            stack.enter_context(mock.patch.object(
+                sbw, "build_hosts", return_value=dict(HOSTS)))
+            stack.enter_context(mock.patch.object(sbw, "Worker", FakeWorker))
+            # 探测一跑就抛 KeyboardInterrupt：BaseException，guarded 的
+            # except Exception 兜不住，经 future 抛回主线程的 pool.map
+            stack.enter_context(mock.patch.object(
+                sbw, "_probe_node_in_worker", side_effect=KeyboardInterrupt))
+            stack.enter_context(contextlib.redirect_stdout(buf))
+            with self.assertRaises(KeyboardInterrupt):
+                sbw.run_pool(["A", "B"], {"A": "ss", "B": "trojan"},
+                             mk_args(workers=2), main_api=None)
+        # 孤儿进程回归保护：所有已启动的临时 worker 都必须被停掉
+        self.assertTrue(started)
+        self.assertEqual({id(w) for w in started}, {id(w) for w in stopped})
+
+    def test_worker_stop_idempotent(self):
+        # 中断统一清理 + shard_loop 的 finally 会重复 stop，必须只真正执行一次
+        w = sbw.Worker("mihomo", [], {}, None)
+        calls = []
+
+        class FakeProc:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                calls.append("terminate")
+
+            def wait(self, timeout=None):
+                calls.append("wait")
+                return 0
+
+            def kill(self):
+                calls.append("kill")
+
+        w.proc = FakeProc()
+        w.dir = None
+        w.stop()
+        w.stop()
+        self.assertEqual(calls, ["terminate", "wait"])
+
+
 if __name__ == "__main__":
     unittest.main()
