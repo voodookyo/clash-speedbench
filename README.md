@@ -22,7 +22,7 @@ SpeedBench ── 逐节点切换 → 经 mixed-port 真实下载 → 查出口 
 ```
 
 - **挂接运行中的客户端**：不改订阅、不改配置、不需要把节点导入别的工具
-- **支持 Unix socket controller**：新版 Clash Verge Rev 默认只开 socket（TCP 9097 其实没绑定）
+- **支持 Unix socket / Windows 命名管道 controller**：新版 Clash Verge Rev 默认只开 socket（macOS/Linux）或 `\\.\pipe\verge-mihomo` 管道（Windows），TCP 9097 其实没绑定
 - **真实带宽**：通过 mixed-port 用 curl 实际下载，不是拿 `/delay` 冒充速度
 - **IP 画像**：每节点查出口 IP 的 ASN / 国家 / ISP / 托管·移动·代理标记（ip-api.com，无需 key；只如实展示标记，不断言"住宅"、不打风险分）
 - **综合评分**：带宽 55% + 延迟 25% + IP 标记 20%（启发式扣分，非风险评分）→ ★1~5
@@ -178,7 +178,7 @@ cp -R "dist/Clash SpeedBench.app" /Applications/
 | `--no-ip` | 跳过 IP 画像 | 关 |
 | `--auto-switch` | 测完自动切到冠军节点 | 关 |
 | `--switch-group NAME` | 指定要切换的策略组 | 自动探测主 Selector |
-| `--controller URL` | 指定 controller（支持 `unix://` 前缀） | 自动探测 |
+| `--controller URL` | 指定 controller（支持 `unix://`、`pipe://`（Windows）前缀） | 自动探测 |
 | `--top N` | 表格只显示前 N 名 | 全部 |
 | `--workers N` | 并发 worker 数；1=关闭并发（串行模式） | 6 |
 | `--config-file PATH` | 并发模式用的配置文件（含节点凭据） | 自动探测 |

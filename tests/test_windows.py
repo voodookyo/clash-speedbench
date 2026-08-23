@@ -20,6 +20,9 @@ sys.platform="win32" 运行，不起真子进程、不碰真文件系统、不�
 - main() 的 SIGBREAK 注册：win32 注册 KeyboardInterrupt 转换 handler；posix 不注册
 - SpeedBench.bat：纯 ASCII / 无 BOM / CRLF / 保留 python 启动行
   （UTF-8 中文 .bat 会被 cmd.exe 错乱解析的真机回归保护）
+- pipe:// 命名管道 controller：候选按平台过滤（win32 含 pipe、posix 剔除），
+  scheme 解析、假 plumbing 上的 HTTP 往返（Content-Length + chunked）、
+  posix 明确报错、_PipeSock 关闭幂等
 """
 import contextlib
 import importlib
@@ -61,7 +64,8 @@ class DefaultControllersTest(unittest.TestCase):
             self.assertNotEqual(csb.DEFAULT_CONTROLLERS, csb._ALL_CONTROLLERS)
             self.assertEqual([c for c in csb.DEFAULT_CONTROLLERS
                               if c.startswith("unix://")], [])
-            # TCP 候选全部保留、顺序不变
+            # win32：命名管道候选在最前（Verge Windows 默认/唯一通道），TCP 候选兜底
+            self.assertTrue(csb.DEFAULT_CONTROLLERS[0].startswith("pipe://"))
             self.assertEqual(csb.DEFAULT_CONTROLLERS,
                              tuple(c for c in csb._ALL_CONTROLLERS
                                    if not c.startswith("unix://")))
@@ -71,12 +75,16 @@ class DefaultControllersTest(unittest.TestCase):
                 with self.assertRaises(csb.ApiError) as cm:
                     csb.detect_controller("", None)
             self.assertNotIn("unix://", str(cm.exception))
+            self.assertIn("pipe://verge-mihomo", str(cm.exception))
             self.assertIn("http://127.0.0.1:9097", str(cm.exception))
 
     def test_posix_keeps_unix_controller_first(self):
         with reload_with_platform(csb, "darwin"):
-            self.assertEqual(csb.DEFAULT_CONTROLLERS, csb._ALL_CONTROLLERS)
             self.assertTrue(csb.DEFAULT_CONTROLLERS[0].startswith("unix://"))
+            # pipe:// 是 Windows 专属通道，posix 候选里剔除；其余全量保留
+            self.assertEqual(csb.DEFAULT_CONTROLLERS,
+                             tuple(c for c in csb._ALL_CONTROLLERS
+                                   if not c.startswith("pipe://")))
 
 
 # 模拟 Windows 环境变量：故意不设 ProgramFiles(x86)，验证 % 残留项被过滤
@@ -514,6 +522,82 @@ class SigbreakRegistrationTest(unittest.TestCase):
             rc = self.run_main("darwin")
         self.assertEqual(rc, 1)
         m_signal.assert_not_called()  # posix 不注册任何自定义 handler
+
+
+class PipeControllerTest(unittest.TestCase):
+    """pipe:// 命名管道 controller：Windows 版 Clash Verge Rev 的默认（服务模式时
+    甚至是唯一）API 通道。真机验收实测：生成的运行配置里 external-controller 为空，
+    9097/9090 均不监听，只有 \\\\.\\pipe\\verge-mihomo 可用。
+
+    传输层（CreateFileW/NtCreateFile/ReadFile/WriteFile）只在真实 Windows 上执行；
+    这里借 reload_with_platform 让 win32 分支代码定义出来，再 patch 四个
+    plumbing 函数喂假报文，验证 scheme 解析与 HTTP 往返逻辑（含 mihomo 实际
+    使用的 chunked 编码）。
+    """
+
+    CANNED = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Content-Length: 22\r\nConnection: close\r\n\r\n"
+        b'{"version":"v1.19.29"}'
+    )
+
+    def _run_over_fake_pipe(self, canned: bytes):
+        """在假 plumbing 上跑一次完整 HTTP 往返，返回 (API 返回值, 写出的请求字节)。"""
+        with reload_with_platform(csb, "win32"):
+            writes = []
+            reads = [canned[i:i + 4096] for i in range(0, len(canned), 4096)] + [b""]
+
+            def fake_read(_handle, size):
+                if not reads:
+                    return b""
+                return reads.pop(0)[:size]
+
+            with mock.patch.object(csb, "_open_pipe_handle", return_value=123) as m_open, \
+                    mock.patch.object(csb, "_pipe_write_all",
+                                      side_effect=lambda _h, d: writes.append(bytes(d))), \
+                    mock.patch.object(csb, "_pipe_read", side_effect=fake_read), \
+                    mock.patch.object(csb, "_pipe_close") as m_close:
+                result = csb.MihomoAPI("pipe://verge-mihomo", timeout=5.0).get("/version")
+            m_open.assert_called_once_with("verge-mihomo")
+            m_close.assert_called_once_with(123)  # 句柄只被关一次（fp/sock 不双关）
+        return result, writes
+
+    def test_pipe_scheme_parsed(self):
+        api = csb.MihomoAPI("pipe://verge-mihomo")
+        self.assertEqual(api.pipe_name, "verge-mihomo")
+        self.assertIsNone(api.unix_path)
+        self.assertEqual(api.base, "http://localhost")
+
+    def test_pipe_transport_round_trip(self):
+        result, writes = self._run_over_fake_pipe(self.CANNED)
+        self.assertEqual(result, {"version": "v1.19.29"})
+        self.assertIn(b"GET /version HTTP/1.1", b"".join(writes))
+
+    def test_pipe_transport_chunked_encoding(self):
+        canned = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            b"5\r\n{\"a\":\r\n2\r\n1}\r\n0\r\n\r\n"
+        )
+        result, _ = self._run_over_fake_pipe(canned)
+        self.assertEqual(result, {"a": 1})
+
+    def test_pipe_scheme_on_posix_raises_clear_error(self):
+        with mock.patch.object(sys, "platform", "darwin"):
+            api = csb.MihomoAPI("pipe://verge-mihomo")
+            with self.assertRaises(csb.ApiError) as cm:
+                api.get("/version")
+        self.assertIn("仅支持 Windows", str(cm.exception))
+
+    def test_pipesock_close_idempotent_and_rb_only(self):
+        with reload_with_platform(csb, "win32"):
+            with mock.patch.object(csb, "_pipe_close") as m_close:
+                sock = csb._PipeSock(456)
+                with self.assertRaises(ValueError):
+                    sock.makefile("wb")
+                sock.close()
+                sock.close()
+            m_close.assert_called_once_with(456)
 
 
 class SpeedBenchBatTest(unittest.TestCase):

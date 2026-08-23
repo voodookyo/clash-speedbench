@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速
-- Reads the running Mihomo controller API (TCP or Unix socket)
+- Reads the running Mihomo controller API (TCP, Unix socket or Windows named pipe)
 - Measures per-node latency with Mihomo's /delay API
 - Temporarily switches Mihomo to GLOBAL mode for real download tests
 - Downloads through the running mixed-port with curl
@@ -19,6 +19,7 @@ import argparse
 import csv
 import getpass
 import http.client
+import io
 import json
 import os
 import re
@@ -39,16 +40,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Clash Verge Rev (recent versions) launches mihomo with -ext-ctl-unix instead of
 # a TCP external-controller, so the Unix socket is probed first.
-# Windows 没有 unix socket，候选里直接剔除 unix:// 项，只保留 TCP 候选
-# （用户仍可用 --controller 显式指定任意地址）；macOS/Linux 行为不变。
+# Windows 版 Verge 对应的默认通道是命名管道 external-controller-pipe——真机实测
+# 生成的运行配置里 external-controller 为空（9097/9090 根本不监听），管道常常
+# 是 controller 的唯一入口；故 win32 候选为 pipe:// 优先 + TCP 兜底，unix:// 剔除。
+# 用户仍可用 --controller 显式指定任意地址（含 pipe://<名字>）。
 _ALL_CONTROLLERS = (
     "unix:///tmp/verge/verge-mihomo.sock",
+    "pipe://verge-mihomo",
     "http://127.0.0.1:9097",
     "http://127.0.0.1:9090",
 )
 DEFAULT_CONTROLLERS = tuple(
     c for c in _ALL_CONTROLLERS
-    if sys.platform != "win32" or not c.startswith("unix://")
+    if c.startswith("http://")
+    or (c.startswith("unix://") and sys.platform != "win32")
+    or (c.startswith("pipe://") and sys.platform == "win32")
 )
 DEFAULT_DELAY_URL = "https://cp.cloudflare.com/generate_204"
 DEFAULT_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
@@ -85,12 +91,215 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.socket_path)
 
 
+# ---------------- Windows 命名管道传输（external-controller-pipe） ----------------
+# Clash Verge Rev 的 Windows 版默认（服务模式时甚至是唯一）把 mihomo 的完整
+# HTTP API 挂在 \\.\pipe\verge-mihomo 上。用 ctypes 调系统 DLL 实现，保持零第三方
+# 依赖。ctypes.windll 只在真实 Windows 上存在，故一律在函数内惰性取用；
+# 测试（含 posix 上 mock 平台分支）通过 patch 下面四个 plumbing 函数进行。
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    class _UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT),
+                    ("MaximumLength", wintypes.USHORT),
+                    ("Buffer", wintypes.LPWSTR)]
+
+    class _OBJECT_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Length", wintypes.ULONG), ("RootDirectory", wintypes.HANDLE),
+                    ("ObjectName", ctypes.POINTER(_UNICODE_STRING)),
+                    ("Attributes", wintypes.ULONG),
+                    ("SecurityDescriptor", wintypes.LPVOID),
+                    ("SecurityQualityOfService", wintypes.LPVOID)]
+
+    class _IO_STATUS_BLOCK(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_ssize_t), ("Information", ctypes.c_size_t)]
+
+    _PIPE_GENERIC_RW = 0x80000000 | 0x40000000  # GENERIC_READ | GENERIC_WRITE
+    _PIPE_SYNCHRONIZE = 0x00100000
+    _PIPE_SHARE_RW = 0x1 | 0x2                  # FILE_SHARE_READ | FILE_SHARE_WRITE
+    _PIPE_OPEN_EXISTING = 3                     # OPEN_EXISTING
+    _PIPE_FILE_OPEN = 1                         # FILE_OPEN
+    _PIPE_CASE_INSENSITIVE = 0x40               # OBJ_CASE_INSENSITIVE
+    _INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+    # ReadFile 的对端关闭/未连接错误码：视同 EOF
+    _PIPE_EOF_ERRORS = (109, 233)               # ERROR_BROKEN_PIPE / PIPE_NOT_CONNECTED
+
+
+def _pipe_kernel32():
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _open_pipe_handle(pipe_name: str) -> int:
+    """打开命名管道，返回 Win32 句柄；失败抛 OSError。
+
+    先试标准的 CreateFileW(\\\\.\\pipe\\<name>)；真机验收实测：mihomo 以服务
+    模式（SYSTEM、会话 0）运行的机器上，Win32 路径解析对这条管道报
+    ERROR_PATH_NOT_FOUND，而原生 NT 路径能开——故回退 ntdll.NtCreateFile
+    直开 \\Device\\NamedPipe\\<name>。
+    """
+    if sys.platform != "win32":
+        raise OSError("命名管道 controller 仅支持 Windows")
+    kernel32 = _pipe_kernel32()
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.HANDLE]
+    handle = kernel32.CreateFileW("\\\\.\\pipe\\" + pipe_name, _PIPE_GENERIC_RW,
+                                  _PIPE_SHARE_RW, None, _PIPE_OPEN_EXISTING, 0, None)
+    if handle != _INVALID_HANDLE_VALUE:
+        return handle
+    # Win32 路径解析失败（真机实测 err 3）：回退原生 NT 路径
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtCreateFile.restype = wintypes.LONG
+    ntdll.NtCreateFile.argtypes = [ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD,
+                                   ctypes.POINTER(_OBJECT_ATTRIBUTES),
+                                   ctypes.POINTER(_IO_STATUS_BLOCK),
+                                   wintypes.LPVOID, wintypes.ULONG, wintypes.ULONG,
+                                   wintypes.ULONG, wintypes.ULONG,
+                                   wintypes.LPVOID, wintypes.ULONG]
+    nt_path = "\\Device\\NamedPipe\\" + pipe_name
+    name_buf = ctypes.create_unicode_buffer(nt_path)
+    ustr = _UNICODE_STRING(len(nt_path) * 2, len(nt_path) * 2,
+                           ctypes.cast(name_buf, wintypes.LPWSTR))
+    attrs = _OBJECT_ATTRIBUTES()
+    attrs.Length = ctypes.sizeof(_OBJECT_ATTRIBUTES)
+    attrs.ObjectName = ctypes.pointer(ustr)
+    attrs.Attributes = _PIPE_CASE_INSENSITIVE
+    out_handle = wintypes.HANDLE()
+    iosb = _IO_STATUS_BLOCK()
+    status = ntdll.NtCreateFile(ctypes.byref(out_handle),
+                                _PIPE_GENERIC_RW | _PIPE_SYNCHRONIZE,
+                                ctypes.byref(attrs), ctypes.byref(iosb),
+                                None, 0, _PIPE_SHARE_RW, _PIPE_FILE_OPEN, 0, None, 0)
+    if status != 0:
+        raise OSError(f"命名管道 {pipe_name} 打开失败，NTSTATUS 0x{status & 0xFFFFFFFF:08X}"
+                      "（请确认 Clash Verge Rev 正在运行）")
+    return out_handle.value
+
+
+def _pipe_write_all(handle: int, data: bytes) -> None:
+    kernel32 = _pipe_kernel32()
+    kernel32.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
+                                   ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    view = memoryview(data)
+    while view:
+        written = wintypes.DWORD()
+        # c_void_p 形参不吃 memoryview（真机实测 TypeError），逐段转 bytes 再传
+        chunk = view.tobytes()
+        if not kernel32.WriteFile(handle, chunk, len(chunk), ctypes.byref(written), None):
+            raise OSError(ctypes.get_last_error(), "WriteFile 命名管道失败")
+        view = view[written.value:]
+
+
+def _pipe_read(handle: int, size: int) -> bytes:
+    """读管道；对端关闭或读到 0 字节视同 EOF 返回 b""。"""
+    kernel32 = _pipe_kernel32()
+    kernel32.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                  ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    buf = ctypes.create_string_buffer(size)
+    read = wintypes.DWORD()
+    ok = kernel32.ReadFile(handle, buf, size, ctypes.byref(read), None)
+    if read.value:
+        return buf.raw[: read.value]  # 含消息模式下的 ERROR_MORE_DATA 部分数据
+    if not ok:
+        err = ctypes.get_last_error()
+        if err in _PIPE_EOF_ERRORS:
+            return b""
+        raise OSError(err, "ReadFile 命名管道失败")
+    return b""
+
+
+def _pipe_close(handle: int) -> None:
+    _pipe_kernel32().CloseHandle(wintypes.HANDLE(handle))
+
+
+class _PipeRawReader(io.RawIOBase):
+    """把管道句柄适配成 io 读接口，供 BufferedReader 包装。
+
+    句柄所有权随 makefile() 移交到这里：HTTPConnection 在 Connection: close
+    响应上 begin() 后立刻 conn.close()（→ sock.close()），而响应体还没从
+    fp 读完——对齐 socket.makefile 的语义（sock 先关、fp 继续可读），
+    由本对象的 close() 在响应读完时真正关句柄。
+    """
+
+    def __init__(self, handle: int):
+        super().__init__()
+        self._handle: Optional[int] = handle
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        data = _pipe_read(self._handle, len(b))
+        b[: len(data)] = data
+        return len(data)
+
+    def close(self) -> None:
+        if self._handle is not None:
+            _pipe_close(self._handle)
+            self._handle = None
+        super().close()
+
+
+class _PipeSock:
+    """http.client 所需的最小 socket 外观（命名管道实现）。
+
+    http.client 只调用 sendall()/makefile("rb")/close()。makefile("rb") 把句柄
+    所有权移交给返回的文件对象（见 _PipeRawReader），此后 close() 不再管句柄。
+    管道读写是阻塞式 Win32 调用、没有 socket 意义上的超时（settimeout 收下来
+    但不生效）；/delay 等 API 的服务端 timeout 参数兜底，mihomo 总会在有限
+    时间内应答。
+    """
+
+    def __init__(self, handle: int):
+        self._handle: Optional[int] = handle
+
+    def sendall(self, data) -> None:
+        if self._handle is None:
+            raise OSError("管道句柄已移交或关闭")
+        _pipe_write_all(self._handle, bytes(data))
+
+    def makefile(self, mode, buffering=None):
+        if mode != "rb":
+            raise ValueError("管道 socket 外观只支持 makefile(\"rb\")")
+        if self._handle is None:
+            raise OSError("管道句柄已移交或关闭")
+        rfile = io.BufferedReader(_PipeRawReader(self._handle), buffer_size=65536)
+        self._handle = None  # 句柄所有权随读侧文件移交
+        return rfile
+
+    def settimeout(self, _timeout) -> None:
+        pass  # 命名管道不支持，见类注释
+
+    def close(self) -> None:
+        if self._handle is not None:
+            _pipe_close(self._handle)
+            self._handle = None
+
+
+class WinPipeHTTPConnection(http.client.HTTPConnection):
+    """HTTP-over-Windows-命名管道连接（mihomo 的 external-controller-pipe）。"""
+
+    def __init__(self, pipe_name: str, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self.pipe_name = pipe_name
+
+    def connect(self) -> None:
+        self.sock = _PipeSock(_open_pipe_handle(self.pipe_name))
+
+
 class MihomoAPI:
     def __init__(self, base: str, secret: str = "", timeout: float = 5.0):
         base = base.rstrip("/")
         self.unix_path: Optional[str] = None
+        self.pipe_name: Optional[str] = None
         if base.startswith("unix://"):
             self.unix_path = base[len("unix://"):]
+            self.base = "http://localhost"
+        elif base.startswith("pipe://"):
+            # Windows 命名管道 controller（Clash Verge Rev Windows 版默认通道）
+            self.pipe_name = base[len("pipe://"):]
             self.base = "http://localhost"
         else:
             self.base = base
@@ -109,6 +318,8 @@ class MihomoAPI:
         conn: http.client.HTTPConnection
         if self.unix_path is not None:
             conn = UnixHTTPConnection(self.unix_path, timeout=self.timeout)
+        elif self.pipe_name is not None:
+            conn = WinPipeHTTPConnection(self.pipe_name, timeout=self.timeout)
         else:
             parsed = urllib.parse.urlsplit(self.base)
             if parsed.scheme == "https":
@@ -828,7 +1039,8 @@ def main() -> int:
         description="Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速（延迟 + 真实带宽 + IP 画像）"
     )
     parser.add_argument("--controller",
-                        help="External Controller，例如 http://127.0.0.1:9097 或 unix:///tmp/verge/verge-mihomo.sock")
+                        help="External Controller，例如 http://127.0.0.1:9097、"
+                             "unix:///tmp/verge/verge-mihomo.sock 或 pipe://verge-mihomo（Windows）")
     parser.add_argument("--secret", default=os.environ.get("MIHOMO_SECRET", ""),
                         help="API secret；建议用环境变量 MIHOMO_SECRET，避免写进 shell history")
     parser.add_argument("--include", help="只测试名称匹配此正则的节点，例如 '香港|HK'")
