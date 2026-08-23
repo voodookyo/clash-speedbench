@@ -36,6 +36,7 @@ from clash_speedbench import (  # noqa: E402
     pick_switch_group,
 )
 import speedbench_db  # noqa: E402
+import speedbench_tray  # noqa: E402
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
@@ -445,10 +446,29 @@ def main() -> int:
     print("Ctrl+C 停止。测速期间 Mihomo 会临时切到 GLOBAL 模式，结束自动恢复。")
     if not args.no_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+
+    def _tray_quit() -> None:
+        # 托盘「退出」与 /api/quit 同一语义：先中断进行中的测速
+        # （走 finally 恢复 Clash 配置），再停面板
+        with STATE_LOCK:
+            busy = STATE["running"]
+        if busy:
+            cancel_benchmark()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    # Windows：进程内系统托盘（零依赖 ctypes/Win32，见 speedbench_tray.py）；
+    # 非 win32 下 start_tray 是 no-op 返回 None
+    tray = speedbench_tray.start_tray(HERE / "speedbench.ico",
+                                      on_open=lambda: webbrowser.open(url),
+                                      on_quit=_tray_quit)
+    if tray is not None:
+        print("托盘图标已启动：左键打开面板，右键可退出 SpeedBench。")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止。")
+    finally:
+        speedbench_tray.stop_tray(tray)  # 摘托盘图标，避免僵尸图标
     return 0
 
 

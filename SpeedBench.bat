@@ -47,10 +47,6 @@ rem speedbench_web.py opens the browser by itself once it is up; do NOT
 rem "start http://127.0.0.1:8950" here or two tabs would open at once.
 start "Clash SpeedBench" /min python "%~dp0speedbench_web.py"
 
-rem System tray icon: launched through the .vbs wrapper so no extra console
-rem window flashes. The tray polls the panel and exits automatically with it.
-start "" wscript //nologo "%~dp0SpeedBenchTray.vbs"
-
 echo Clash SpeedBench started; the browser opens http://127.0.0.1:8950 shortly.
 echo The panel runs in the minimized "Clash SpeedBench" console window on
 echo the taskbar, plus a tray icon near the clock (left-click opens the panel).

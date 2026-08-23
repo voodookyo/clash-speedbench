@@ -27,10 +27,9 @@ sys.platform="win32" 运行，不起真子进程、不碰真文件系统、不�
   posix 明确报错、_PipeSock 关闭幂等
 - 子进程文本输出钉 UTF-8（curl_speed / fetch_ip_info / doh_resolve）：
   中文 Windows 的 GBK 默认解码会炸 UnicodeDecodeError（真机实测）
-- Windows 托盘三件套：SpeedBenchTray.ps1 必须 UTF-8 带 BOM（PowerShell 5.1
-  无 BOM 按 ANSI 读，中文菜单会乱码）、SpeedBenchTray.vbs 纯 ASCII、
-  SpeedBench.bat 经 wscript 拉起托盘、speedbench.ico 结构合法、
-  release.yml 的 Windows 打包清单包含托盘文件
+- 进程内托盘（speedbench_tray.py，ctypes/Win32）：posix 纯 no-op、
+  web main() 的启动/摘除接线、speedbench.ico 结构合法、release.yml
+  Windows 打包清单收录托盘模块与图标
 """
 import contextlib
 import importlib
@@ -688,37 +687,47 @@ class SpeedBenchBatTest(unittest.TestCase):
         self.assertNotIn('pythonw "%~dp0', text)
 
 
-class TrayLauncherTest(unittest.TestCase):
-    """Windows 托盘三件套的静态约束（WinForms 行为本身靠真机验证）。
+class TrayModuleTest(unittest.TestCase):
+    """进程内托盘（speedbench_tray.py，ctypes/Win32）的跨平台静态约束。
 
-    - SpeedBenchTray.ps1：UTF-8 必须带 BOM——Windows PowerShell 5.1 对无 BOM
-      的 .ps1 按 ANSI（中文系统即 GBK）读取，中文菜单文案会乱码
-    - SpeedBenchTray.vbs：纯 ASCII（脚本宿主按 ANSI 读 .vbs，与 .bat 同理）
-    - SpeedBench.bat：必须经 wscript 无窗口拉起 .vbs（直接 start powershell
-      会闪控制台窗口）
-    - speedbench.ico：ICO 头结构合法（reserved=0 / type=1 / 条目偏移不越界）
-    - release.yml：Windows 打包清单必须包含托盘文件，否则发版 zip 里缺文件
+    Win32 窗口/消息循环本身靠真机验证；这里守：
+    - posix 上 start_tray/stop_tray 是纯 no-op（模块 import 不炸、行为不变）
+    - web main() 的接线：启动时调 start_tray、退出时 finally 调 stop_tray
+    - speedbench.ico 结构合法；release.yml 的 Windows 打包清单收录托盘模块与图标
     """
 
     ROOT = Path(__file__).resolve().parents[1]
 
-    def test_ps1_is_utf8_with_bom(self):
-        data = (self.ROOT / "SpeedBenchTray.ps1").read_bytes()
-        self.assertTrue(data.startswith(b"\xef\xbb\xbf"),
-                        "SpeedBenchTray.ps1 必须带 UTF-8 BOM，否则中文菜单乱码")
-        text = data.decode("utf-8-sig")
-        self.assertIn("NotifyIcon", text)
-        self.assertIn("/api/quit", text)      # 退出走面板 API（web-token 机制）
-        self.assertIn("web-token", text)
+    def test_start_tray_noop_on_posix(self):
+        import speedbench_tray
+        with mock.patch.object(sys, "platform", "darwin"):
+            self.assertIsNone(speedbench_tray.start_tray("x.ico", lambda: None, lambda: None))
+            speedbench_tray.stop_tray(None)  # 不应抛异常
 
-    def test_vbs_is_pure_ascii_and_targets_ps1(self):
-        data = (self.ROOT / "SpeedBenchTray.vbs").read_bytes()
-        data.decode("ascii")  # 有非 ASCII 字节会抛 UnicodeDecodeError
-        self.assertIn("SpeedBenchTray.ps1", data.decode("ascii"))
+    def test_web_main_starts_and_stops_tray(self):
+        import speedbench_tray
 
-    def test_bat_launches_tray_via_vbs(self):
-        text = (self.ROOT / "SpeedBench.bat").read_bytes().decode("ascii")
-        self.assertIn('wscript //nologo "%~dp0SpeedBenchTray.vbs"', text)
+        class FakeServer:
+            server_port = 8950
+
+            def serve_forever(self):
+                return None
+
+            def shutdown(self):
+                return None
+
+        with mock.patch.object(web, "ThreadingHTTPServer", return_value=FakeServer()), \
+                mock.patch.object(web, "sync_db", return_value=0), \
+                mock.patch.object(web, "write_token_file"), \
+                mock.patch.object(web.webbrowser, "open"), \
+                mock.patch.object(sys, "argv", ["speedbench_web.py", "--no-browser"]), \
+                mock.patch.object(speedbench_tray, "start_tray", return_value=object()) as m_start, \
+                mock.patch.object(speedbench_tray, "stop_tray") as m_stop:
+            self.assertEqual(web.main(), 0)
+        m_start.assert_called_once()          # 接线：图标路径 + on_open/on_quit 回调
+        _, kwargs = m_start.call_args
+        self.assertTrue(callable(kwargs["on_open"]) and callable(kwargs["on_quit"]))
+        m_stop.assert_called_once()           # finally 摘图标，不留僵尸图标
 
     def test_icon_is_valid_ico(self):
         import struct
@@ -732,7 +741,7 @@ class TrayLauncherTest(unittest.TestCase):
 
     def test_release_packages_tray_files(self):
         yml = (self.ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-        for fname in ("SpeedBenchTray.ps1", "SpeedBenchTray.vbs", "speedbench.ico"):
+        for fname in ("speedbench_tray.py", "speedbench.ico"):
             self.assertIn(fname, yml, f"release.yml 的 Windows 打包清单缺少 {fname}")
 
 

@@ -60,9 +60,8 @@ jobs:
           $stage = "release-stage/Clash-SpeedBench"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item clash_speedbench.py, speedbench_db.py, speedbench_switch.py, `
-            speedbench_web.py, speedbench_workers.py -Destination $stage
-          Copy-Item SpeedBench.bat, SpeedBenchTray.ps1, SpeedBenchTray.vbs, `
-            speedbench.ico, README.md, LICENSE -Destination $stage
+            speedbench_web.py, speedbench_workers.py, speedbench_tray.py -Destination $stage
+          Copy-Item SpeedBench.bat, speedbench.ico, README.md, LICENSE -Destination $stage
           Copy-Item web -Destination $stage -Recurse
           Compress-Archive -Path $stage -DestinationPath $zip -Force
           # sha256 与 macOS 的 shasum 输出格式一致：<hash>  <filename>
