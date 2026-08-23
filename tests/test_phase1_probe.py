@@ -322,6 +322,20 @@ class RunPoolMainApiTest(unittest.TestCase):
         self.assertEqual({c[1] for c in calls if c[0] == "probe"}, {"A", "B"})
         self.assertGreaterEqual(worker_cls.call_count, 2)  # Phase 1 分片 + Phase 2
 
+    def test_phase2_scope_line_no_duplicated_count(self):
+        # 回归：scope 曾含 f"Top {len}" 又拼「{len} 个节点」，打出「Top 15 15 个节点」
+        results, calls, worker_cls, out = self._run(
+            mk_args(no_ip=True), mock.Mock(name="MainAPI"),
+            {"A": (100, 2.0), "B": (200, 5.0)})
+        self.assertIn("Phase 2 精测: Top 2 个节点", out)
+        self.assertNotIn("Top 2 2", out)
+
+    def test_phase2_scope_line_all(self):
+        results, calls, worker_cls, out = self._run(
+            mk_args(no_ip=True, all=True), mock.Mock(name="MainAPI"),
+            {"A": (100, 2.0), "B": (200, 5.0)})
+        self.assertIn("Phase 2 精测: 全部 2 个节点", out)
+
 
 class Phase1InterruptCleanupTest(unittest.TestCase):
     """Phase 1 池化阶段被 KeyboardInterrupt 打断时的临时 worker 清理。

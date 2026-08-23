@@ -1266,7 +1266,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     if not chosen:
         print("Phase 2 精测: 没有连通节点，跳过带宽精测。")
     else:
-        scope = "全部" if getattr(args, "all", False) else f"Top {len(chosen)}"
+        # scope 只出「全部/Top」字样，个数由后面的 {len(chosen)} 表达，避免「Top 15 15 个节点」
+        scope = "全部" if getattr(args, "all", False) else "Top"
         print(f"Phase 2 精测: {scope} {len(chosen)} 个节点，单 worker 严格串行"
               f"（同一时刻只有一路测速下载）…")
         chosen_proxies = [by_name[r.name] for r in chosen if r.name in by_name]
