@@ -1,42 +1,52 @@
 @echo off
-rem ============================================================
-rem  Clash SpeedBench 启动器（Windows 双击运行）
-rem  零第三方依赖，只需要系统里装有 Python 3.9+
-rem ============================================================
 chcp 65001 >nul
+rem ============================================================
+rem  Clash SpeedBench launcher (double-click to run on Windows)
+rem  Zero third-party dependencies: needs only Python 3.9+
+rem ============================================================
+rem  WARNING: this file must stay 100% ASCII, no BOM. cmd.exe parses
+rem  batch files through the console codepage, and a UTF-8 .bat with
+rem  CJK text is mis-parsed on a zh-CN Windows under both CP936 and
+rem  CP65001: comment/echo fragments end up executed as commands
+rem  ("is not recognized as an internal or external command").
+rem  Reproduced on real hardware during the v0.8.0 Windows acceptance.
 setlocal EnableExtensions
 
-rem 数据目录：历史记录 / Web 令牌等放在 %APPDATA%\ClashSpeedBench，不污染源码目录
+rem Data dir: history DB / web token live in %APPDATA%\ClashSpeedBench,
+rem keeping the source directory clean.
 set "SPEEDBENCH_HOME=%APPDATA%\ClashSpeedBench"
 if not exist "%SPEEDBENCH_HOME%" mkdir "%SPEEDBENCH_HOME%"
 
-rem 切到本脚本所在目录（%~dp0 自带末尾反斜杠），保证面板能找到同目录的源码
+rem Switch to this script's directory (%~dp0 ends with a backslash) so
+rem the panel can find the source files sitting next to it.
 cd /d "%~dp0"
 
-rem 检测 Python；检测不到则引导到 Microsoft Store 安装（商店版自动配好 PATH）
+rem Detect Python; if missing, open the Microsoft Store install page
+rem (the Store build sets up PATH by itself), then exit.
 where python >nul 2>nul
 if errorlevel 1 (
     echo.
-    echo 未检测到 Python，请先从 Microsoft Store 安装 Python 3
-    echo （即将打开商店页面，安装完成后重新双击本文件即可）
+    echo Python not found. Please install Python 3 from the Microsoft Store
+    echo ^(the store page opens now; double-click this file again afterwards^).
     start ms-windows-store://pdp/?productid=9NRWMJP3717K
     pause
     exit /b 1
 )
 
-echo 已检测到 Python:
+echo Python detected:
 python --version
 echo.
 
-rem 故意用 python 而不是 pythonw：Windows 下面板的「中断测速」依赖
-rem CTRL_BREAK_EVENT，而该事件只能发送给拥有控制台窗口的进程；
-rem 用 pythonw（无控制台）会导致无法优雅中断测速、无法自动恢复 Clash 配置。
-rem 因此这里保留一个最小化的控制台窗口，属于正常设计。
+rem Deliberately "python", not "pythonw": the panel's cancel-benchmark
+rem button relies on CTRL_BREAK_EVENT, which can only be delivered to a
+rem process that owns a console window. pythonw (no console) would break
+rem graceful cancel and the automatic restore of the Clash config, so the
+rem minimized console window that stays open is by design.
 rem
-rem 注意：speedbench_web.py 启动后会自行 webbrowser.open 打开浏览器，
-rem 这里不再重复 start http://127.0.0.1:8950，否则会一次开出两个标签页。
+rem speedbench_web.py opens the browser by itself once it is up; do NOT
+rem "start http://127.0.0.1:8950" here or two tabs would open at once.
 start "Clash SpeedBench" /min python "%~dp0speedbench_web.py"
 
-echo Clash SpeedBench 已启动，浏览器稍后会自动打开 http://127.0.0.1:8950
-echo 面板运行在任务栏中最小化的 "Clash SpeedBench" 控制台窗口里：
-echo 此窗口可最小化，关闭窗口将退出 SpeedBench
+echo Clash SpeedBench started; the browser opens http://127.0.0.1:8950 shortly.
+echo The panel runs in the minimized "Clash SpeedBench" console window on
+echo the taskbar: closing that window exits SpeedBench.

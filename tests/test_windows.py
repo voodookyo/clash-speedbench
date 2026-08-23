@@ -18,6 +18,8 @@ sys.platform="win32" 运行，不起真子进程、不碰真文件系统、不�
 - run_benchmark 的 Popen：win32 带 CREATE_NEW_PROCESS_GROUP，posix 不带
 - _no_window_kwargs：win32/posix 两分支 + curl_speed 集成
 - main() 的 SIGBREAK 注册：win32 注册 KeyboardInterrupt 转换 handler；posix 不注册
+- SpeedBench.bat：纯 ASCII / 无 BOM / CRLF / 保留 python 启动行
+  （UTF-8 中文 .bat 会被 cmd.exe 错乱解析的真机回归保护）
 """
 import contextlib
 import importlib
@@ -512,6 +514,40 @@ class SigbreakRegistrationTest(unittest.TestCase):
             rc = self.run_main("darwin")
         self.assertEqual(rc, 1)
         m_signal.assert_not_called()  # posix 不注册任何自定义 handler
+
+
+class SpeedBenchBatTest(unittest.TestCase):
+    """SpeedBench.bat 启动器回归保护。
+
+    v0.8.0 Windows 真机验收实测：UTF-8 编码 + 中文注释的 .bat 在中文 Windows
+    上会被 cmd.exe 错乱解析（chcp 65001 提前到文件最前也无效），中文注释/回显
+    的碎片被当成命令执行（“不是内部或外部命令”刷屏）；改成纯 ASCII 后彻底消失。
+    因此启动器必须保持纯 ASCII、无 BOM、CRLF 行尾。
+    """
+
+    BAT = Path(__file__).resolve().parents[1] / "SpeedBench.bat"
+
+    def test_bat_is_pure_ascii_no_bom(self):
+        data = self.BAT.read_bytes()
+        self.assertFalse(data.startswith(b"\xef\xbb\xbf"),
+                         "SpeedBench.bat 不允许带 BOM")
+        try:
+            data.decode("ascii")
+        except UnicodeDecodeError as e:
+            self.fail(f"SpeedBench.bat 偏移 {e.start} 处出现非 ASCII 字节："
+                      "cmd.exe 会错乱解析含中文的 .bat（真机实测），启动器必须纯 ASCII")
+
+    def test_bat_crlf_line_endings(self):
+        data = self.BAT.read_bytes()
+        self.assertIn(b"\r\n", data)
+        self.assertNotIn(b"\n", data.replace(b"\r\n", b""), "存在孤立的 LF 行尾")
+
+    def test_bat_keeps_python_launch_line(self):
+        # 防手滑改掉真正的启动行：面板必须经 python（非 pythonw）启动，否则
+        # 子进程没有控制台、CTRL_BREAK_EVENT 无法投递，中断测速功能失效
+        text = self.BAT.read_bytes().decode("ascii")
+        self.assertIn('python "%~dp0speedbench_web.py"', text)
+        self.assertNotIn('pythonw "%~dp0', text)
 
 
 if __name__ == "__main__":
