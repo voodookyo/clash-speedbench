@@ -757,24 +757,34 @@ def with_dependencies(selected: List[dict], all_proxies: List[dict]) -> List[dic
 
 def physical_interface() -> Optional[str]:
     if sys.platform == "win32":
-        # Windows 没有 route get default；用 PowerShell 查默认路由所在接口的别名。
+        # Windows 没有 route get default；用 PowerShell 查默认流量实际走的接口别名。
         # 中文系统上网卡名可能是「以太网」，PowerShell 默认输出编码不是 UTF-8，
         # 先把 [Console]::OutputEncoding 钉成 UTF-8，再按 utf-8/replace 解码。
         ps = shutil.which("powershell") or "powershell.exe"
-        try:
-            p = subprocess.run(
-                [ps, "-NoProfile", "-Command",
-                 "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
-                 "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
-                 "Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias"],
-                capture_output=True, timeout=10,
-                encoding="utf-8", errors="replace",
-                **_no_window_kwargs())
-            name = (p.stdout or "").strip()
-            if p.returncode == 0 and name:
-                return name
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        # mihomo TUN（auto-route）会给虚拟网卡也挂一条 0.0.0.0/0 并把接口 metric
+        # 压得比物理网卡低：此时 Get-NetRoute 有多条同 RouteMetric 记录，按
+        # RouteMetric 排序取第一是乱序赌博（真机实测拿到物理网卡、漏检 TUN）。
+        # Find-NetRoute 问的是路由栈的真实选择（纯查表不发包；RemoteIPAddress
+        # 用 RFC 5737 文档段，不与任何真实主机相关），拿不到再回退旧命令。
+        cmds = [
+            "(Find-NetRoute -RemoteIPAddress '203.0.113.1' -ErrorAction "
+            "SilentlyContinue | Select-Object -First 1).InterfaceAlias",
+            "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
+            "Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias",
+        ]
+        for c in cmds:
+            try:
+                p = subprocess.run(
+                    [ps, "-NoProfile", "-Command",
+                     "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + c],
+                    capture_output=True, timeout=10,
+                    encoding="utf-8", errors="replace",
+                    **_no_window_kwargs())
+                name = (p.stdout or "").strip()
+                if p.returncode == 0 and name:
+                    return name
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         return None
     try:
         p = subprocess.run(["route", "get", "default"],

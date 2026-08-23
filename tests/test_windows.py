@@ -9,8 +9,10 @@ sys.platform="win32" 运行，不起真子进程、不碰真文件系统、不�
 - find_mihomo_bin：候选顺序、os.access 过滤、which 兜底顺序（verge-mihomo 优先）
 - MIHOMO_BIN_CANDIDATES/CONFIG_CANDIDATES 的 expandvars 展开与 % 残留过滤
   （os.path.expandvars 按 %VAR% 语法 fake，模拟环境变量缺失场景）
-- physical_interface：PowerShell Get-NetRoute 输出解析（含中文「以太网」）、
-  encoding/errors/timeout 参数、非零/超时/空输出/进程不存在 → None
+- physical_interface：首选 Find-NetRoute（路由栈真实选择；mihomo TUN 双 0/0
+  路由同 RouteMetric 时 Get-NetRoute 排序乱序会漏检，真机实测），失败回退
+  Get-NetRoute；输出解析（含中文「以太网」）、encoding/errors/timeout 参数、
+  非零/超时/空输出/进程不存在 → None
 - is_virtual_iface：win32 大小写不敏感 + WIN_VIRTUAL_IFACE_PREFIXES 并集；
   posix 分支行为不变
 - cancel_benchmark：win32 首发 CTRL_BREAK_EVENT、5s 等待、terminate→kill 兜底；
@@ -218,12 +220,23 @@ class PhysicalInterfaceWinTest(unittest.TestCase):
         self.assertEqual(got, "Ethernet")
         cmd, kwargs = m_run.call_args
         self.assertEqual(cmd[0][0], "powershell.exe")   # which 未命中时用 .exe 兜底
-        self.assertIn("Get-NetRoute", cmd[0][-1])
+        # 首选 Find-NetRoute 问路由栈的真实选择（mihomo TUN 双 0/0 路由同
+        # RouteMetric 时 Sort-Object 乱序会漏检，真机实测踩过）
+        self.assertIn("Find-NetRoute", cmd[0][-1])
         # 中文系统网卡名解码依赖这两个参数
         self.assertEqual(kwargs["encoding"], "utf-8")
         self.assertEqual(kwargs["errors"], "replace")
         self.assertEqual(kwargs["timeout"], 10)
         self.assertTrue(kwargs["capture_output"])
+
+    def test_falls_back_to_get_netroute_when_find_fails(self):
+        # Find-NetRoute 拿不到（离线/老系统）时回退旧 Get-NetRoute 命令
+        got, m_run = self.run_iface(run_side_effect=[
+            self.cp(""), self.cp("以太网\r\n")])
+        self.assertEqual(got, "以太网")
+        self.assertEqual(m_run.call_count, 2)
+        self.assertIn("Find-NetRoute", m_run.call_args_list[0][0][0][-1])
+        self.assertIn("Get-NetRoute", m_run.call_args_list[1][0][0][-1])
 
     def test_chinese_iface_name(self):
         got, _ = self.run_iface(run_return=self.cp("以太网\r\n"),
