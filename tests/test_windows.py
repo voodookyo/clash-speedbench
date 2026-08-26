@@ -743,6 +743,9 @@ class TrayModuleTest(unittest.TestCase):
         yml = (self.ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
         for fname in ("speedbench_tray.py", "speedbench.ico"):
             self.assertIn(fname, yml, f"release.yml 的 Windows 打包清单缺少 {fname}")
+        sh = (self.ROOT / "build_app.sh").read_text(encoding="utf-8")
+        self.assertIn("speedbench_tray.py", sh,
+                      "build_app.sh 的 macOS 打包清单缺少 speedbench_tray.py")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,17 @@ cp "$ROOT/clash_speedbench.py" \
    "$ROOT/speedbench_web.py" \
    "$ROOT/speedbench_switch.py" \
    "$ROOT/speedbench_workers.py" \
+   "$ROOT/speedbench_tray.py" \
    "$APP/Contents/Resources/app/"
+
+echo "→ 校验程序文件完整性（防止漏拷打出残包）"
+for f in clash_speedbench.py speedbench_db.py speedbench_web.py \
+         speedbench_switch.py speedbench_workers.py speedbench_tray.py; do
+  if [ ! -f "$APP/Contents/Resources/app/$f" ]; then
+    echo "✗ 缺少 $f：程序文件不完整，终止打包（避免打出残包）" >&2
+    exit 1
+  fi
+done
 
 echo "→ 拷贝前端静态文件"
 if [ ! -f "$ROOT/web/index.html" ]; then
