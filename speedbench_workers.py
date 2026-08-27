@@ -71,6 +71,7 @@ from clash_speedbench import (
     ip_brief,
     make_tags,
     multi_stream_speed,
+    node_key_of,
     probe_latency,
     warmup_speed,
 )
@@ -1082,13 +1083,17 @@ def relabel_unmeasured(r: Result) -> None:
 
 
 def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
-             main_api: Optional[MihomoAPI] = None) -> List[Result]:
+             main_api: Optional[MihomoAPI] = None,
+             provider_by_name: Optional[Dict[str, str]] = None) -> List[Result]:
     """两阶段测速，从不触碰用户正在运行的实例：
     Phase 1 的延迟/连通性经主实例 /delay API 并发探测（与 Clash Verge 的 ping
     同口径；main_api 缺省时退回 worker 内探测，即旧行为），worker 池只做出口
     IP 画像 + 主实例探测失败节点的延迟兜底，不跑带宽；
     Phase 2 新建单个 worker 对 Top-N 连通节点严格串行精测真实带宽，
-    保证同一时刻全网只有一路测速下载。Raises WorkerUnavailable 触发回退。"""
+    保证同一时刻全网只有一路测速下载。Raises WorkerUnavailable 触发回退。
+
+    provider_by_name：主实例 /proxies 快照的 节点名 → provider-name 映射
+    （订阅来源；节点凭据表里没有该信息），缺省时 provider 落空串。"""
     mihomo_bin = find_mihomo_bin()
     if not mihomo_bin:
         if sys.platform == "win32":
@@ -1268,6 +1273,19 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         finally:
             pool.shutdown(wait=True)
     print(f"Phase 1 粗筛完成，耗时 {time.time() - started:.1f}s（{total} 节点）")
+
+    # 订阅维度回填（集中一处，覆盖 Phase 1 各正常/异常分支产出的全部 Result）：
+    # provider 取主实例 /proxies 快照的 provider-name；node_key 用凭据表的
+    # proto|server|port 哈希，节点改名不断链；凭据缺失时退化为 proto|name。
+    provider_map = provider_by_name or {}
+    for r in results:
+        r.provider = provider_map.get(r.name, "")
+        cred = by_name.get(r.name)
+        if cred:
+            r.node_key = node_key_of(str(cred.get("type", "")),
+                                     str(cred.get("server") or ""),
+                                     str(cred.get("port") or ""),
+                                     r.name)
 
     # Phase 2 选节点：剔除不通节点后按延迟升序，取 Top N（--all 时取全部连通节点）
     chosen = select_phase2_nodes(results, getattr(args, "top_n", 15),

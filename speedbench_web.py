@@ -96,6 +96,18 @@ def write_token_file() -> None:
 _DB_SYNC_LOCK = threading.Lock()
 _DB_SYNCED = {}  # str(db_path) -> 已同步的 jsonl mtime
 
+# DB 里 provider 为空的行在 API 层展示成这个名字；/api/subscription 回传它时
+# 也按 provider='' 查询
+UNKNOWN_PROVIDER = "(未知订阅)"
+
+
+def _days_param(qs: dict, default: int = 30) -> int:
+    """days 查询参数解析：默认 30、钳到 [1, 3650]，非数字回退默认。"""
+    try:
+        return max(1, min(int(qs.get("days", [str(default)])[0]), 3650))
+    except (ValueError, TypeError):
+        return default
+
 
 def sync_db() -> int:
     """jsonl 有新增时增量导入 SQLite（幂等），返回新导入的轮次数。"""
@@ -144,6 +156,7 @@ def slim_history() -> list:
             "results": [
                 {
                     "name": r.get("name"),
+                    "provider": r.get("provider") or "",
                     "median_mbps": r.get("median_mbps"),
                     "latency_ms": r.get("latency_ms"),
                     "score": r.get("score"),
@@ -349,21 +362,41 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/history":
             self._json(slim_history())
         elif path == "/api/node":
-            # 单节点详情：近 N 天测速序列 + 出口 IP 变化时间线（SQL 参数化防注入）
+            # 单节点详情：近 N 天测速序列 + 出口 IP 变化时间线（SQL 参数化防注入）。
+            # key= 按 node_key 查（订阅改名不断链）；无 key 时按 name，兼容旧行为。
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             name = qs.get("name", [""])[0]
-            if not name:
+            key = qs.get("key", [""])[0]
+            if not name and not key:
                 self._json({"ok": False, "msg": "缺少 name 参数"}, 400)
                 return
-            try:
-                days = max(1, min(int(qs.get("days", ["30"])[0]), 3650))
-            except (ValueError, TypeError):
-                days = 30
+            days = _days_param(qs)
             sync_db()
             self._json({
-                "series": speedbench_db.node_series(db_path(), name, days=days),
-                "ip_changes": speedbench_db.ip_changes(db_path(), name),
+                "series": speedbench_db.node_series(db_path(), name, days=days,
+                                                    node_key=key),
+                "ip_changes": (speedbench_db.ip_changes(db_path(), name)
+                               if name else []),
             })
+        elif path == "/api/subscriptions":
+            # 订阅维度汇总：按 provider 聚合近 N 天的可用率/速度/评分
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            days = _days_param(qs)
+            sync_db()
+            out = speedbench_db.subscription_summary(db_path(), days=days)
+            for item in out:
+                if not item["provider"]:
+                    item["provider"] = UNKNOWN_PROVIDER
+            self._json(out)
+        elif path == "/api/subscription":
+            # 单订阅逐轮趋势：name 为 "(未知订阅)" 或空串时查 provider=''
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = qs.get("name", [""])[0]
+            provider = "" if name in ("", UNKNOWN_PROVIDER) else name
+            days = _days_param(qs)
+            sync_db()
+            self._json(speedbench_db.subscription_series(db_path(), provider,
+                                                         days=days))
         elif path == "/api/run/status":
             with STATE_LOCK:
                 self._json({

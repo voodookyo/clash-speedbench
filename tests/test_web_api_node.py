@@ -197,11 +197,14 @@ class ApiLatestHistoryTest(WebApiCase):
         self.assertEqual(slim, [
             {"ts": recs[0]["ts"],
              "results": [
-                 {"name": "节点A", "median_mbps": 11.1, "latency_ms": 90, "score": 55.5},
-                 {"name": "节点B", "median_mbps": None, "latency_ms": None, "score": 0}]},
+                 {"name": "节点A", "provider": "", "median_mbps": 11.1,
+                  "latency_ms": 90, "score": 55.5},
+                 {"name": "节点B", "provider": "", "median_mbps": None,
+                  "latency_ms": None, "score": 0}]},
             {"ts": recs[1]["ts"],
              "results": [
-                 {"name": "节点A", "median_mbps": 22.2, "latency_ms": 80, "score": 66.6}]},
+                 {"name": "节点A", "provider": "", "median_mbps": 22.2,
+                  "latency_ms": 80, "score": 66.6}]},
         ])
 
     def test_history_empty(self):

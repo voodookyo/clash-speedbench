@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import getpass
+import hashlib
 import http.client
 import io
 import json
@@ -412,6 +413,7 @@ class Result:
     connect_ms: Optional[float] = None   # TCP+TLS 建连耗时（curl time_appconnect）
     multi_mbps: Optional[float] = None   # 4 路并发流合计峰值带宽（--multi）
     sample_mb: Optional[int] = None      # 实际带宽样本大小 MB（自适应时逐节点不同）
+    node_key: str = ""                   # 节点稳定身份（proto|server|port 哈希），改名不断链
 
 
 def detect_controller(secret: str, explicit: Optional[str]) -> Tuple[str, bool]:
@@ -936,11 +938,45 @@ def write_csv(results: List[Result], path: Path) -> None:
             ])
 
 
+def node_key_of(proto: str, server: str, port, name: str) -> str:
+    """节点稳定身份：有 server/port 时取 sha1(proto|server|port) 前 12 位，
+    订阅方改名不会断链；拿不到凭据（串行模式的 /proxies 快照没有 server/port）
+    时退化为 sha1(proto|name)——退化路径下节点改名即换 key，趋势断链属已知取舍。"""
+    if server and port:
+        raw = f"{proto}|{server}|{port}"
+    else:
+        raw = f"{proto}|{name}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def classify_failure(status: str) -> str:
+    """把 Result.status 编码的失败语义归类成固定类别，供订阅维度统计。
+
+    成功（"ok"/空）归 ""；status 可能是多轮状态以 ";" 拼接的串，按整串里的
+    关键词判定。未识别的非 ok 一律 "other"。
+    """
+    s = (status or "").strip().lower()
+    if not s or s == "ok":
+        return ""
+    if "timeout" in s:
+        return "timeout"          # curl-timeout（含多轮拼接）
+    if s.startswith("no-data"):
+        return "no_data"          # 连上了但零字节
+    if s.startswith("http-"):
+        return "http_error"       # 下载端返回异常状态码（http-403 等）
+    if s.startswith("switch-failed") or s.startswith("switch_failed"):
+        return "switch_failed"    # 切换到该节点失败
+    if s.startswith("curl-") or s == "unreachable":
+        return "connect_error"    # curl 退出码非 0（curl-7 等）/ 延迟探测不通
+    return "other"                # parse-error / error: / worker-failed: 等
+
+
 def result_to_dict(r: Result) -> dict:
     ip = r.ip if r.ip and r.ip.ok else IpInfo()
     return {
         "name": r.name,
         "provider": r.provider,
+        "node_key": r.node_key,
         "proto": r.proto,
         "latency_ms": r.latency_ms,
         "jitter_ms": r.jitter_ms,
@@ -954,6 +990,7 @@ def result_to_dict(r: Result) -> dict:
         "stars": star_str(r.score),
         "tags": r.tags,
         "status": r.status,
+        "fail_reason": classify_failure(r.status),
         "ip": {
             "exit_ip": ip.exit_ip, "country": ip.country, "country_code": ip.country_code,
             "region": ip.region, "city": ip.city, "isp": ip.isp, "org": ip.org,
@@ -1163,6 +1200,9 @@ def main() -> int:
                   file=sys.stderr)
             return 1
         proto_by_name = {n: str(info.get("type", "")) for n, info in leaves.items()}
+        # 订阅来源（/proxies 快照的 provider-name）传给 workers：凭据表里没有该信息
+        provider_by_name = {n: str(info.get("provider-name", ""))
+                            for n, info in leaves.items()}
         if args.mb:
             sample_desc = f"{args.mb} MB"
             max_mb = args.mb
@@ -1185,7 +1225,8 @@ def main() -> int:
                 print("已取消。")
                 return 0
         try:
-            results = run_pool(candidates, proto_by_name, args, main_api=api)
+            results = run_pool(candidates, proto_by_name, args, main_api=api,
+                               provider_by_name=provider_by_name)
         except WorkerUnavailable as e:
             print(f"并发模式不可用：{e}\n回退到串行模式。", file=sys.stderr)
         else:
@@ -1279,6 +1320,8 @@ def main() -> int:
                     median_mbps=None,
                     best_mbps=None,
                     status="switch-failed",
+                    # /proxies 快照没有 server/port，node_key 走 proto|name 退化路径
+                    node_key=node_key_of(str(info.get("type", "")), "", "", name),
                 )
                 res.tags = make_tags(res)
                 results.append(res)
@@ -1343,6 +1386,8 @@ def main() -> int:
                 connect_ms=connect_ms,
                 multi_mbps=multi,
                 sample_mb=mb,
+                # /proxies 快照没有 server/port，node_key 走 proto|name 退化路径
+                node_key=node_key_of(str(info.get("type", "")), "", "", name),
             )
             res.score = compute_score(res)
             res.tags = make_tags(res)

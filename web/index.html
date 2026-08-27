@@ -14,6 +14,7 @@
     <nav id="nav">
       <a class="nav-item" data-view="nodes" href="#/nodes">🗂 节点</a>
       <a class="nav-item" data-view="history" href="#/history">📈 历史</a>
+      <a class="nav-item" data-view="subs" href="#/subs">🧭 订阅</a>
       <a class="nav-item" data-view="about" href="#/about">ℹ️ 关于</a>
     </nav>
     <div class="nav-foot"><button class="quit-btn" id="btn-quit">⏻ 退出 SpeedBench</button></div>
@@ -67,6 +68,7 @@
             <thead><tr>
               <th>#</th>
               <th class="sort" data-k="name">节点 <span class="arr"></span></th>
+              <th class="sort" data-k="provider" id="th-provider" style="display:none">订阅 <span class="arr"></span></th>
               <th class="sort" data-k="latency_ms">延迟 <span class="arr"></span></th>
               <th class="sort" data-k="median_mbps">带宽 <span class="arr"></span></th>
               <th class="sort" data-k="score">评分 <span class="arr">▼</span></th>
@@ -110,6 +112,45 @@
             <canvas id="chart"></canvas>
             <div id="ip-timeline"></div>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 订阅视图 ============ -->
+    <section id="view-subs" style="display:none">
+      <div class="card">
+        <div class="toolbar">
+          <div class="card-title" style="margin:0;flex:1">订阅汇总（点行看趋势）</div>
+          <select id="subs-days">
+            <option value="7">近 7 天</option>
+            <option value="30" selected>近 30 天</option>
+            <option value="90">近 90 天</option>
+            <option value="365">近 365 天</option>
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>订阅</th><th>测速轮次</th><th>节点数</th><th>可用率</th>
+              <th>中位速度</th><th>中位延迟</th><th>平均分</th><th>最近测速</th>
+            </tr></thead>
+            <tbody id="subs-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card" id="subs-detail-card" style="display:none">
+        <div class="card-title" id="subs-detail-title"></div>
+        <div id="subs-chart-sub"></div>
+        <canvas id="subs-chart"></canvas>
+        <div class="card-sub">最近一轮该订阅各节点表现</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>#</th><th>节点</th><th>延迟</th><th>带宽</th><th>评分</th>
+              <th>IP画像</th><th>标签</th><th></th>
+            </tr></thead>
+            <tbody id="subs-nodes-tbody"></tbody>
+          </table>
         </div>
       </div>
     </section>

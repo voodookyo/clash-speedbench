@@ -62,10 +62,10 @@ def full_result():
 class ResultToDictTest(unittest.TestCase):
     def test_new_fields_all_present(self):
         d = csb.result_to_dict(full_result())
-        expected_top = {"name", "provider", "proto", "latency_ms", "jitter_ms",
-                        "connect_ms", "median_mbps", "multi_mbps", "best_mbps",
-                        "sample_mb", "samples_mbps", "score", "stars", "tags",
-                        "status", "ip"}
+        expected_top = {"name", "provider", "node_key", "proto", "latency_ms",
+                        "jitter_ms", "connect_ms", "median_mbps", "multi_mbps",
+                        "best_mbps", "sample_mb", "samples_mbps", "score",
+                        "stars", "tags", "status", "fail_reason", "ip"}
         self.assertEqual(set(d), expected_top)
         expected_ip = {"exit_ip", "country", "country_code", "region", "city",
                        "isp", "org", "asn", "asname", "kind",
@@ -122,8 +122,10 @@ class HistoryCompatTest(unittest.TestCase):
         self.assertEqual(
             slim[0]["results"],
             [
-                {"name": "旧节点A", "median_mbps": 45.5, "latency_ms": 120, "score": 66.6},
-                {"name": "旧节点B", "median_mbps": None, "latency_ms": None, "score": 0},
+                {"name": "旧节点A", "provider": "机场甲", "median_mbps": 45.5,
+                 "latency_ms": 120, "score": 66.6},
+                {"name": "旧节点B", "provider": "机场甲", "median_mbps": None,
+                 "latency_ms": None, "score": 0},
             ])
 
     def test_slim_history_tolerates_record_without_results(self):

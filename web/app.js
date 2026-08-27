@@ -217,8 +217,8 @@ let searchText = '';
 let expandedNode = null;      // 节点视图中展开详情面板的节点（一次只展开一个）
 let pollTimer = null;         // 测速状态轮询：全局单例，切视图不清除
 
-/* ==================== 表格行渲染（节点/历史两视图复用） ==================== */
-// opts: {readonly, currentNode, favs, expanded, selected}
+/* ==================== 表格行渲染（节点/历史/订阅三视图复用） ==================== */
+// opts: {readonly, currentNode, favs, expanded, selected, provider, cols}
 function rowHtml(r, i, opts){
   const ro = opts.readonly;
   const isCur = !ro && r.name===opts.currentNode;
@@ -232,7 +232,9 @@ function rowHtml(r, i, opts){
     h += `<span class="fav${isFav?' on':''}" data-name="${esc(r.name)}" title="收藏/取消收藏">${isFav?'★':'☆'}</span>`;
   h += esc(r.name);
   if(isCur) h += '<span class="cur-mark">✅ 使用中</span>';
-  h += `</td><td class="mono">${r.latency_ms??'-'}</td>`;
+  h += '</td>';
+  if(opts.provider) h += `<td class="mono">${esc(r.provider||'(未知订阅)')}</td>`;
+  h += `<td class="mono">${r.latency_ms??'-'}</td>`;
   h += `<td class="mono">${r.median_mbps?r.median_mbps.toFixed(1):'-'}</td>`;
   h += `<td class="stars" data-name="${esc(r.name)}" title="查看 30 天趋势"><span class="sc-num">${sc==null?'-':sc.toFixed(1)}</span> ${esc(r.stars||'')}</td>`;
   h += `<td>${ipHtml(r.ip)}</td><td>${tagHtml(r.tags)}</td><td>`;
@@ -240,12 +242,12 @@ function rowHtml(r, i, opts){
     h += isCur ? '<button class="mini" disabled>使用中</button>'
                : `<button class="mini sw" data-name="${esc(r.name)}">切换</button>`;
   h += '</td></tr>';
-  if(opts.expanded) h += detailHtml(r);
+  if(opts.expanded) h += detailHtml(r, opts.cols||8);
   return h;
 }
 
 // 行展开详情：延迟/抖动/建连/样本/单流/多流 + 出口 IP/ASN/ISP + 趋势入口
-function detailHtml(r){
+function detailHtml(r, colspan){
   const ip = r.ip || {};
   const asn = ip.asn ? ('AS'+String(ip.asn).replace(/^AS/i,'')) : '';
   const asnTxt = asn ? esc(asn + (ip.asname?' '+ip.asname:'')) : '-';
@@ -262,18 +264,18 @@ function detailHtml(r){
     cell('ISP', ip.ok ? esc(ip.isp||'-') : '-'),
     cell('组织', ip.ok ? esc(ip.org||'-') : '-'),
   ].join('');
-  return `<tr class="detail-row"><td colspan="8"><div class="detail-grid">${cells}</div>` +
+  return `<tr class="detail-row"><td colspan="${colspan||8}"><div class="detail-grid">${cells}</div>` +
          `<div class="detail-actions"><button class="mini trend" data-name="${esc(r.name)}">📈 查看 30 天趋势</button></div></td></tr>`;
 }
 
-function skeletonRows(n){
+function skeletonRows(n, colspan){
   let h = '';
-  for(let i=0;i<n;i++) h += '<tr class="skel-row"><td colspan="8"><div class="skel"></div></td></tr>';
+  for(let i=0;i<n;i++) h += `<tr class="skel-row"><td colspan="${colspan||8}"><div class="skel"></div></td></tr>`;
   return h;
 }
 
-function emptyRow(text){
-  return `<tr class="empty-row"><td colspan="8">${esc(text)}</td></tr>`;
+function emptyRow(text, colspan){
+  return `<tr class="empty-row"><td colspan="${colspan||8}">${esc(text)}</td></tr>`;
 }
 
 /* ==================== 节点视图 ==================== */
@@ -285,16 +287,23 @@ function renderTable(){
     tbody.innerHTML = emptyRow('暂无测速记录 · 在上方设置参数后点击「开始测速」');
     return;
   }
+  // 有任一节点带订阅来源时才显示「订阅」列（旧历史没有 provider 字段）
+  const showProv = all.some(r=>r.provider);
+  const pth = document.getElementById('th-provider');
+  if(pth && pth.style) pth.style.display = showProv ? '' : 'none';
+  const cols = showProv ? 9 : 8;
   const q = searchText.trim().toLowerCase();
-  const rows = all.filter(r=>!q || (r.name||'').toLowerCase().includes(q));
+  const rows = all.filter(r=>!q || (r.name||'').toLowerCase().includes(q)
+                        || (r.provider||'').toLowerCase().includes(q));
   if(!rows.length){
-    tbody.innerHTML = emptyRow(`没有匹配「${searchText.trim()}」的节点`);
+    tbody.innerHTML = emptyRow(`没有匹配「${searchText.trim()}」的节点`, cols);
     return;
   }
   sortRows(rows, sortKey, sortAsc);
   tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
     readonly:false, currentNode, favs,
     expanded: expandedNode===r.name, selected:false,
+    provider: showProv, cols,
   })).join('');
 }
 
@@ -506,6 +515,147 @@ function renderIpTimeline(){
   box.innerHTML = '<div class="card-sub">出口 IP 时间线（相邻不变已合并）</div>' + items;
 }
 
+/* ==================== 订阅视图 ==================== */
+// 按订阅（provider）聚合的历史回顾：汇总表 + 单订阅三线趋势图 + 最近一轮节点表
+let subsData = [];          // /api/subscriptions 汇总列表
+let subsLoaded = false;
+let subsDays = +(lsGet('sb_subs_days')||30) || 30;
+let subsSel = null;         // 当前选中的订阅（API 展示名，未知来源为 "(未知订阅)"）
+let subsSeries = null;      // {name, pts:[{ts,online_ratio,median_mbps,latency_ms,avg_score}]}
+
+const UNKNOWN_PROVIDER = '(未知订阅)';
+// 汇总/API 用展示名，匹配 slim 历史行里的原始 provider 时用原始值
+function subsRawProvider(){ return subsSel===UNKNOWN_PROVIDER ? '' : subsSel; }
+
+async function loadSubs(){
+  let d;
+  try{ d = await getJSON('/api/subscriptions?days='+subsDays); }
+  catch(e){ d = []; toast('读取订阅汇总失败', false); }
+  subsData = Array.isArray(d) ? d : [];
+  subsLoaded = true;
+  renderSubsTable();
+  if(subsSel) selectSub(subsSel);   // 天数变化后已选中的订阅也要重拉趋势
+}
+
+function renderSubsTable(){
+  const tbody = document.getElementById('subs-tbody');
+  if(!subsLoaded){ tbody.innerHTML = skeletonRows(3); return; }
+  if(!subsData.length){
+    tbody.innerHTML = emptyRow('暂无订阅数据 · 先在「节点」页跑一轮测速');
+    return;
+  }
+  tbody.innerHTML = subsData.map(s=>
+    `<tr data-provider="${esc(s.provider)}"${s.provider===subsSel?' class="sel"':''}>` +
+    `<td>${esc(s.provider)}</td>` +
+    `<td class="mono">${s.run_count}</td>` +
+    `<td class="mono">${s.node_count}</td>` +
+    `<td class="mono">${s.online_ratio==null?'-':(s.online_ratio*100).toFixed(0)+'%'}</td>` +
+    `<td class="mono">${s.median_mbps!=null?s.median_mbps.toFixed(1):'-'}</td>` +
+    `<td class="mono">${s.latency_ms!=null?s.latency_ms.toFixed(0):'-'}</td>` +
+    `<td class="mono">${s.avg_score!=null?s.avg_score.toFixed(1):'-'}</td>` +
+    `<td class="mono">${esc((s.last_ts||'').slice(0,16))}</td></tr>`
+  ).join('');
+}
+
+async function selectSub(name){
+  subsSel = name;
+  document.getElementById('subs-detail-card').style.display = '';
+  document.getElementById('subs-detail-title').textContent =
+    `订阅趋势：${name}（近 ${subsDays} 天，三条线各自归一）`;
+  renderSubsTable();
+  subsSeries = null;
+  drawSubsChart();
+  try{
+    const d = await getJSON('/api/subscription?name='+encodeURIComponent(name)+'&days='+subsDays);
+    if(subsSel!==name) return;   // 等待期间用户已改选别的订阅，丢弃过期响应
+    subsSeries = {name, pts: Array.isArray(d) ? d : []};
+  }catch(e){
+    subsSeries = {name, pts: []};
+  }
+  drawSubsChart();
+  renderSubsNodes(name);
+}
+
+// 最近一轮该订阅各节点表现：复用 slim 历史（含 provider）+ rowHtml 只读行
+async function renderSubsNodes(forName){
+  const tbody = document.getElementById('subs-nodes-tbody');
+  let hist = histData;
+  if(!histLoaded){
+    try{ hist = await getJSON('/api/history'); }
+    catch(e){ hist = []; }
+  }
+  if(subsSel!==forName) return;   // 过期响应
+  const want = subsRawProvider();
+  let rec = null;
+  for(let i=hist.length-1;i>=0;i--){
+    if((hist[i].results||[]).some(r=>(r.provider||'')===want)){ rec = hist[i]; break; }
+  }
+  document.getElementById('subs-chart-sub').textContent =
+    rec ? `最近一轮：${rec.ts}` : '';
+  const rows = rec ? (rec.results||[]).filter(r=>(r.provider||'')===want) : [];
+  if(!rows.length){ tbody.innerHTML = emptyRow('该订阅暂无节点数据'); return; }
+  sortRows(rows, 'score', false);
+  tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
+    readonly:true, currentNode:'', favs:{has(){return false}},
+    expanded:false, selected:false,
+  })).join('');
+}
+
+// 三线趋势：可用率% / 中位速度 Mbps / 平均分。量纲不同，各自按自身最大值归一，
+// 图例标注满刻度值（画法与历史视图单节点趋势图同风格）
+function drawSubsChart(){
+  const cv = document.getElementById('subs-chart');
+  if(!cv) return;
+  const dpr = window.devicePixelRatio||1;
+  const W = cv.clientWidth*dpr, H = cv.clientHeight*dpr;
+  if(!W || !H) return;   // 视图隐藏时 clientWidth=0，跳过；切回时 route() 会重画
+  cv.width=W; cv.height=H;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+  if(!subsSel) return;
+  const pts = (subsSeries && subsSeries.name===subsSel) ? subsSeries.pts : [];
+  if(!pts.length){
+    ctx.fillStyle='#8b949e'; ctx.font=`${12*dpr}px sans-serif`;
+    ctx.fillText('该订阅在所选天数内暂无数据', 20*dpr, 30*dpr);
+    return;
+  }
+  const pad=36*dpr, padTop=24*dpr;
+  const x=i=> pad + (pts.length===1?(W-2*pad)/2:(W-2*pad)*i/(pts.length-1));
+  const yRange=H-pad-padTop;
+  ctx.strokeStyle='#30363d'; ctx.font=`${10*dpr}px sans-serif`;
+  for(let g=0; g<=4; g++){ const yy=padTop+yRange*g/4;
+    ctx.beginPath(); ctx.moveTo(pad,yy); ctx.lineTo(W-pad,yy); ctx.stroke(); }
+  const lines = [
+    {label:'可用率',   color:'#3fb950', val:p=>p.online_ratio==null?null:p.online_ratio*100, fmt:v=>v.toFixed(0)+'%'},
+    {label:'中位速度', color:'#58a6ff', val:p=>p.median_mbps,                              fmt:v=>v.toFixed(1)+'M'},
+    {label:'平均分',   color:'#d29922', val:p=>p.avg_score,                                fmt:v=>v.toFixed(1)},
+  ];
+  let lx = pad;
+  for(const ln of lines){
+    const vals = pts.map(p=>ln.val(p));
+    const present = vals.filter(v=>v!=null);
+    if(!present.length) continue;
+    const maxV = Math.max(...present)*1.15 || 1;
+    const y=v=> padTop + yRange*(1-v/maxV);
+    ctx.strokeStyle=ln.color; ctx.lineWidth=2*dpr; ctx.beginPath();
+    let started=false;
+    vals.forEach((v,i)=>{
+      if(v==null) return;   // 缺失点跳过（折线跨过），不产生假零值
+      if(started) ctx.lineTo(x(i),y(v)); else { ctx.moveTo(x(i),y(v)); started=true; }
+    });
+    ctx.stroke();
+    ctx.fillStyle=ln.color;
+    vals.forEach((v,i)=>{ if(v==null) return;
+      ctx.beginPath(); ctx.arc(x(i),y(v),2.5*dpr,0,7); ctx.fill(); });
+    const legend = `${ln.label}·满格${ln.fmt(Math.max(...present))}`;
+    ctx.fillText(legend, lx, 12*dpr);
+    lx += (ctx.measureText ? ctx.measureText(legend).width : legend.length*10*dpr) + 18*dpr;
+  }
+  ctx.fillStyle='#8b949e';
+  pts.forEach((p,i)=>{ if(pts.length<=12||i%2===0)
+    ctx.fillText((p.ts||'').slice(5,16), x(i)-20*dpr, H-10*dpr); });
+}
+
 /* ==================== 数据加载 ==================== */
 async function loadLatest(){
   let rec = null;
@@ -607,6 +757,8 @@ async function pollStatus(){
     loadLatest(); loadCurrent();
     histLoaded = false;   // 历史缓存失效，下次进历史视图重拉
     if(currentView()==='history') loadHistory();
+    subsLoaded = false;   // 订阅汇总同样失效
+    if(currentView()==='subs') loadSubs();
   }
 }
 
@@ -662,7 +814,7 @@ function quitPanel(){
 }
 
 /* ==================== hash 路由 ==================== */
-const VIEWS = ['nodes','history','about'];
+const VIEWS = ['nodes','history','subs','about'];
 function currentView(){
   let h = '';
   try{ h = (window.location && window.location.hash) || ''; }catch(e){ h=''; }
@@ -681,6 +833,9 @@ function route(){
   for(const a of navs){ if(a.classList) a.classList.toggle('on', a.dataset && a.dataset.view===v); }
   if(v==='history'){
     if(!histLoaded) loadHistory(); else drawChart();   // 切回时 canvas 已有宽度，重画
+  }
+  if(v==='subs'){
+    if(!subsLoaded) loadSubs(); else if(subsSel) drawSubsChart();
   }
 }
 
@@ -752,10 +907,26 @@ function init(){
     log.style.display = open?'block':'none';
     document.getElementById('log-arrow').textContent = open?'▾':'▸';
   });
-  // 搜索框：按节点名实时过滤
+  // 搜索框：按节点名/订阅名实时过滤
   document.getElementById('f-search').addEventListener('input', e=>{
     searchText = (e.target && e.target.value) || '';
     renderTable();
+  });
+  // 订阅视图：天数切换重拉汇总；点汇总行进单订阅详情；节点行点评分看单节点趋势
+  const subsDaysSel = document.getElementById('subs-days');
+  if(subsDaysSel) subsDaysSel.value = String(subsDays);
+  subsDaysSel.addEventListener('change', e=>{
+    subsDays = +((e.target && e.target.value) || 30) || 30;
+    lsSet('sb_subs_days', String(subsDays));
+    loadSubs();
+  });
+  document.getElementById('subs-tbody').addEventListener('click', e=>{
+    const tr = e.target.closest('tr[data-provider]');
+    if(tr && tr.dataset.provider!=null) selectSub(tr.dataset.provider);
+  });
+  document.getElementById('subs-nodes-tbody').addEventListener('click', e=>{
+    const cell = e.target.closest('td.stars');
+    if(cell && cell.dataset.name!=null) gotoTrend(cell.dataset.name);
   });
   document.getElementById('btn-run').addEventListener('click', startRun);
   document.getElementById('btn-cancel').addEventListener('click', cancelRun);
@@ -771,7 +942,10 @@ function init(){
     if(e.target===e.currentTarget) closeModal();
   });
   window.addEventListener('hashchange', route);
-  window.addEventListener('resize', ()=>{ if(currentView()==='history') drawChart(); });
+  window.addEventListener('resize', ()=>{
+    if(currentView()==='history') drawChart();
+    if(currentView()==='subs') drawSubsChart();
+  });
 }
 
 /* ==================== 启动 ==================== */
