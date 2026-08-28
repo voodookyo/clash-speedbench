@@ -111,7 +111,9 @@ class CancelStateMachineTest(unittest.TestCase):
         proc = make_proc()
         proc.send_signal.side_effect = OSError("No such process")
         self.arm(proc)
-        r = web.cancel_benchmark()
+        # 钉住 posix 分支：真 Windows 上 win32 分支改写哨兵文件、不发信号
+        with mock.patch.object(sys, "platform", "darwin"):
+            r = web.cancel_benchmark()
         self.assertFalse(r["ok"])
         self.assertIn("中断失败", r["msg"])
         proc.terminate.assert_not_called()
