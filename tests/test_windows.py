@@ -15,12 +15,14 @@ sys.platform="win32" 运行，不起真子进程、不碰真文件系统、不�
   非零/超时/空输出/进程不存在 → None
 - is_virtual_iface：win32 大小写不敏感 + WIN_VIRTUAL_IFACE_PREFIXES 并集；
   posix 分支行为不变
-- cancel_benchmark：win32 首发 CTRL_BREAK_EVENT、5s 等待、terminate→kill 兜底；
-  posix 首发 SIGINT 不变
-- run_benchmark 的 Popen：win32 带 CREATE_NEW_PROCESS_GROUP，posix 不带
+- cancel_benchmark：win32 写哨兵文件（子进程 cancel_requested 轮询）、
+  5s 等待、terminate→kill 兜底；posix 首发 SIGINT 不变
+- run_benchmark 的 Popen：win32 带 CREATE_NO_WINDOW，posix 不带；
+  两平台 stdin=DEVNULL、env 带 SPEEDBENCH_CANCEL_FILE
 - _no_window_kwargs：win32/posix 两分支 + curl_speed 集成
 - main() 的 SIGBREAK 注册：win32 注册 KeyboardInterrupt 转换 handler；posix 不注册
-- SpeedBench.bat：纯 ASCII / 无 BOM / CRLF / 保留 python 启动行
+- SpeedBench.bat：纯 ASCII / 无 BOM / CRLF / 优先 pythonw 无窗口启动且
+  保留 python 最小化控制台兜底
   （UTF-8 中文 .bat 会被 cmd.exe 错乱解析的真机回归保护）
 - pipe:// 命名管道 controller：候选按平台过滤（win32 含 pipe、posix 剔除），
   scheme 解析、假 plumbing 上的 HTTP 往返（Content-Length + chunked）、
@@ -39,6 +41,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -348,60 +351,49 @@ class WebStateCase(unittest.TestCase):
 
 
 class CancelBenchmarkWinTest(WebStateCase):
-    """win32：首发 CTRL_BREAK_EVENT（macOS 上 signal 没有该常量，patch 假值进去）。"""
-
-    FAKE_CTRL_BREAK = 9876  # 真实值是 1；mock 子进程下任意哨兵值即可
+    """win32：面板无控制台（pythonw），取消改写哨兵文件——测速子进程在
+    节点/轮次间隙经 cancel_requested 发现后转 KeyboardInterrupt 优雅退出；
+    5s 等待、terminate→kill 兜底不变，不再发 CTRL_BREAK_EVENT。"""
 
     @contextlib.contextmanager
-    def win32_signal(self):
-        with mock.patch.object(sys, "platform", "win32"):
-            if hasattr(signal, "CTRL_BREAK_EVENT"):
-                yield signal.CTRL_BREAK_EVENT     # 真 Windows：用真常量
-            else:
-                with mock.patch.object(signal, "CTRL_BREAK_EVENT",
-                                       self.FAKE_CTRL_BREAK, create=True):
-                    yield self.FAKE_CTRL_BREAK
+    def win32_cancel(self, proc):
+        with tempfile.TemporaryDirectory() as td:
+            sentinel = Path(td) / "cancel-request"
+            with mock.patch.object(sys, "platform", "win32"), \
+                    mock.patch.object(web, "CANCEL_FILE", sentinel):
+                self.arm(proc)
+                yield sentinel
 
-    def test_win32_first_signal_is_ctrl_break(self):
-        with self.win32_signal() as expected:
-            proc = make_proc()
-            self.arm(proc)
+    def test_win32_writes_sentinel_no_signal(self):
+        proc = make_proc()
+        with self.win32_cancel(proc) as sentinel:
             r = web.cancel_benchmark()
-        self.assertTrue(r["ok"])
-        proc.send_signal.assert_called_once_with(expected)
-        proc.wait.assert_called_once_with(timeout=5)   # 先发信号再等 5s
-        proc.terminate.assert_not_called()             # 优雅退出后不强杀
-        proc.kill.assert_not_called()
+            self.assertTrue(r["ok"])
+            self.assertTrue(sentinel.exists())
+            proc.send_signal.assert_not_called()
+            proc.wait.assert_called_once_with(timeout=5)   # 写文件后等 5s
+            proc.terminate.assert_not_called()             # 优雅退出后不强杀
+            proc.kill.assert_not_called()
 
     def test_win32_escalates_to_terminate(self):
-        with self.win32_signal() as expected:
-            proc = make_proc(wait_side_effect=[TIMEOUT, 0])
-            self.arm(proc)
+        proc = make_proc(wait_side_effect=[TIMEOUT, 0])
+        with self.win32_cancel(proc) as sentinel:
             r = web.cancel_benchmark()
-        self.assertTrue(r["ok"])
-        proc.send_signal.assert_called_once_with(expected)
-        proc.terminate.assert_called_once_with()
-        proc.kill.assert_not_called()
-        self.assertEqual(proc.wait.call_count, 2)
+            self.assertTrue(r["ok"])
+            self.assertTrue(sentinel.exists())
+            proc.send_signal.assert_not_called()
+            proc.terminate.assert_called_once_with()
+            proc.kill.assert_not_called()
+            self.assertEqual(proc.wait.call_count, 2)
 
     def test_win32_escalates_to_kill(self):
-        with self.win32_signal():
-            proc = make_proc(wait_side_effect=[TIMEOUT, TIMEOUT])
-            self.arm(proc)
+        proc = make_proc(wait_side_effect=[TIMEOUT, TIMEOUT])
+        with self.win32_cancel(proc):
             r = web.cancel_benchmark()
-        self.assertTrue(r["ok"])
-        proc.terminate.assert_called_once_with()
-        proc.kill.assert_called_once_with()
-
-    @unittest.skipIf(hasattr(signal, "CTRL_BREAK_EVENT"),
-                     "本平台 signal 自带 CTRL_BREAK_EVENT，无法模拟常量缺失")
-    def test_win32_missing_constant_falls_back_to_sigint(self):
-        proc = make_proc()
-        self.arm(proc)
-        with mock.patch.object(sys, "platform", "win32"):
-            r = web.cancel_benchmark()
-        self.assertTrue(r["ok"])
-        proc.send_signal.assert_called_once_with(signal.SIGINT)
+            self.assertTrue(r["ok"])
+            proc.send_signal.assert_not_called()
+            proc.terminate.assert_called_once_with()
+            proc.kill.assert_called_once_with()
 
     def test_posix_first_signal_is_sigint(self):
         proc = make_proc()
@@ -413,9 +405,10 @@ class CancelBenchmarkWinTest(WebStateCase):
 
 
 class BenchmarkPopenFlagsTest(WebStateCase):
-    """run_benchmark 的 Popen：win32 加 CREATE_NEW_PROCESS_GROUP，posix 不加。"""
+    """run_benchmark 的 Popen：win32 加 CREATE_NO_WINDOW，posix 不加；
+    两平台 stdin=DEVNULL、env 带 SPEEDBENCH_CANCEL_FILE 哨兵路径。"""
 
-    FAKE_NEW_GROUP = 0x00000200
+    FAKE_NO_WINDOW = 0x08000000
 
     def run_web(self, platform):
         proc = make_proc()
@@ -425,20 +418,30 @@ class BenchmarkPopenFlagsTest(WebStateCase):
                 mock.patch.object(web.subprocess, "Popen",
                                   return_value=proc) as m_popen, \
                 mock.patch.object(web, "sync_db"), \
-                mock.patch.object(subprocess, "CREATE_NEW_PROCESS_GROUP",
-                                  self.FAKE_NEW_GROUP, create=True), \
+                mock.patch.object(subprocess, "CREATE_NO_WINDOW",
+                                  self.FAKE_NO_WINDOW, create=True), \
                 contextlib.redirect_stdout(io.StringIO()):
             web.run_benchmark({})
         return m_popen
 
-    def test_win32_sets_create_new_process_group(self):
+    def test_win32_sets_create_no_window(self):
         m_popen = self.run_web("win32")
         kwargs = m_popen.call_args.kwargs
-        self.assertEqual(kwargs.get("creationflags"), self.FAKE_NEW_GROUP)
+        self.assertEqual(kwargs.get("creationflags"), self.FAKE_NO_WINDOW)
 
     def test_posix_no_creationflags(self):
         m_popen = self.run_web("darwin")
         self.assertNotIn("creationflags", m_popen.call_args.kwargs)
+
+    def test_stdin_devnull_and_cancel_env_both_platforms(self):
+        # stdin=DEVNULL：pythonw 的 stdin 句柄无效，子进程不能继承；
+        # env 带哨兵文件路径：子进程 cancel_requested 靠它定位哨兵
+        for platform in ("win32", "darwin"):
+            with self.subTest(platform=platform):
+                kwargs = self.run_web(platform).call_args.kwargs
+                self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+                self.assertEqual(kwargs["env"].get("SPEEDBENCH_CANCEL_FILE"),
+                                 str(web.CANCEL_FILE))
 
     def test_baseline_popen_kwargs_both_platforms(self):
         # 既有参数两平台都不变：-u 无缓冲、输出走管道、面板数据目录作 cwd
@@ -679,12 +682,12 @@ class SpeedBenchBatTest(unittest.TestCase):
         self.assertIn(b"\r\n", data)
         self.assertNotIn(b"\n", data.replace(b"\r\n", b""), "存在孤立的 LF 行尾")
 
-    def test_bat_keeps_python_launch_line(self):
-        # 防手滑改掉真正的启动行：面板必须经 python（非 pythonw）启动，否则
-        # 子进程没有控制台、CTRL_BREAK_EVENT 无法投递，中断测速功能失效
+    def test_bat_prefers_pythonw_keeps_python_fallback(self):
+        # 防手滑改掉启动方式：面板优先 pythonw 无窗口启动（取消走哨兵文件，
+        # 不再依赖控制台），pythonw 缺失时保留 python 最小化控制台兜底
         text = self.BAT.read_bytes().decode("ascii")
+        self.assertIn('pythonw "%~dp0speedbench_web.py"', text)
         self.assertIn('python "%~dp0speedbench_web.py"', text)
-        self.assertNotIn('pythonw "%~dp0', text)
 
 
 class TrayModuleTest(unittest.TestCase):

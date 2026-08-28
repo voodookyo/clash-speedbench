@@ -94,10 +94,10 @@ macOS 用户也可以直接**双击 `speedbench.command`**（可拖到桌面或 
 数据（历史记录 / Web 令牌）存放在 `%APPDATA%\ClashSpeedBench\`，不污染源码目录。
 
 **使用**：与 macOS 一致——浏览器自动打开 `http://127.0.0.1:8950`，在面板里一键测速、
-排序、切换节点；「中断测速」在 Windows 下通过 CTRL_BREAK_EVENT 优雅中断，
-同样自动恢复 Clash 的运行模式与节点选择。为此面板会保留一个最小化的
-"Clash SpeedBench" 控制台窗口（中断信号需要控制台存在，属正常设计）——
-最小化放着即可，关闭该窗口即退出 SpeedBench（面板里的「退出 SpeedBench」按钮同样可用）。
+排序、切换节点；「中断测速」在 Windows 下通过哨兵文件（`SPEEDBENCH_CANCEL_FILE`）
+优雅中断，同样自动恢复 Clash 的运行模式与节点选择。面板经 `pythonw` 启动，
+**不再有常驻控制台窗口**；托盘图标在右下角（左键开面板、右键退出），
+面板里的「退出 SpeedBench」按钮同样可用。
 同时右下角托盘会出现 SpeedBench 图标：**左键点一下打开面板**，右键菜单可「打开面板 /
 退出 SpeedBench」；托盘随面板自动出现、自动消失，无需手动管理。
 

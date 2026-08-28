@@ -10,12 +10,14 @@ import json
 import signal
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import clash_speedbench as csb
 import speedbench_web as web
 from tests.web_server_case import WebServerCase
 
@@ -75,7 +77,7 @@ class CancelStateMachineTest(unittest.TestCase):
     def test_sigint_preferred_no_force_when_process_exits(self):
         proc = make_proc()
         self.arm(proc)
-        # 钉住 posix 平台：win32 分支首发 CTRL_BREAK_EVENT（见 tests/test_windows.py），
+        # 钉住 posix 平台：win32 分支改写哨兵文件（见 tests/test_windows.py），
         # 本用例只验证 posix 的 SIGINT 优先语义
         with mock.patch.object(sys, "platform", "darwin"):
             r = web.cancel_benchmark()
@@ -114,6 +116,40 @@ class CancelStateMachineTest(unittest.TestCase):
         self.assertIn("中断失败", r["msg"])
         proc.terminate.assert_not_called()
         self.assertNotIn("!! 测速已被手动中断", web.STATE["lines"])
+
+
+class CancelSentinelFileTest(unittest.TestCase):
+    """测速子进程侧的哨兵文件检测（clash_speedbench.cancel_requested）。
+
+    面板无控制台（pythonw）后 CTRL_BREAK_EVENT 无处可投，Windows 取消改走
+    SPEEDBENCH_CANCEL_FILE 环境变量指向的哨兵文件；这里守住检测与
+    启动时清理残留哨兵的行为。
+    """
+
+    def test_no_env_never_cancelled(self):
+        with mock.patch.object(csb, "_CANCEL_FILE", ""):
+            self.assertFalse(csb.cancel_requested())
+            csb.clear_cancel_request()  # 无环境变量时是纯 no-op，不报错
+
+    def test_file_presence_toggles(self):
+        with tempfile.TemporaryDirectory() as td:
+            sentinel = Path(td) / "cancel-request"
+            with mock.patch.object(csb, "_CANCEL_FILE", str(sentinel)):
+                self.assertFalse(csb.cancel_requested())
+                sentinel.write_text("1", encoding="utf-8")
+                self.assertTrue(csb.cancel_requested())
+
+    def test_clear_removes_stale_sentinel(self):
+        with tempfile.TemporaryDirectory() as td:
+            sentinel = Path(td) / "cancel-request"
+            sentinel.write_text("stale", encoding="utf-8")
+            with mock.patch.object(csb, "_CANCEL_FILE", str(sentinel)):
+                csb.clear_cancel_request()
+                self.assertFalse(csb.cancel_requested())
+            self.assertFalse(sentinel.exists())
+            # 文件本就不存在时清理不报错（幂等）
+            with mock.patch.object(csb, "_CANCEL_FILE", str(sentinel)):
+                csb.clear_cancel_request()
 
 
 class CancelEndpointTest(WebServerCase):

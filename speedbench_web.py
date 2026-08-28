@@ -43,6 +43,9 @@ SCRIPT = HERE / "clash_speedbench.py"
 # ~/Library/Application Support/ClashSpeedBench，避免污染应用包。
 DATA_HOME = Path(os.environ.get("SPEEDBENCH_HOME", str(HERE)))
 HISTORY = DATA_HOME / "speedbench-history.jsonl"
+# 「停止测速」哨兵文件：面板无控制台（pythonw），CTRL_BREAK_EVENT 无处可投，
+# 改写哨兵文件，测速子进程在节点/轮次间隙发现后走 KeyboardInterrupt 优雅中断。
+CANCEL_FILE = DATA_HOME / "cancel-request"
 
 # 前端静态文件目录与分发白名单：URL 路径 → (磁盘文件名, MIME)。
 # 只认这三个文件、不做任何路径拼接，天然免疫 ".." 穿越；其余一律 404。
@@ -187,16 +190,21 @@ def run_benchmark(params: dict) -> None:
         STATE["exit_code"] = None
 
     try:
-        # Windows：测速子进程放进独立进程组，cancel 时才能把 CTRL_BREAK_EVENT
-        # 只投递给它（不殃及面板进程自身）。这里不能加 CREATE_NO_WINDOW——
-        # 子进程没有可依附的控制台时 CTRL_BREAK_EVENT 无法投递，取消功能会失效。
-        popen_kwargs: dict = {}
+        # Windows：面板无控制台（pythonw 启动），测速子进程同样没有可依附的
+        # 控制台——CTRL_BREAK_EVENT 无处可投，取消改走哨兵文件（见
+        # cancel_benchmark / CANCEL_FILE）。CREATE_NO_WINDOW 防止子进程弹窗。
+        # stdin=DEVNULL：pythonw 的 stdin 句柄无效，子进程继承会出问题；
+        # 且面板场景不该有 getpass 之类的控制台交互。
+        popen_kwargs: dict = {"stdin": subprocess.DEVNULL}
         if sys.platform == "win32":
-            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             if flags:
                 popen_kwargs["creationflags"] = flags
+        # 把哨兵文件路径传给子进程（clash_speedbench.py 的 cancel_requested）
+        env = dict(os.environ)
+        env["SPEEDBENCH_CANCEL_FILE"] = str(CANCEL_FILE)
         proc = subprocess.Popen(
-            cmd, cwd=str(DATA_HOME),
+            cmd, cwd=str(DATA_HOME), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
             **popen_kwargs,
@@ -230,11 +238,11 @@ def run_benchmark(params: dict) -> None:
 def cancel_benchmark() -> dict:
     """中断正在运行的测速子进程。
 
-    POSIX 先发 SIGINT；Windows 发 CTRL_BREAK_EVENT（测速子进程里注册的
-    SIGBREAK handler 会把它转成 KeyboardInterrupt）——两者都走
-    clash_speedbench.py 的 finally 恢复 Clash 策略组/模式。Windows 的
-    terminate 是 TerminateProcess，不跑 finally，所以只作兜底：
-    最多等 5 秒，未退出再 terminate（再兜底 kill）。
+    POSIX 发 SIGINT；Windows 写哨兵文件（面板无控制台后 CTRL_BREAK_EVENT
+    无处可投；测速子进程在节点/轮次间隙检查 cancel_requested，发现后转
+    KeyboardInterrupt）——两者都走 clash_speedbench.py 的 finally 恢复
+    Clash 策略组/模式。Windows 的 terminate 是 TerminateProcess，不跑
+    finally，所以只作兜底：最多等 5 秒，未退出再 terminate（再兜底 kill）。
     """
     with STATE_LOCK:
         proc = STATE.get("proc")
@@ -243,10 +251,9 @@ def cancel_benchmark() -> dict:
         return {"ok": False, "msg": "当前没有正在进行的测速"}
     try:
         if sys.platform == "win32":
-            first_sig = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT)
+            CANCEL_FILE.write_text(str(int(time.time())), encoding="utf-8")
         else:
-            first_sig = signal.SIGINT
-        proc.send_signal(first_sig)
+            proc.send_signal(signal.SIGINT)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -452,7 +459,7 @@ class Handler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 busy = STATE["running"]
             if busy:
-                cancel_benchmark()  # 先中断测速（SIGINT/CTRL_BREAK 走 finally 恢复 Clash 配置），再停面板
+                cancel_benchmark()  # 先中断测速（SIGINT/哨兵文件走 finally 恢复 Clash 配置），再停面板
             msg = "面板已停止" + ("，已先中断进行中的测速" if busy else "")
             self._json({"ok": True, "msg": msg})
             threading.Thread(target=self.server.shutdown, daemon=True).start()

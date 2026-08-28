@@ -61,6 +61,7 @@ from clash_speedbench import (
     MihomoAPI,
     Result,
     _no_window_kwargs,
+    cancel_requested,
     adaptive_sample,
     classify_ip,
     compute_score,
@@ -1194,7 +1195,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
 
         ip_total = len(ip_pending)
 
-        # 中断收队机制：CTRL_BREAK/SIGINT 只会打断主线程的 pool.map，分片线程
+        # 中断收队机制：Ctrl+C/Ctrl+Break 只会打断主线程的 pool.map，分片线程
         # 原本感知不到、会继续逐节点探测（真机验收实测：面板 5 秒兜底强杀后
         # 留下 5 个孤儿 worker 进程）。引入取消标志 + 已启动 worker 注册表：
         # 中断时置标志并立即停掉全部临时 mihomo，在途探测因出口进程消失而
@@ -1202,6 +1203,15 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         cancel_event = threading.Event()
         workers_lock = threading.Lock()
         live_workers: List[Worker] = []
+
+        def cancelled() -> bool:
+            # 进程内标志（Ctrl+C/Ctrl+Break 路径）+ 面板哨兵文件（无控制台路径）
+            if cancel_event.is_set():
+                return True
+            if cancel_requested():
+                cancel_event.set()
+                return True
+            return False
 
         def stop_live_workers() -> None:
             with workers_lock:
@@ -1213,7 +1223,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                     pass
 
         def shard_loop(shard: List[dict]) -> None:
-            if cancel_event.is_set():
+            if cancelled():
                 return
             # worker 配置 = 分片节点 + 各自的 dialer-proxy 依赖闭包；
             # 探测仍只针对分片内的入选节点，依赖节点仅供链式拨号、不计入结果
@@ -1223,7 +1233,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                 live_workers.append(worker)
             try:
                 for p in shard:
-                    if cancel_event.is_set():  # 节点间检查取消标志，尽快收队
+                    if cancelled():  # 节点间检查取消标志，尽快收队
                         return
                     name = str(p.get("name"))
                     proto = str(p.get("type", ""))
@@ -1312,6 +1322,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         if worker2 is not None:
             try:
                 for i, r in enumerate(chosen, 1):
+                    if cancel_requested():  # 面板哨兵文件：节点间检查
+                        raise KeyboardInterrupt
                     try:
                         _speed_node_in_worker(worker2, r, args)
                     except Exception as e:

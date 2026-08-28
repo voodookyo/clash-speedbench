@@ -37,17 +37,23 @@ echo Python detected:
 python --version
 echo.
 
-rem Deliberately "python", not "pythonw": the panel's cancel-benchmark
-rem button relies on CTRL_BREAK_EVENT, which can only be delivered to a
-rem process that owns a console window. pythonw (no console) would break
-rem graceful cancel and the automatic restore of the Clash config, so the
-rem minimized console window that stays open is by design.
+rem Prefer pythonw (no console window): the panel no longer needs a console
+rem for the cancel button - cancellation now travels through a sentinel file
+rem (SPEEDBENCH_CANCEL_FILE), and benchmark/grandchild processes are spawned
+rem with CREATE_NO_WINDOW. If pythonw is unavailable (rare; the Microsoft
+rem Store build ships it), fall back to python with a minimized console.
+rem Panel output goes to web.log either way so crashes stay diagnosable.
 rem
 rem speedbench_web.py opens the browser by itself once it is up; do NOT
 rem "start http://127.0.0.1:8950" here or two tabs would open at once.
-start "Clash SpeedBench" /min python "%~dp0speedbench_web.py"
+where pythonw >nul 2>nul
+if errorlevel 1 (
+    echo pythonw not found; falling back to a minimized console window.
+    start "Clash SpeedBench" /min python "%~dp0speedbench_web.py" >>"%SPEEDBENCH_HOME%\web.log" 2>&1
+) else (
+    start "" pythonw "%~dp0speedbench_web.py" >>"%SPEEDBENCH_HOME%\web.log" 2>&1
+)
 
 echo Clash SpeedBench started; the browser opens http://127.0.0.1:8950 shortly.
-echo The panel runs in the minimized "Clash SpeedBench" console window on
-echo the taskbar, plus a tray icon near the clock (left-click opens the panel).
-echo Closing that window exits SpeedBench.
+echo No console window stays open; use the tray icon near the clock
+echo ^(left-click opens the panel, right-click quits SpeedBench^).

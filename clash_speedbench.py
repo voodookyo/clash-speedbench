@@ -528,13 +528,33 @@ def restore_groups(api: MihomoAPI, saved: Dict[str, Tuple[str, Optional[str]]]) 
             print(f"⚠️ 恢复策略组失败: {group}: {e}", file=sys.stderr)
 
 
+# 无控制台取消通道：面板以 pythonw 无窗口运行时，测速子进程没有可依附的
+# 控制台，CTRL_BREAK_EVENT 无处可投。改由面板把哨兵文件路径放进环境变量，
+# 测速循环在节点/轮次间隙发现文件出现即走与 Ctrl+C 相同的优雅中断路径
+# （KeyboardInterrupt → finally 恢复 Clash 配置）。
+_CANCEL_FILE = os.environ.get("SPEEDBENCH_CANCEL_FILE", "")
+
+
+def cancel_requested() -> bool:
+    """面板是否请求中断（哨兵文件出现）。未设置环境变量时恒为 False。"""
+    return bool(_CANCEL_FILE) and os.path.exists(_CANCEL_FILE)
+
+
+def clear_cancel_request() -> None:
+    """启动时清掉上一轮残留的哨兵文件，否则一开场就会被误判为已取消。"""
+    if not _CANCEL_FILE:
+        return
+    try:
+        os.unlink(_CANCEL_FILE)
+    except OSError:
+        pass
+
+
 def _no_window_kwargs() -> dict:
     """Windows 下给子进程（curl/mihomo/powershell 等）加 CREATE_NO_WINDOW，
     防止面板以 pythonw 无控制台方式启动时每跑一个子进程就弹黑色控制台窗口；
     这些子进程的输出全部走管道/DEVNULL，不依赖控制台。POSIX 返回空 dict，
-    调用处用 ** 展开，对既有调用签名零影响。
-    注意：Web 面板的测速子进程不能用这个（会导致 CTRL_BREAK_EVENT 无法投递），
-    见 speedbench_web.run_benchmark。"""
+    调用处用 ** 展开，对既有调用签名零影响。"""
     if sys.platform == "win32":
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         if flags:
@@ -1146,15 +1166,19 @@ def main() -> int:
         print("错误：--top-n 至少为 1。", file=sys.stderr)
         return 2
 
-    # Windows：Web 面板「停止测速」发来的是 CTRL_BREAK_EVENT（Python 映射为
+    # Windows：命令行场景下用户可在控制台按 Ctrl+Break（Python 映射为
     # SIGBREAK）。本文件没有显式 SIGINT handler——Ctrl+C 靠解释器默认把 SIGINT
     # 转成 KeyboardInterrupt；这里给 SIGBREAK 注册同样的转换，让 CTRL_BREAK_EVENT
     # 走与 Ctrl+C 完全相同的优雅中断路径（except KeyboardInterrupt + finally
     # 恢复策略组/原模式）。terminate=TerminateProcess 不会跑 finally，不能用它。
+    # Web 面板的「停止测速」不走这里：面板无控制台，改发哨兵文件
+    # （见 cancel_requested / SPEEDBENCH_CANCEL_FILE）。
     if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
         def _on_sigbreak(signum, frame):
             raise KeyboardInterrupt
         signal.signal(signal.SIGBREAK, _on_sigbreak)
+
+    clear_cancel_request()
 
     try:
         base, needs_secret = detect_controller(args.secret, args.controller)
@@ -1303,6 +1327,8 @@ def main() -> int:
             mode_changed = True
 
         for idx, name in enumerate(candidates, 1):
+            if cancel_requested():  # 面板哨兵文件：节点间检查，走优雅中断
+                raise KeyboardInterrupt
             # refresh metadata occasionally is unnecessary; original snapshot is enough for graph.
             path = paths[name]
             info = leaves[name]
@@ -1340,6 +1366,8 @@ def main() -> int:
             statuses = []
             connect_ms = None
             for round_i in range(args.rounds):
+                if cancel_requested():  # 轮次间隙检查哨兵，尽快收队
+                    raise KeyboardInterrupt
                 # Add cache-busting measId even though Cloudflare's __down is dynamic.
                 byte_count = mb * 1_000_000
                 url = DEFAULT_DOWNLOAD_URL.format(bytes=byte_count) + f"&measId={int(time.time()*1000)}-{idx}-{round_i}"
