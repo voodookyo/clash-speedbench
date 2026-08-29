@@ -5,7 +5,7 @@
 init() 事件绑定与 loadLatest/loadHistory/loadCurrent 启动链路），再在同一词法
 作用域追加驱动代码直接调用其顶层函数，结果 JSON 打到 stdout 由 Python 断言：
 
-- 4 个评分 Profile（all/daily/download/ipclean）公式数值样例 + 沉底规则（返回 null）
+- 5 个评分 Profile（含多源 ipclean/residential）公式数值样例 + 沉底规则
 - regionOf 地区启发式：country_code 优先 > 国旗 emoji > 中/英关键词 > '??' 兜底
 - Profile 选择与收藏节点的 localStorage 持久化
 
@@ -94,8 +94,79 @@ R.ipclean_proxy         = prof("ipclean", {ip:{ok:true, proxy:true, hosting:true
 R.ipclean_hosting       = prof("ipclean", {ip:{ok:true, hosting:true, mobile:true}});
 R.ipclean_mobile        = prof("ipclean", {ip:{ok:true, mobile:true}});
 R.ipclean_clean         = prof("ipclean", {ip:{ok:true}});
+R.ipclean_legacy_neutral = prof("ipclean", {ip:{ok:true, kind:"ISP/非托管",
+  proxy:false, hosting:false, mobile:false}});
 R.ipclean_not_ok        = prof("ipclean", {ip:{ok:false}});
 R.ipclean_missing       = prof("ipclean", {});
+
+// —— 多源 IP intelligence fixtures ——
+const intel = (category, confidence, quality, extra={}) => Object.assign({
+  ip: "203.0.113.10",
+  classification: {category, confidence},
+  confidence,
+  ip_quality_score: quality,
+  ip_grade: quality>=90 ? "S" : quality>=75 ? "A" : quality>=60 ? "B" : quality>=40 ? "C" : "D",
+  ipqs_fraud_score: 5,
+  scamalytics_score: 5,
+  hosting: false,
+  proxy: false,
+  vpn: false,
+  tor: false,
+  mobile: false,
+  residential_proxy: false,
+  ipqs_recent_abuse: false,
+  scamalytics_blacklisted: false,
+  scamalytics_datacenter: false,
+}, extra);
+const intelResidential = intel("residential", 94, 92);
+const intelCorporate = intel("corporate", 90, 86);
+const intelMobile = intel("mobile", 88, 80, {mobile:true});
+const intelResidentialProxy = intel("residential_proxy", 89, 76, {residential_proxy:true});
+const intelDatacenter = intel("datacenter", 88, 82, {hosting:true, scamalytics_datacenter:true});
+const intelVpn = intel("vpn_proxy", 85, 72);
+const intelHighRisk = intel("residential_proxy", 90, 12, {
+  residential_proxy:true, proxy:true, ipqs_fraud_score:96,
+  scamalytics_score:91, ipqs_recent_abuse:true, scamalytics_blacklisted:true,
+});
+const intelUnknown = intel("unknown", 0, 100, {ip_grade:"S"});
+R.ipclean_intel_clean = prof("ipclean", {intel_v4:intelResidential});
+R.ipclean_intel_high_fraud = prof("ipclean", {intel_v4:intelHighRisk});
+R.ipclean_intel_unknown = prof("ipclean", {intel_v4:intelUnknown});
+R.ipclean_dual_stack_worst = prof("ipclean", {
+  intel_v4:intelResidential, intel_v6:intelHighRisk,
+});
+R.residential_dual_stack_worst = prof("residential", {
+  intel_v4:intelResidential, intel_v6:intelDatacenter,
+});
+const residentialRows = [
+  {name:"unknown", intel_v4:intelUnknown},
+  {name:"high-risk", intel_v4:intelHighRisk},
+  {name:"vpn", intel_v4:intelVpn},
+  {name:"datacenter", intel_v4:intelDatacenter},
+  {name:"residential-proxy", intel_v4:intelResidentialProxy},
+  {name:"mobile", intel_v4:intelMobile},
+  {name:"corporate", intel_v4:intelCorporate},
+  {name:"residential", intel_v4:intelResidential},
+];
+currentProfile = "residential";
+sortRows(residentialRows, "score", false);
+R.residential_order = residentialRows.map(x=>x.name);
+R.residential_legacy_clean = prof("residential", {ip:{ok:true, kind:"ISP/非托管", hosting:false, mobile:false}});
+
+// 🚀下载必须只依赖带宽字段；相同带宽下改变 IP intelligence 不得改变分数/顺序。
+const downloadClean = prof("download", {median_mbps:150, multi_mbps:250,
+  intel_v4:intelResidential});
+const downloadRisk = prof("download", {median_mbps:150, multi_mbps:250,
+  intel_v4:intelHighRisk});
+R.download_ip_independent = downloadClean===downloadRisk;
+const downloadRows = [
+  {name:"risk", median_mbps:150, multi_mbps:250, intel_v4:intelHighRisk},
+  {name:"clean", median_mbps:150, multi_mbps:250, intel_v4:intelResidential},
+];
+currentProfile = "download";
+sortRows(downloadRows, "score", false);
+R.download_order_same = downloadRows.map(x=>x.name);
+
 currentProfile = "all";
 R.all_passthrough       = N(profileScore({score:66.6}));  // 综合推荐：后端分数原样
 R.all_null              = N(profileScore({}));
@@ -154,13 +225,23 @@ class AppJsLogicTest(unittest.TestCase):
         "download_half": 50.0,
         "download_multi_fallback": 8.8,  # 0.7×10 + 0.3×6
         "download_no_median": "__NULL__",
-        # ipclean = 最差标记：代理 20 / 托管 50 / 移动 75 / 干净 100
+        # ipclean = 代理 20 / 托管 50 / 移动 75 / legacy 中性 60
         "ipclean_proxy": 20,
         "ipclean_hosting": 50,
         "ipclean_mobile": 75,
-        "ipclean_clean": 100,
+        "ipclean_clean": 60,
+        "ipclean_legacy_neutral": 60,
         "ipclean_not_ok": "__NULL__",
         "ipclean_missing": "__NULL__",
+        # structured intelligence uses quality/fraud/flags conservatively;
+        # unknown/N/A is never promoted to a clean 100.
+        "ipclean_intel_clean": 92.0,
+        "ipclean_intel_high_fraud": 4.0,
+        "ipclean_intel_unknown": 0.0,
+        "ipclean_dual_stack_worst": 4.0,
+        "residential_dual_stack_worst": 395.0,
+        "residential_legacy_clean": 500.0,
+        "download_ip_independent": True,
         # all：后端 score 原样；无 score → null 沉底
         "all_passthrough": 66.6,
         "all_null": "__NULL__",
@@ -209,6 +290,13 @@ class AppJsLogicTest(unittest.TestCase):
     def test_profile_formulas_and_null_rule(self):
         r = self.run_app_js()
         self.check_expected(r, self.PROFILE_EXPECTED)
+        self.assertLess(r["ipclean_legacy_neutral"], 100,
+                        "仅 ip-api 的中性 all-false 信号不得冒充 clean intelligence")
+        self.assertEqual(r["residential_order"], [
+            "residential", "corporate", "mobile", "residential-proxy",
+            "datacenter", "vpn", "high-risk", "unknown",
+        ])
+        self.assertEqual(r["download_order_same"], ["risk", "clean"])
         self.assertEqual(r["initial_profile"], "all")  # 空存储默认综合推荐
 
     def test_region_of_heuristics(self):
