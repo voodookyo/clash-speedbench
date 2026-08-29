@@ -15,6 +15,8 @@
       <a class="nav-item" data-view="nodes" href="#/nodes">🗂 节点</a>
       <a class="nav-item" data-view="history" href="#/history">📈 历史</a>
       <a class="nav-item" data-view="subs" href="#/subs">🧭 订阅</a>
+      <a class="nav-item" data-view="leak" href="#/leak">🕵 环境泄漏检测</a>
+      <a class="nav-item" data-view="settings" href="#/settings">⚙️ IP 设置</a>
       <a class="nav-item" data-view="about" href="#/about">ℹ️ 关于</a>
     </nav>
     <div class="nav-foot"><button class="quit-btn" id="btn-quit">⏻ 退出 SpeedBench</button></div>
@@ -55,7 +57,8 @@
             <button class="mini pf" data-p="all" title="后端综合评分（延迟+带宽+IP 画像加权）">综合推荐</button>
             <button class="mini pf" data-p="daily" title="0.5×延迟 + 0.3×抖动 + 0.2×带宽，日常浏览体验优先">⚡ 日常</button>
             <button class="mini pf" data-p="download" title="0.7×单线程带宽(300M封顶) + 0.3×多线程带宽(500M封顶)，下载优先">🚀 下载</button>
-            <button class="mini pf" data-p="ipclean" title="按出口 IP 属性打分：无标记 100 / 移动 75 / 托管 50 / 代理 20">🧼 IP</button>
+            <button class="mini pf" data-p="ipclean" title="按多源 IP 分类、风险和信誉排序">🧼 IP</button>
+            <button class="mini pf" data-p="residential" title="住宅优先：仅按多源分类和风险排序，不改变下载 Profile">🏠 住宅优先</button>
           </div>
           <input type="text" id="f-search" placeholder="🔍 搜索节点名…">
         </div>
@@ -71,8 +74,8 @@
               <th class="sort" data-k="provider" id="th-provider" style="display:none">订阅 <span class="arr"></span></th>
               <th class="sort" data-k="latency_ms">延迟 <span class="arr"></span></th>
               <th class="sort" data-k="median_mbps">带宽 <span class="arr"></span></th>
-              <th class="sort" data-k="score">评分 <span class="arr">▼</span></th>
-              <th class="sort" data-k="ip">IP画像 <span class="arr"></span></th>
+              <th class="sort" data-k="score">Network <span class="arr">▼</span></th>
+              <th>IP Grade</th><th>IP 类型</th><th>风险</th>
               <th>标签</th><th></th>
             </tr></thead>
             <tbody id="tbody"></tbody>
@@ -155,17 +158,73 @@
       </div>
     </section>
 
+    <!-- ============ 环境泄漏检测 ============ -->
+    <section id="view-leak" style="display:none">
+      <div class="card leak-hero">
+        <div class="card-title">🕵 环境泄漏检测</div>
+        <p class="warn">泄漏检测属于当前浏览器、当前 Clash/TUN 和当前活动节点的环境属性，不属于离线测速节点的固有属性。</p>
+        <div class="leak-actions">
+          <button id="btn-leak-run">开始 WebRTC 检测</button>
+          <button class="mini" id="btn-leak-save" disabled>保存本次结果</button>
+        </div>
+        <div id="leak-status" class="leak-status unknown">尚未检测 · 无法确认</div>
+        <div id="leak-summary" class="card-sub">浏览器会尝试收集 host、srflx、prflx、relay ICE candidate；隐私策略或 STUN 不可用时不会猜测为安全。</div>
+        <div id="leak-details"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">DNS Leak Guided Audit</div>
+        <p>DNS 泄漏需要外部 authoritative observer；本页不会读取系统 DNS，也不会抓取测试站点 HTML 后声称安全。</p>
+        <div class="leak-actions">
+          <button class="mini dns-open" data-dns-url="https://browserleaks.com/dns">打开 BrowserLeaks DNS</button>
+          <button class="mini dns-open" data-dns-url="https://www.dnsleaktest.com/">打开 DNSLeakTest</button>
+        </div>
+        <p class="card-sub">正常：resolver 应与代理出口所在地区或全球公共 DNS 一致；危险：出现本地真实网络、北京或中国联通 resolver。结果仅供人工判读。</p>
+        <label class="chk"><input type="checkbox" id="dns-observed"> 我已人工查看 DNS 测试结果</label>
+        <select id="dns-status" aria-label="DNS 人工判定">
+          <option value="unknown">无法确认</option>
+          <option value="clear">未观察到明显异常</option>
+          <option value="warning">发现可能泄漏</option>
+        </select>
+      </div>
+      <div class="card">
+        <div class="card-title">最近审计记录</div>
+        <div id="leak-history" class="card-sub">尚无本地保存记录</div>
+      </div>
+    </section>
+
+    <!-- ============ IP Intelligence 设置 ============ -->
+    <section id="view-settings" style="display:none">
+      <div class="card settings-card">
+        <div class="card-title">IP Intelligence 设置</div>
+        <p class="card-sub">Key 只提交给本机 SpeedBench 后端，默认仅驻留内存；不会写入 localStorage、Cookie、JSONL、SQLite、日志或命令行。清空输入可移除本次面板配置。</p>
+        <div class="settings-grid">
+          <label>IPinfo Token<input id="setting-ipinfo-token" type="password" autocomplete="off" spellcheck="false"></label>
+          <label>IPQS Key<input id="setting-ipqs-key" type="password" autocomplete="off" spellcheck="false"></label>
+          <label>Scamalytics Username<input id="setting-scamalytics-username" type="text" autocomplete="off" spellcheck="false"></label>
+          <label>Scamalytics Key<input id="setting-scamalytics-key" type="password" autocomplete="off" spellcheck="false"></label>
+          <label>Scamalytics Region<select id="setting-scamalytics-region"><option value="">未选择</option><option value="eu">EU</option><option value="us">US</option></select></label>
+        </div>
+        <div class="leak-actions"><button id="btn-settings-save">保存到本次面板</button><button class="mini" id="btn-settings-clear">清除本次输入</button></div>
+        <div id="settings-msg" class="card-sub"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">IP Intelligence Sources</div>
+        <div id="provider-status" class="provider-status-grid">正在读取 Provider 状态…</div>
+      </div>
+    </section>
+
     <!-- ============ 关于视图 ============ -->
     <section id="view-about" style="display:none">
       <div class="card about">
-        <div class="card-title">⚡ Clash SpeedBench · v0.8.1</div>
-        <p>Clash Verge Rev / Mihomo 节点的本地综合测速面板：延迟 + 真实带宽 + IP 画像 + 综合评分，一键切换最优节点。</p>
+        <div class="card-title">⚡ Clash SpeedBench · v1.0.0</div>
+        <p>Clash Verge Rev / Mihomo 节点的本地综合测速面板：延迟 + 真实带宽 + 多源 IP Intelligence + 综合评分，一键切换最优节点。</p>
 
         <h2>两阶段测速原理</h2>
         <ul>
           <li><b>Phase 1 · 并发粗筛</b>：对所有候选节点并发探测连通性、延迟、抖动与建连耗时，快速排除不通/龟速节点。</li>
           <li><b>Phase 2 · 串行精测</b>：只对延迟最优的 Top-N 连通节点逐个做真实下载测速（curl 经 mixed-port），得单流中位/最佳带宽，可选 4 路并发流测峰值；样本大小随带宽自适应。</li>
-          <li><b>IP 画像</b>：逐节点查询出口 IP 的国家/ASN/ISP 与代理、托管、移动标记，识别「脏 IP」。</li>
+          <li><b>IP Intelligence</b>：按出口 IP 去重后可选查询 IPinfo、IPQS、Scamalytics；分类与 IP Grade 是启发式证据汇总，不等同“真住宅”或厂商官方评分。</li>
+          <li><b>环境泄漏检测</b>：WebRTC/DNS 检测当前浏览器与 Clash/TUN 环境，不属于节点固有属性；DNS 页面采用 Guided Audit，不读取系统 DNS 后宣称安全。</li>
         </ul>
 
         <h2>安全说明</h2>

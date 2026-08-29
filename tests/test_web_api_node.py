@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Web API v0.5（读接口改走 SQLite）HTTP 级测试。
+"""Web API 节点详情（读接口改走 SQLite）HTTP 级测试。
 
-- GET /api/node：series/ip_changes 结构、days 窗口与非数字容错、缺 name 400、
+- GET /api/node：series/ip_changes/ip_reputation_changes 结构、days 窗口与非数字容错、缺 name 400、
   SQL 注入尝试（' OR 1=1--）返回空结构而不是报错或泄露全表
 - GET /api/latest：patch HISTORY 指向临时 jsonl 后，响应与末行逐字段一致（走 sync_db）
 - GET /api/history：slim 结构不回归
@@ -78,12 +78,14 @@ class WebApiCase(WebServerCase):
         return status, json.loads(body.decode("utf-8"))
 
     @staticmethod
-    def node_path(name=None, days=None):
+    def node_path(name=None, days=None, key=None):
         qs = {}
         if name is not None:
             qs["name"] = name
         if days is not None:
             qs["days"] = days
+        if key is not None:
+            qs["key"] = key
         return "/api/node" + ("?" + urllib.parse.urlencode(qs) if qs else "")
 
 
@@ -102,7 +104,7 @@ class ApiNodeTest(WebApiCase):
         self.write_history(self._history())
         status, d = self.get_json(self.node_path("节点A", 60))
         self.assertEqual(status, 200)
-        self.assertEqual(set(d), {"series", "ip_changes"})
+        self.assertEqual(set(d), {"series", "ip_changes", "ip_reputation_changes"})
         self.assertEqual([s["median_mbps"] for s in d["series"]],
                          [10.0, 20.0, None, 30.0])  # 失败轮次也在序列里（median 为 null）
         self.assertEqual(set(d["series"][0]),
@@ -111,6 +113,43 @@ class ApiNodeTest(WebApiCase):
         # 失败轮次（无 exit_ip）不进时间线；相邻不变合并，换 IP/ASN 产生变化点
         self.assertEqual([(e["exit_ip"], e["asn"]) for e in d["ip_changes"]],
                          [("203.0.113.1", "AS1 Net"), ("203.0.113.2", "AS2 Net")])
+        # The additive DB timeline may retain legacy IP observations even when
+        # no paid intelligence was available; it must still be a list and
+        # must not manufacture a clean score for those rows.
+        self.assertIsInstance(d["ip_reputation_changes"], list)
+        self.assertTrue(all(row.get("intel_available") is False
+                            for row in d["ip_reputation_changes"]))
+
+    def test_node_reputation_changes_passes_name_and_key(self):
+        self.write_history(self._history())
+        fixture = [{"ts": "2026-08-28T12:00:00", "exit_ip": "198.51.100.8",
+                    "classification": "residential_proxy", "ip_grade": "C",
+                    "ipqs_fraud_score": 71, "scamalytics_score": 64,
+                    "same_ip_reputation_worsened": True}]
+        with mock.patch.object(web.speedbench_db, "ip_reputation_changes",
+                               return_value=fixture) as changes:
+            status, d = self.get_json(self.node_path("节点A", 60))
+        self.assertEqual(status, 200)
+        self.assertEqual(d["ip_reputation_changes"], fixture)
+        kwargs = changes.call_args.kwargs
+        self.assertEqual(kwargs["name"], "节点A")
+        self.assertEqual(kwargs["node_key"], "")
+
+        with mock.patch.object(web.speedbench_db, "ip_reputation_changes",
+                               return_value=fixture) as changes:
+            status, d = self.get_json(self.node_path(key="stable-node-key"))
+        self.assertEqual(status, 200)
+        self.assertEqual(d["ip_reputation_changes"], fixture)
+        kwargs = changes.call_args.kwargs
+        self.assertEqual(kwargs["name"], "")
+        self.assertEqual(kwargs["node_key"], "stable-node-key")
+
+    def test_node_reputation_changes_missing_function_degrades_empty(self):
+        self.write_history(self._history())
+        with mock.patch.object(web.speedbench_db, "ip_reputation_changes", None):
+            status, d = self.get_json(self.node_path("节点A"))
+        self.assertEqual(status, 200)
+        self.assertEqual(d["ip_reputation_changes"], [])
 
     def test_node_days_window_and_bad_days_fallback(self):
         self.write_history(self._history())
@@ -138,6 +177,7 @@ class ApiNodeTest(WebApiCase):
         self.assertEqual(status, 200)
         self.assertEqual(d["series"], [])       # 参数化查询：注入串当普通名字，查不到
         self.assertEqual(d["ip_changes"], [])
+        self.assertEqual(d["ip_reputation_changes"], [])
         # 注入尝试不破坏后续正常查询
         status, d2 = self.get_json(self.node_path("节点A", 60))
         self.assertEqual(status, 200)
@@ -147,13 +187,15 @@ class ApiNodeTest(WebApiCase):
         self.write_history(self._history())
         status, d = self.get_json(self.node_path("不存在节点"))
         self.assertEqual(status, 200)
-        self.assertEqual(d, {"series": [], "ip_changes": []})
+        self.assertEqual(d, {"series": [], "ip_changes": [],
+                             "ip_reputation_changes": []})
 
     def test_node_empty_history_returns_empty(self):
         # jsonl 不存在：sync_db 无可导入，接口仍返回 200 空结构
         status, d = self.get_json(self.node_path("节点A"))
         self.assertEqual(status, 200)
-        self.assertEqual(d, {"series": [], "ip_changes": []})
+        self.assertEqual(d, {"series": [], "ip_changes": [],
+                             "ip_reputation_changes": []})
 
 
 class ApiLatestHistoryTest(WebApiCase):

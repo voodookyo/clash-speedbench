@@ -56,8 +56,9 @@ function closeModal(){
 }
 
 /* ==================== 评分 Profile（公式与旧版一致，勿改） ==================== */
-// all=综合推荐(后端 score 原样) / daily=⚡日常 / download=🚀下载 / ipclean=🧼IP
-const PROFILES = ['all','daily','download','ipclean'];
+// all=综合推荐(后端 score 原样) / daily=⚡日常 / download=🚀下载 /
+// ipclean=🧼IP / residential=🏠住宅优先。下载 Profile 不读取 IP 规则。
+const PROFILES = ['all','daily','download','ipclean','residential'];
 let currentProfile = lsGet('sb_profile');
 if(!PROFILES.includes(currentProfile)) currentProfile = 'all';
 
@@ -87,6 +88,16 @@ function profileScore(r){
       if(ip.hosting) return 50;
       if(ip.mobile)  return 75;
       return 100;
+    }
+    case 'residential': {  // 🏠住宅优先：多源分类/Grade，未知永远沉底
+      const ip = r.ip_intel || r.intel || r.ip || {};
+      const cls = ip.classification && typeof ip.classification === 'object'
+        ? ip.classification.category : (ip.classification || ip.category || 'unknown');
+      const rank = {residential:7, corporate:6, residential_proxy:5,
+                    mobile:4, datacenter:3, vpn_proxy:2, unknown:0};
+      const grade = {S:5, A:4, B:3, C:2, D:1};
+      const g = grade[String(ip.ip_grade || ip.grade || '').toUpperCase()] || 0;
+      return (rank[cls] || 0)*10 + g;
     }
     default: return r.score;  // 综合推荐：后端分数原样
   }
@@ -132,6 +143,60 @@ function normKind(ip){
   return KIND_ALIAS[k] || k || '未知';
 }
 
+const INTEL_KIND_LABEL = {
+  residential: '住宅 ISP',
+  residential_proxy: 'ISP住宅代理',
+  corporate: '企业/商宽',
+  mobile: '移动网络',
+  datacenter: '数据中心',
+  vpn_proxy: '代理/VPN',
+  unknown: '未知',
+};
+function intelOf(r){
+  if(!r) return {};
+  const direct = r.ip_intel || r.intel || (r.ip && r.ip.intel);
+  if(direct) return direct;
+  // The serialized Result model keeps one full intelligence object per
+  // address family.  Prefer IPv4 for the compact row, while carrying the
+  // result-level grade/score into the detail renderer.
+  const family = r.intel_v4 || r.intel_v6;
+  if(family){
+    return Object.assign({}, family, {
+      ip_quality_score: r.ip_quality_score ?? family.ip_quality_score,
+      ip_grade: r.ip_grade || family.ip_grade,
+      exit_ipv4: r.exit_ipv4 || family.ip,
+      exit_ipv6: r.exit_ipv6 || (r.intel_v6 && r.intel_v6.ip),
+    });
+  }
+  return {};
+}
+function classificationOf(r){
+  const x = intelOf(r);
+  const c = x.classification;
+  return (c && typeof c === 'object' ? c.category : c) || x.category || '';
+}
+function classificationLabel(r){
+  const x = intelOf(r), c = classificationOf(r);
+  const confidence = x.confidence ?? (x.classification && x.classification.confidence);
+  let text = INTEL_KIND_LABEL[c] || normKind(r && r.ip);
+  if(c==='residential' && confidence!=null)
+    text = (Number(confidence)>=80 ? '高置信度住宅 ISP' : '疑似住宅');
+  return text || '未知';
+}
+function ipGradeOf(r){
+  const x = intelOf(r);
+  return x.ip_grade || x.grade || r.ip_grade || '-';
+}
+function ipRiskOf(r){
+  const x = intelOf(r);
+  const values = [];
+  if(x.ipqs_fraud_score!=null) values.push(`IPQS ${esc(x.ipqs_fraud_score)}`);
+  if(x.scamalytics_score!=null) values.push(`Scam ${esc(x.scamalytics_score)}`);
+  if(x.scamalytics_risk) values.push(esc(x.scamalytics_risk));
+  if(x.ip_quality_score!=null && !values.length) values.push(`Grade ${esc(x.ip_quality_score)}`);
+  return values.length ? values.join(' · ') : (r && r.risk ? esc(r.risk) : '-');
+}
+
 function ipHtml(ip){
   if(!ip || !ip.ok) return '-';
   let h = `${esc(ip.country_code||ip.country||'?')}·${esc(normKind(ip))}`;
@@ -140,6 +205,16 @@ function ipHtml(ip){
   if(ip.hosting) badges.push('<span class="tag bad">托管</span>');
   if(ip.mobile)  badges.push('<span class="tag">移动</span>');
   return badges.length ? h + ' ' + badges.join('') : h;
+}
+
+function ipDisplayHtml(r){
+  const intel = intelOf(r);
+  if(intel && (intel.ip || intel.classification || intel.ip_grade)){
+    const country = intel.country_code || intel.country || '?';
+    const ip = intel.ip ? ` <span class="mono">${esc(intel.ip)}</span>` : '';
+    return `${esc(country)}·${esc(classificationLabel(r))}${ip}`;
+  }
+  return ipHtml(r && r.ip);
 }
 
 /* ==================== 地区启发式（与旧版一致，勿改） ==================== */
@@ -236,8 +311,16 @@ function rowHtml(r, i, opts){
   if(opts.provider) h += `<td class="mono">${esc(r.provider||'(未知订阅)')}</td>`;
   h += `<td class="mono">${r.latency_ms??'-'}</td>`;
   h += `<td class="mono">${r.median_mbps?r.median_mbps.toFixed(1):'-'}</td>`;
-  h += `<td class="stars" data-name="${esc(r.name)}" title="查看 30 天趋势"><span class="sc-num">${sc==null?'-':sc.toFixed(1)}</span> ${esc(r.stars||'')}</td>`;
-  h += `<td>${ipHtml(r.ip)}</td><td>${tagHtml(r.tags)}</td><td>`;
+  const network = r.network_score ?? r.networkScore ?? r.score;
+  h += `<td class="stars" data-name="${esc(r.name)}" title="查看 30 天趋势"><span class="sc-num">${network==null?'-':Number(network).toFixed(1)}</span> ${esc(r.stars||'')}</td>`;
+  if(opts.intelColumns !== false){
+    h += `<td class="mono">${esc(ipGradeOf(r))}</td>`;
+    h += `<td>${esc(classificationLabel(r))}</td>`;
+    h += `<td>${ipRiskOf(r)}</td>`;
+  }else{
+    h += `<td>${ipDisplayHtml(r)}</td>`;
+  }
+  h += `<td>${tagHtml(r.tags)}</td><td>`;
   if(!ro)
     h += isCur ? '<button class="mini" disabled>使用中</button>'
                : `<button class="mini sw" data-name="${esc(r.name)}">切换</button>`;
@@ -249,8 +332,15 @@ function rowHtml(r, i, opts){
 // 行展开详情：延迟/抖动/建连/样本/单流/多流 + 出口 IP/ASN/ISP + 趋势入口
 function detailHtml(r, colspan){
   const ip = r.ip || {};
-  const asn = ip.asn ? ('AS'+String(ip.asn).replace(/^AS/i,'')) : '';
-  const asnTxt = asn ? esc(asn + (ip.asname?' '+ip.asname:'')) : '-';
+  const intel = intelOf(r);
+  const cls = intel.classification && typeof intel.classification === 'object'
+    ? intel.classification : {};
+  const asnValue = intel.asn || ip.asn;
+  const asnName = intel.as_name || intel.asname || ip.asname;
+  const asn = asnValue ? ('AS'+String(asnValue).replace(/^AS/i,'')) : '';
+  const asnTxt = asn ? esc(asn + (asnName?' '+asnName:'')) : '-';
+  const isp = intel.isp || ip.isp;
+  const organization = intel.organization || intel.org || ip.org;
   const cell = (k,v)=>`<div><div class="k">${k}</div><div class="v">${v}</div></div>`;
   const cells = [
     cell('抖动', r.jitter_ms!=null ? esc(r.jitter_ms)+' ms' : '-'),
@@ -259,12 +349,35 @@ function detailHtml(r, colspan){
     cell('单流带宽（中位）', r.median_mbps!=null ? r.median_mbps.toFixed(1)+' Mbps' : '-'),
     cell('单流带宽（最佳）', r.best_mbps!=null ? r.best_mbps.toFixed(1)+' Mbps' : '-'),
     cell('多流带宽', r.multi_mbps!=null ? r.multi_mbps.toFixed(1)+' Mbps' : '-'),
+    cell('Network Score', r.network_score!=null ? esc(r.network_score) : (r.score!=null ? esc(r.score) : '-')),
+    cell('应用层探测失败率', r.probe_loss_pct!=null ? esc(r.probe_loss_pct)+'%' : '-'),
     cell('出口 IP', ip.ok ? esc(ip.exit_ip||'-') : '-'),
-    cell('ASN', ip.ok ? asnTxt : '-'),
-    cell('ISP', ip.ok ? esc(ip.isp||'-') : '-'),
-    cell('组织', ip.ok ? esc(ip.org||'-') : '-'),
+    cell('IPv4', esc(r.exit_ipv4 || intel.exit_ipv4 || (ip.ok ? ip.exit_ip : '') || '-')),
+    cell('IPv6', esc(r.exit_ipv6 || intel.exit_ipv6 || '-')),
+    cell('ASN', asnTxt),
+    cell('ISP', isp ? esc(isp) : '-'),
+    cell('组织', organization ? esc(organization) : '-'),
+    cell('IP 类型', esc(classificationLabel(r))),
+    cell('Confidence', cls.confidence!=null ? esc(cls.confidence)+'%' : '-'),
+    cell('IP Grade', esc(ipGradeOf(r))),
+    cell('IPQS Fraud', intel.ipqs_fraud_score!=null ? esc(intel.ipqs_fraud_score) : '-'),
+    cell('Scamalytics Fraud', intel.scamalytics_score!=null ? esc(intel.scamalytics_score) : '-'),
   ].join('');
-  return `<tr class="detail-row"><td colspan="${colspan||8}"><div class="detail-grid">${cells}</div>` +
+  const evidence = (cls.evidence||[]).map(x=>`<li>${esc(x)}</li>`).join('');
+  const conflicts = (cls.conflicts||[]).map(x=>`<li>${esc(x)}</li>`).join('');
+  const pdata = intel.provider_data || intel.providers || {};
+  const providerBlocks = Object.entries(pdata).map(([name, data])=>{
+    const rows = Object.entries(data||{}).map(([key, value])=>{
+      const shown = (value && typeof value === 'object') ? JSON.stringify(value) : value;
+      return `<tr><td>${esc(key)}</td><td>${esc(shown==null?'-':shown)}</td></tr>`;
+    }).join('');
+    return `<details class="provider-detail"><summary>${esc(name)}</summary><table class="compact"><tbody>${rows||'<tr><td colspan="2">N/A</td></tr>'}</tbody></table></details>`;
+  }).join('');
+  const intelText = `<div class="intel-detail"><b>Evidence</b><ul>${evidence||'<li>-</li>'}</ul>`+
+    `<b>Conflicts</b><ul>${conflicts||'<li>-</li>'}</ul>`+
+    `<div class="card-sub">Provider 状态：${esc(JSON.stringify(intel.provider_status||{}))}</div>`+
+    `<div class="provider-detail-list">${providerBlocks||'<span class="card-sub">暂无 Provider 细节</span>'}</div></div>`;
+  return `<tr class="detail-row"><td colspan="${colspan||8}"><div class="detail-grid">${cells}</div>${intelText}` +
          `<div class="detail-actions"><button class="mini trend" data-name="${esc(r.name)}">📈 查看 30 天趋势</button></div></td></tr>`;
 }
 
@@ -291,7 +404,7 @@ function renderTable(){
   const showProv = all.some(r=>r.provider);
   const pth = document.getElementById('th-provider');
   if(pth && pth.style) pth.style.display = showProv ? '' : 'none';
-  const cols = showProv ? 9 : 8;
+  const cols = showProv ? 11 : 10;
   const q = searchText.trim().toLowerCase();
   const rows = all.filter(r=>!q || (r.name||'').toLowerCase().includes(q)
                         || (r.provider||'').toLowerCase().includes(q));
@@ -362,7 +475,8 @@ let histLoaded = false;
 let histSortKey = 'score', histSortAsc = false;
 let histSelRun = -1;          // histData 下标；-1=未选
 let histSelNode = null;
-// 单节点 30 天趋势：{name, pts:[{ts,v}], changes:[...], note}；name 不符时回退 histData
+// 单节点 30 天趋势：{name, pts:[{ts,v}], changes:[...], reputation_changes:[...], note}；
+// name 不符时回退 histData
 let nodeTrend = null;
 
 // 一轮测速的冠军：后端综合评分最高者（null 跳过）
@@ -417,7 +531,7 @@ function renderHistTable(){
   sortRows(rows, histSortKey, histSortAsc);
   tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
     readonly:true, currentNode:'', favs:{has(){return false}},
-    expanded:false, selected: r.name===histSelNode,
+    expanded:false, selected: r.name===histSelNode, intelColumns:false,
   })).join('');
 }
 
@@ -441,10 +555,12 @@ async function fetchNodeTrend(name){
       pts: (d.series||[]).filter(s=>s.median_mbps!=null)
            .map(s=>({ts:(s.ts||'').slice(5,16), v:s.median_mbps})),
       changes: d.ip_changes||[],
+      reputation_changes: Array.isArray(d.ip_reputation_changes)
+        ? d.ip_reputation_changes : [],
       note: ipChangeNote(d.ip_changes),
     };
   }catch(e){
-    nodeTrend = {name, pts:[], changes:[], note:''};  // 静默回退 histData
+    nodeTrend = {name, pts:[], changes:[], reputation_changes:[], note:''};  // 静默回退 histData
   }
   drawChart(); renderIpTimeline();
 }
@@ -453,7 +569,7 @@ async function fetchNodeTrend(name){
 function ipChangeNote(changes){
   if(!changes || changes.length<2) return '';
   const last = changes[changes.length-1], prev = changes[changes.length-2];
-  return `出口 IP 曾变化 ${changes.length-1} 次（最近：${prev.exit_ip||'?'} → ${last.exit_ip||'?'} @ ${(last.ts||'').slice(0,16)}）`;
+  return `出口 IP 曾变化 ${changes.length-1} 次（最近：${prev.exit_ip||'?'} → ${last.exit_ip||'?'} @ ${String(last.ts||'').slice(0,16)}）`;
 }
 
 function drawChart(){
@@ -501,18 +617,57 @@ function drawChart(){
 function renderIpTimeline(){
   const box = document.getElementById('ip-timeline');
   const t = nodeTrend && nodeTrend.name===histSelNode ? nodeTrend : null;
-  if(!t || !t.changes || !t.changes.length){ box.innerHTML=''; return; }
-  const items = t.changes.map(c=>{
+  const changes = t && Array.isArray(t.changes) ? t.changes : [];
+  const reputation = t && Array.isArray(t.reputation_changes)
+    ? t.reputation_changes : [];
+  if(!t || (!changes.length && !reputation.length)){ box.innerHTML=''; return; }
+  const items = changes.map(c=>{
     const badges = [];
     if(c.proxy)   badges.push('<span class="tag bad">代理</span>');
     if(c.hosting) badges.push('<span class="tag bad">托管</span>');
     if(c.mobile)  badges.push('<span class="tag">移动</span>');
     const asn = c.asn ? ('AS'+String(c.asn).replace(/^AS/i,'')) : '';
     const who = [asn + (c.asname?' '+c.asname:''), c.isp, c.kind].filter(Boolean).join(' · ');
-    return `<div class="ip-item"><span class="ip-ts">${esc((c.ts||'').slice(0,16))}</span>` +
+    return `<div class="ip-item"><span class="ip-ts">${esc(String(c.ts||'').slice(0,16))}</span>` +
            `<span>${esc(c.exit_ip||'?')}${who?' · '+esc(who):''} ${badges.join('')}</span></div>`;
   }).join('');
-  box.innerHTML = '<div class="card-sub">出口 IP 时间线（相邻不变已合并）</div>' + items;
+
+  // The database keeps this richer timeline separate from legacy
+  // ``ip_changes``.  Treat every value as untrusted text before composing the
+  // detail HTML; old databases may contain missing or hand-edited fields.
+  const repTruthy = v => v===true || v===1 || v==='1' || v==='true';
+  const repWorsened = c => repTruthy(c.same_ip_reputation_worsened) ||
+                           repTruthy(c.reputation_worsened) ||
+                           repTruthy(c.reputation_degraded);
+  const repClassLabel = c => {
+    const raw = c && c.classification;
+    const category = raw && typeof raw==='object' ? raw.category : raw;
+    const confidence = c && c.confidence!=null ? Number(c.confidence) : NaN;
+    if(category==='residential')
+      return Number.isFinite(confidence) && confidence>=80 ? '高置信度住宅 ISP' : '疑似住宅';
+    return INTEL_KIND_LABEL[category] || '未知';
+  };
+  const repValue = v => v==null || v==='' ? '-' : esc(v);
+  const repItems = reputation.map(c=>{
+    const ip = c.exit_ip || c.exit_ipv4 || c.exit_ipv6 || '?';
+    const confidence = c.confidence!=null ? ` · Confidence ${repValue(c.confidence)}%` : '';
+    const worsened = repWorsened(c);
+    const warning = worsened ? '<span class="tag bad">⚠ 同 IP 信誉明显恶化</span>' : '';
+    return `<div class="ip-item rep-item${worsened?' rep-warn':''}">` +
+      `<span class="ip-ts">${esc(String(c.ts||'').slice(0,16))}</span>` +
+      `<span class="rep-content"><span class="mono">${repValue(ip)}</span>` +
+      ` · ${esc(repClassLabel(c))}${confidence}` +
+      ` · Grade ${repValue(c.ip_grade || c.grade)}` +
+      ` · IPQS ${repValue(c.ipqs_fraud_score)}` +
+      ` · Scamalytics ${repValue(c.scamalytics_score)} ${warning}</span></div>`;
+  }).join('');
+  const deterioration = reputation.some(repWorsened);
+  const warningHtml = deterioration
+    ? '<div class="leak-warning"><b>⚠ 同一出口 IP 的信誉明显恶化</b>：请对照该 IP 的历史记录与各 Provider 分项指标。</div>'
+    : '';
+  box.innerHTML =
+    (changes.length ? '<div class="card-sub">出口 IP 时间线（相邻不变已合并）</div>' + items : '') +
+    (reputation.length ? '<div class="card-sub rep-title">IP Intelligence 历史（按出口 IP）</div>' + warningHtml + repItems : '');
 }
 
 /* ==================== 订阅视图 ==================== */
@@ -597,7 +752,7 @@ async function renderSubsNodes(forName){
   sortRows(rows, 'score', false);
   tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
     readonly:true, currentNode:'', favs:{has(){return false}},
-    expanded:false, selected:false,
+    expanded:false, selected:false, intelColumns:false,
   })).join('');
 }
 
@@ -813,8 +968,184 @@ function quitPanel(){
   });
 }
 
+/* ==================== IP Intelligence / Leak Audit ==================== */
+// Credentials deliberately have no localStorage representation.  These
+// variables contain only the latest leak candidate result in page memory.
+let lastLeakPayload = null;
+let lastLeakEvaluation = null;
+
+function providerStatusLabel(name, item){
+  const labels = {'ip-api':'ip-api', ipinfo:'IPinfo', ipqs:'IPQS', scamalytics:'Scamalytics'};
+  const text = item && item.status ? item.status : 'unknown';
+  const configured = item && item.configured ? '✓' : '未配置';
+  const cache = item && item.cache ? ` · ${esc(item.cache)}` : '';
+  return `<div class="provider-status"><b>${esc(labels[name]||name)}</b><span>${esc(configured)} · ${esc(text)}${cache}</span></div>`;
+}
+
+async function loadProviderStatus(){
+  const box = document.getElementById('provider-status');
+  if(!box) return;
+  try{
+    const data = await getJSON('/api/ip-intel/status');
+    const providers = data && data.providers || {};
+    const names = ['ip-api','ipinfo','ipqs','scamalytics'];
+    box.innerHTML = names.map(n=>providerStatusLabel(n, providers[n]||{})).join('');
+  }catch(e){ box.textContent = 'Provider 状态暂时不可用'; }
+}
+
+function setLeakStatus(evaluation){
+  const box = document.getElementById('leak-status');
+  if(!box) return;
+  const state = evaluation && evaluation.status || 'unknown';
+  box.className = `leak-status ${esc(state)}`;
+  box.textContent = evaluation && evaluation.status_text || '无法确认';
+  const summary = document.getElementById('leak-summary');
+  if(summary){
+    const n = evaluation && evaluation.candidates ? evaluation.candidates.length : 0;
+    summary.textContent = `已收到 ${n} 个 ICE candidate。${evaluation && evaluation.notes && evaluation.notes.length ? evaluation.notes.join('；') : '结果为当前浏览器环境的 best-effort 判断。'}`;
+  }
+}
+
+function renderLeakDetails(evaluation){
+  const box = document.getElementById('leak-details');
+  if(!box) return;
+  const candidates = (evaluation && evaluation.candidates)||[];
+  const warnings = (evaluation && evaluation.warnings)||[];
+  const notes = (evaluation && evaluation.notes)||[];
+  const rows = candidates.map(c=>`<tr><td>${esc(c.type||'-')}</td><td class="mono">${esc(c.address||'-')}</td><td>${esc(c.protocol||'-')}</td></tr>`).join('');
+  const warningHtml = warnings.length ? `<div class="leak-warning"><b>⚠ 需要注意</b><ul>${warnings.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const noteHtml = notes.length ? `<div class="card-sub">${notes.map(x=>esc(x)).join('；')}</div>` : '';
+  box.innerHTML = `${warningHtml}${noteHtml}<div class="table-wrap"><table class="compact"><thead><tr><th>类型</th><th>地址</th><th>协议</th></tr></thead><tbody>${rows||'<tr><td colspan="3">没有可显示的 candidate</td></tr>'}</tbody></table></div>`;
+}
+
+async function browserExitIp(url){
+  try{
+    const response = await fetch(url, {cache:'no-store'});
+    const data = await response.json();
+    const ip = data && data.ip;
+    return typeof ip === 'string' ? ip : null;
+  }catch(e){ return null; }
+}
+
+function collectWebRTCCandidates(){
+  if(typeof RTCPeerConnection !== 'function')
+    return Promise.resolve({candidates:[], collection_complete:false, policy_blocked:true});
+  return new Promise(resolve=>{
+    const candidates = [];
+    let pc = null, done = false;
+    const finish = (error, blocked)=>{
+      if(done) return;
+      done = true;
+      try{ if(pc) pc.close(); }catch(e){}
+      resolve({candidates, collection_complete:!error && !blocked,
+               collection_error:error||null, policy_blocked:!!blocked});
+    };
+    try{
+      pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+      pc.onicecandidate = event=>{
+        if(!event || !event.candidate) return;
+        let item = event.candidate;
+        try{ if(typeof item.toJSON === 'function') item = item.toJSON(); }
+        catch(e){}
+        // Keep only the standard browser fields/a-line.  No credentials or
+        // third-party provider data are sent with the audit request.
+        candidates.push({type:item.type, address:item.address, protocol:item.protocol,
+                         port:item.port, candidate:item.candidate});
+      };
+      pc.onicegatheringstatechange = ()=>{
+        if(pc.iceGatheringState === 'complete') finish(null, false);
+      };
+      pc.createDataChannel('speedbench-leak');
+      pc.createOffer().then(offer=>pc.setLocalDescription(offer))
+        .catch(()=>finish('stun_failed', false));
+      setTimeout(()=>finish('stun_timeout', false), 7000);
+    }catch(e){ finish('webrtc_unavailable', true); }
+  });
+}
+
+async function runLeakAudit(){
+  const run = document.getElementById('btn-leak-run');
+  if(run){ run.disabled = true; run.textContent = '检测中…'; }
+  setLeakStatus({status:'unknown', status_text:'正在采集 WebRTC candidate…'});
+  try{
+    const [exit_ipv4, exit_ipv6, gathered] = await Promise.all([
+      browserExitIp('https://api.ipify.org?format=json'),
+      browserExitIp('https://api6.ipify.org?format=json'),
+      collectWebRTCCandidates(),
+    ]);
+    const payload = Object.assign({}, gathered, {exit_ipv4, exit_ipv6});
+    lastLeakPayload = payload;
+    const evaluation = await post('/api/leak/evaluate', payload);
+    lastLeakEvaluation = evaluation;
+    setLeakStatus(evaluation); renderLeakDetails(evaluation);
+    const save = document.getElementById('btn-leak-save');
+    if(save) save.disabled = !evaluation || !!evaluation.msg;
+  }catch(e){
+    lastLeakPayload = null; lastLeakEvaluation = null;
+    const evaluation = {status:'unknown', status_text:'无法确认', notes:['浏览器出口或本地 API 不可用']};
+    setLeakStatus(evaluation); renderLeakDetails(evaluation);
+  }finally{
+    if(run){ run.disabled = false; run.textContent = '开始 WebRTC 检测'; }
+  }
+}
+
+async function saveLeakAudit(){
+  if(!lastLeakPayload) return;
+  const payload = Object.assign({}, lastLeakPayload);
+  payload.dns_status = (document.getElementById('dns-status')||{}).value || 'unknown';
+  try{
+    const result = await post('/api/leak/audit', payload);
+    if(result && result.persistence && result.persistence.saved) toast('泄漏审计已保存');
+    else toast('审计结果已完成，但历史库暂不可用', false);
+    loadLeakHistory();
+  }catch(e){ toast('保存审计失败', false); }
+}
+
+function renderLeakHistory(data){
+  const box = document.getElementById('leak-history');
+  if(!box) return;
+  const rows = data && data.audits || [];
+  if(!rows.length){ box.textContent = data && data.available===false ? '历史库尚未提供 leak_audits 接口' : '尚无本地保存记录'; return; }
+  box.innerHTML = rows.map(x=>`<div class="history-chip"><b>${esc(x.created_at||x.ts||'-')}</b> · ${esc(x.webrtc_status||'unknown')} · DNS ${esc(x.dns_status||'unknown')}</div>`).join('');
+}
+
+async function loadLeakHistory(){
+  try{ renderLeakHistory(await getJSON('/api/leak/audits?limit=20')); }
+  catch(e){ renderLeakHistory({audits:[]}); }
+}
+
+async function saveIpIntelSettings(){
+  const body = {
+    ipinfo_token: (document.getElementById('setting-ipinfo-token')||{}).value || '',
+    ipqs_key: (document.getElementById('setting-ipqs-key')||{}).value || '',
+    scamalytics_username: (document.getElementById('setting-scamalytics-username')||{}).value || '',
+    scamalytics_key: (document.getElementById('setting-scamalytics-key')||{}).value || '',
+    scamalytics_region: (document.getElementById('setting-scamalytics-region')||{}).value || '',
+  };
+  try{
+    const result = await post('/api/ip-intel/settings', body);
+    const msg = document.getElementById('settings-msg');
+    if(msg) msg.textContent = result.msg || (result.ok ? '已更新' : '更新失败');
+    if(result.ok) loadProviderStatus();
+  }catch(e){ const msg=document.getElementById('settings-msg'); if(msg) msg.textContent='设置请求失败'; }
+}
+
+function clearIpIntelSettings(){
+  for(const id of ['setting-ipinfo-token','setting-ipqs-key','setting-scamalytics-username','setting-scamalytics-key']){
+    const el=document.getElementById(id); if(el) el.value='';
+  }
+  const region=document.getElementById('setting-scamalytics-region'); if(region) region.value='';
+  saveIpIntelSettings();
+}
+
+function openDnsAudit(url){
+  // noopener/noreferrer is explicit; the target pages are never scraped.
+  try{ const child=window.open(url, '_blank', 'noopener,noreferrer'); if(child) child.opener=null; }
+  catch(e){}
+}
+
 /* ==================== hash 路由 ==================== */
-const VIEWS = ['nodes','history','subs','about'];
+const VIEWS = ['nodes','history','subs','leak','settings','about'];
 function currentView(){
   let h = '';
   try{ h = (window.location && window.location.hash) || ''; }catch(e){ h=''; }
@@ -837,6 +1168,8 @@ function route(){
   if(v==='subs'){
     if(!subsLoaded) loadSubs(); else if(subsSel) drawSubsChart();
   }
+  if(v==='leak') loadLeakHistory();
+  if(v==='settings') loadProviderStatus();
 }
 
 /* ==================== 事件绑定（全部 addEventListener/委托） ==================== */
@@ -930,6 +1263,16 @@ function init(){
   });
   document.getElementById('btn-run').addEventListener('click', startRun);
   document.getElementById('btn-cancel').addEventListener('click', cancelRun);
+  const leakRun = document.getElementById('btn-leak-run');
+  if(leakRun) leakRun.addEventListener('click', runLeakAudit);
+  const leakSave = document.getElementById('btn-leak-save');
+  if(leakSave) leakSave.addEventListener('click', saveLeakAudit);
+  const settingsSave = document.getElementById('btn-settings-save');
+  if(settingsSave) settingsSave.addEventListener('click', saveIpIntelSettings);
+  const settingsClear = document.getElementById('btn-settings-clear');
+  if(settingsClear) settingsClear.addEventListener('click', clearIpIntelSettings);
+  for(const button of document.querySelectorAll('.dns-open'))
+    button.addEventListener('click', ()=>openDnsAudit(button.dataset.dnsUrl));
   // 退出按钮两处：导航底部 + 「关于」视图，复用同一 quitPanel
   document.getElementById('btn-quit').addEventListener('click', quitPanel);
   document.getElementById('btn-quit-2').addEventListener('click', quitPanel);

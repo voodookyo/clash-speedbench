@@ -28,7 +28,8 @@ from tests.web_server_case import TOKEN, WebServerCase
 SAFE_POST = "/api/run/cancel"
 # 未知路径用 ASCII：http.client 要求请求行可 ASCII 编码（浏览器会自动百分号转码）
 ALL_POST_PATHS = ("/api/run", "/api/switch", "/api/run/cancel", "/api/quit",
-                  "/no-such-endpoint")
+                  "/api/ip-intel/settings", "/api/leak/evaluate",
+                  "/api/leak/audit", "/no-such-endpoint")
 
 # 前端静态文件目录（v0.6：PAGE 内嵌字符串已抽成 web/ 下的真实文件）
 WEB_FILES = Path(web.__file__).resolve().parent / "web"
@@ -186,6 +187,25 @@ class FrontendSourceTest(unittest.TestCase):
         app_js = read_web("app.js")
         self.assertIn("addEventListener", app_js)
         self.assertIn("dataset.name", app_js)
+
+    def test_leak_and_settings_routes_are_static_and_no_secret_storage(self):
+        html = read_web("index.html")
+        app_js = read_web("app.js")
+        self.assertIn("#/leak", html)
+        self.assertIn("#/settings", html)
+        self.assertIn("RTCPeerConnection", app_js)
+        self.assertIn("stun:", app_js)
+        self.assertIn("noopener,noreferrer", app_js)
+        # Only the profile/favourite helpers may write localStorage.  API keys
+        # are sent directly to localhost and must never be persisted in the
+        # browser, URL, or cookie.
+        self.assertNotIn("lsSet('setting", app_js)
+        self.assertNotIn('lsSet("setting', app_js)
+        self.assertNotIn("document.cookie", app_js)
+        self.assertNotIn("/api/ip-intel/settings?", app_js)
+        # Guided DNS means no BrowserLeaks/DNSLeakTest HTML scraping or fetch.
+        self.assertNotIn("fetch('https://browserleaks.com", app_js)
+        self.assertNotIn("fetch('https://www.dnsleaktest.com", app_js)
 
 
 if __name__ == "__main__":

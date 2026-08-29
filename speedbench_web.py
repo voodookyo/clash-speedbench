@@ -36,6 +36,8 @@ from clash_speedbench import (  # noqa: E402
     pick_switch_group,
 )
 import speedbench_db  # noqa: E402
+import speedbench_ip_intel  # noqa: E402
+import speedbench_leak  # noqa: E402
 import speedbench_tray  # noqa: E402
 
 SCRIPT = HERE / "clash_speedbench.py"
@@ -83,6 +85,165 @@ WEB_TOKEN = secrets.token_hex(16)
 # 令牌同时写入数据目录（0600 仅本人可读），供本机受信脚本（SwiftBar 菜单栏
 # 插件等）调用写操作 API（如 /api/quit）。每次启动覆盖，面板停掉后自然失效。
 TOKEN_FILE = DATA_HOME / "web-token"
+
+# Optional IP Intelligence credentials supplied from the Web UI.  These
+# values intentionally live only in this process.  A key present in the
+# environment remains the default until the user explicitly clears it with
+# an empty value through the settings endpoint.  No value from this mapping
+# is ever returned by an API or written to STATE/history/SQLite.
+_IP_INTEL_SETTING_ENV = {
+    "ipinfo_token": "SPEEDBENCH_IPINFO_TOKEN",
+    "ipqs_key": "SPEEDBENCH_IPQS_KEY",
+    "scamalytics_username": "SPEEDBENCH_SCAMALYTICS_USERNAME",
+    "scamalytics_key": "SPEEDBENCH_SCAMALYTICS_KEY",
+    "scamalytics_region": "SPEEDBENCH_SCAMALYTICS_REGION",
+}
+_IP_INTEL_SETTING_LIMITS = {
+    "ipinfo_token": 512,
+    "ipqs_key": 512,
+    "scamalytics_username": 128,
+    "scamalytics_key": 512,
+    "scamalytics_region": 2,
+}
+_IP_INTEL_OVERRIDES = {}
+_IP_INTEL_SETTINGS_LOCK = threading.RLock()
+
+
+def _provider_config() -> speedbench_ip_intel.ProviderConfig:
+    """Return an env + in-memory credential snapshot without exposing it."""
+    values = {}
+    with _IP_INTEL_SETTINGS_LOCK:
+        for field, env_name in _IP_INTEL_SETTING_ENV.items():
+            if field in _IP_INTEL_OVERRIDES:
+                value = _IP_INTEL_OVERRIDES[field]
+            else:
+                value = os.environ.get(env_name)
+            if isinstance(value, str):
+                value = value.strip() or None
+            values[field] = value
+    region = values.get("scamalytics_region")
+    if region:
+        region = str(region).lower()
+    return speedbench_ip_intel.ProviderConfig(
+        ipinfo_token=values.get("ipinfo_token"),
+        ipqs_key=values.get("ipqs_key"),
+        scamalytics_username=values.get("scamalytics_username"),
+        scamalytics_key=values.get("scamalytics_key"),
+        scamalytics_region=region,
+    )
+
+
+def _provider_status_payload() -> dict:
+    """Configuration-only status; credentials never cross this boundary."""
+    try:
+        config = _provider_config()
+        providers = speedbench_ip_intel.make_default_providers(config=config)
+        statuses = speedbench_ip_intel.provider_status_snapshot(providers)
+    except Exception:
+        statuses = {
+            "ip-api": "error", "ipinfo": "error", "ipqs": "error",
+            "scamalytics": "error",
+        }
+    # If a recent run already queried a provider, surface its safe runtime
+    # state (cache_hit/rate_limited/quota_unavailable) alongside the current
+    # configuration state.  Only status strings are copied from history.
+    observed = {}
+    try:
+        recent = latest_record()
+        for item in (recent.get("results", []) if isinstance(recent, dict) else []):
+            for family in (item.get("intel_v4"), item.get("intel_v6")):
+                if not isinstance(family, dict):
+                    continue
+                values = family.get("provider_status")
+                if isinstance(values, dict):
+                    observed.update({str(k): str(v) for k, v in values.items()
+                                     if str(v) in speedbench_ip_intel.PROVIDER_STATUSES})
+    except Exception:
+        observed = {}
+    result = {}
+    for name, status in statuses.items():
+        # ``configured`` is deliberately a Boolean rather than a credential
+        # hint.  The status itself is one of the documented safe states.
+        result[name] = {
+            "configured": status == "ok",
+            "status": observed.get(name, status),
+            "cache": "available",
+        }
+    return {
+        "ok": True,
+        "providers": result,
+        "cache": {"available": True, "policy": "ip-api:7d,risk:24h"},
+    }
+
+
+def _provider_env_snapshot() -> dict:
+    """Copy subprocess environment and inject only the current credentials.
+
+    The command line and STATE log remain credential-free.  Explicitly
+    removing an inherited variable is important when the user cleared a
+    value in the in-memory settings form.
+    """
+    env = dict(os.environ)
+    config = _provider_config()
+    values = {
+        "SPEEDBENCH_IPINFO_TOKEN": config.ipinfo_token,
+        "SPEEDBENCH_IPQS_KEY": config.ipqs_key,
+        "SPEEDBENCH_SCAMALYTICS_USERNAME": config.scamalytics_username,
+        "SPEEDBENCH_SCAMALYTICS_KEY": config.scamalytics_key,
+        "SPEEDBENCH_SCAMALYTICS_REGION": config.scamalytics_region,
+    }
+    for name, value in values.items():
+        env.pop(name, None)
+        if value:
+            env[name] = value
+    return env
+
+
+def _redact_runtime_text(value: object) -> str:
+    """Redact in-memory provider credentials before a line reaches STATE."""
+    text = str(value)
+    try:
+        config = _provider_config()
+        for secret in (config.ipinfo_token, config.ipqs_key,
+                       config.scamalytics_username, config.scamalytics_key):
+            if secret:
+                text = text.replace(str(secret), "[REDACTED]")
+    except Exception:
+        pass
+    # Also cover common credential query parameter forms if a future provider
+    # emits a malformed error before its own sanitizer runs.
+    text = re.sub(r"(?i)([?&](?:key|token|api[_-]?key|authorization)=)[^&\s]+",
+                  r"\1[REDACTED]", text)
+    return text
+
+
+def _set_ip_intel_settings(payload: object) -> tuple:
+    """Validate and update memory-only settings.
+
+    Returns ``(ok, message)``.  Messages contain field names/status only and
+    never reflect the submitted value, which keeps API errors safe to display.
+    """
+    if not isinstance(payload, dict):
+        return False, "请求格式无效"
+    unknown = [key for key in payload if key not in _IP_INTEL_SETTING_ENV]
+    if unknown:
+        return False, "存在不支持的设置项"
+    updates = {}
+    for field, value in payload.items():
+        if value is None:
+            updates[field] = None
+            continue
+        if not isinstance(value, str):
+            return False, "设置值必须是文本"
+        value = value.strip()
+        if len(value) > _IP_INTEL_SETTING_LIMITS[field]:
+            return False, "设置值过长"
+        if field == "scamalytics_region" and value and value.lower() not in {"us", "eu"}:
+            return False, "Scamalytics 区域必须是 us 或 eu"
+        updates[field] = value.lower() if field == "scamalytics_region" and value else (value or None)
+    with _IP_INTEL_SETTINGS_LOCK:
+        _IP_INTEL_OVERRIDES.update(updates)
+    return True, "设置已更新（仅驻留内存）"
 
 
 def write_token_file() -> None:
@@ -201,7 +362,7 @@ def run_benchmark(params: dict) -> None:
             if flags:
                 popen_kwargs["creationflags"] = flags
         # 把哨兵文件路径传给子进程（clash_speedbench.py 的 cancel_requested）
-        env = dict(os.environ)
+        env = _provider_env_snapshot()
         env["SPEEDBENCH_CANCEL_FILE"] = str(CANCEL_FILE)
         proc = subprocess.Popen(
             cmd, cwd=str(DATA_HOME), env=env,
@@ -213,7 +374,7 @@ def run_benchmark(params: dict) -> None:
             STATE["proc"] = proc
         assert proc.stdout is not None
         for line in proc.stdout:
-            line = line.rstrip("\n")
+            line = _redact_runtime_text(line.rstrip("\n"))
             with STATE_LOCK:
                 STATE["lines"].append(line)
                 if len(STATE["lines"]) > MAX_LINES:
@@ -221,7 +382,7 @@ def run_benchmark(params: dict) -> None:
         STATE["exit_code"] = proc.wait()
     except Exception as e:
         with STATE_LOCK:
-            STATE["lines"].append(f"!! 启动测速失败: {e}")
+            STATE["lines"].append(f"!! 启动测速失败: {_redact_runtime_text(e)}")
             STATE["exit_code"] = -1
     finally:
         with STATE_LOCK:
@@ -232,7 +393,7 @@ def run_benchmark(params: dict) -> None:
             sync_db()
         except Exception as e:
             with STATE_LOCK:
-                STATE["lines"].append(f"!! 历史入库失败: {e}")
+                STATE["lines"].append(f"!! 历史入库失败: {_redact_runtime_text(e)}")
 
 
 def cancel_benchmark() -> dict:
@@ -307,6 +468,115 @@ def get_current() -> dict:
         return {"ok": False, "msg": str(e)}
 
 
+def _basic_ip_lookup(ip: str) -> dict:
+    """Basic, non-reputation lookup used only for China/Unicom leak hints.
+
+    Tests replace ``LEAK_BASIC_LOOKUP`` with a fixture.  This fallback uses
+    the existing no-key ip-api provider and never calls IPinfo/IPQS/
+    Scamalytics; leak candidates therefore cannot consume paid reputation
+    quota.
+    """
+    try:
+        provider = speedbench_ip_intel.IpApiProvider()
+        result = provider.query(ip)
+        if result.ok:
+            return dict(result.normalized)
+    except Exception:
+        pass
+    return {}
+
+
+# Injectable for tests and for installations that provide their own basic
+# lookup.  It is intentionally not an IP reputation provider.
+LEAK_BASIC_LOOKUP = _basic_ip_lookup
+
+
+def _evaluate_leak_payload(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        return {"ok": False, "status": "unknown", "status_text": "无法确认",
+                "msg": "请求格式无效"}
+    # Explicit allow-list: provider fields, API keys and arbitrary URLs are
+    # not accepted by this endpoint and cannot accidentally reach a vendor.
+    candidates = payload.get("candidates", payload.get("ice_candidates", []))
+    if not isinstance(candidates, (list, tuple, str, dict)):
+        candidates = []
+    evaluation = speedbench_leak.evaluate_webrtc(
+        candidates,
+        exit_ipv4=payload.get("exit_ipv4", payload.get("ipv4")),
+        exit_ipv6=payload.get("exit_ipv6", payload.get("ipv6")),
+        basic_lookup=LEAK_BASIC_LOOKUP,
+        collection_complete=bool(payload.get("collection_complete", True)),
+        collection_error=payload.get("collection_error"),
+        policy_blocked=bool(payload.get("policy_blocked", False)),
+    )
+    return evaluation.to_dict()
+
+
+def _save_leak_audit(audit: dict) -> dict:
+    """Best-effort adapter for the additive DB API.
+
+    Older databases/modules have no leak table yet.  The UI should continue
+    to work and report ``available=False`` instead of failing the audit.
+    """
+    fn = getattr(speedbench_db, "insert_leak_audit", None)
+    if not callable(fn):
+        return {"available": False, "saved": False, "status": "unavailable"}
+    try:
+        value = fn(db_path(), audit)
+        return {"available": True, "saved": True, "status": "ok",
+                "id": value if isinstance(value, (int, str)) else None}
+    except Exception:
+        return {"available": True, "saved": False, "status": "error"}
+
+
+def _load_leak_audits(limit: int = 20) -> dict:
+    fn = getattr(speedbench_db, "leak_audits", None)
+    if not callable(fn):
+        return {"ok": True, "available": False, "audits": []}
+    try:
+        rows = fn(db_path(), max(1, min(int(limit), 100)))
+        if not isinstance(rows, list):
+            rows = list(rows or [])
+        return {"ok": True, "available": True, "audits": rows}
+    except Exception:
+        return {"ok": True, "available": True, "audits": [], "status": "error"}
+
+
+def _load_ip_reputation_changes(name: str = "", node_key: str = "") -> list:
+    """Load the additive reputation timeline without requiring a new DB API.
+
+    The web panel is also used with databases/modules created by older
+    SpeedBench versions.  Keep this adapter deliberately best-effort: the
+    richer timeline is optional and a missing table/function must never make
+    the existing node endpoint fail.
+    """
+    fn = getattr(speedbench_db, "ip_reputation_changes", None)
+    if not callable(fn):
+        return []
+    try:
+        rows = fn(db_path(), name=name, node_key=node_key)
+    except TypeError:
+        # Compatibility with an intermediate implementation that accepted
+        # positional arguments only (or the old name-only signature).
+        try:
+            rows = fn(db_path(), name, node_key)
+        except TypeError:
+            try:
+                rows = fn(db_path(), name)
+            except Exception:
+                return []
+        except Exception:
+            return []
+    except Exception:
+        return []
+    if not isinstance(rows, list):
+        try:
+            rows = list(rows or [])
+        except Exception:
+            return []
+    return rows
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "SpeedBenchWeb/0.1"
 
@@ -325,7 +595,14 @@ class Handler(BaseHTTPRequestHandler):
                    "application/json; charset=utf-8")
 
     def _read_body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return {}
+        # Avoid allowing a malformed client to make the handler read an
+        # unbounded body.  The endpoint payloads are all tiny JSON objects.
+        if length < 0 or length > 1024 * 1024:
+            return {}
         if not length:
             return {}
         try:
@@ -368,6 +645,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(get_current())
         elif path == "/api/history":
             self._json(slim_history())
+        elif path == "/api/ip-intel/status":
+            # Configuration-only response.  Never serialize the ProviderConfig
+            # itself: it contains the in-memory credentials.
+            self._json(_provider_status_payload())
+        elif path in ("/api/leak/audits", "/api/leak/history"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                limit = int(qs.get("limit", ["20"])[0])
+            except (TypeError, ValueError):
+                limit = 20
+            self._json(_load_leak_audits(limit))
         elif path == "/api/node":
             # 单节点详情：近 N 天测速序列 + 出口 IP 变化时间线（SQL 参数化防注入）。
             # key= 按 node_key 查（订阅改名不断链）；无 key 时按 name，兼容旧行为。
@@ -384,6 +672,8 @@ class Handler(BaseHTTPRequestHandler):
                                                     node_key=key),
                 "ip_changes": (speedbench_db.ip_changes(db_path(), name)
                                if name else []),
+                "ip_reputation_changes": _load_ip_reputation_changes(
+                    name=name, node_key=key),
             })
         elif path == "/api/subscriptions":
             # 订阅维度汇总：按 provider 聚合近 N 天的可用率/速度/评分
@@ -455,6 +745,39 @@ class Handler(BaseHTTPRequestHandler):
             self._json(do_switch(name))
         elif path == "/api/run/cancel":
             self._json(cancel_benchmark())
+        elif path == "/api/ip-intel/settings":
+            ok, msg = _set_ip_intel_settings(self._read_body())
+            self._json({"ok": ok, "msg": msg}, 200 if ok else 400)
+        elif path == "/api/leak/evaluate":
+            payload = self._read_body()
+            self._json(_evaluate_leak_payload(payload))
+        elif path in ("/api/leak/audit", "/api/leak/save"):
+            body = self._read_body()
+            result = _evaluate_leak_payload(body)
+            # Invalid payloads are never persisted.  The evaluation itself is
+            # still returned so the browser can explain the failure.
+            if result.get("msg"):
+                self._json(result, 400)
+                return
+            evaluation = speedbench_leak.LeakEvaluation(
+                status=str(result.get("status", "unknown")),
+                status_text=str(result.get("status_text", "无法确认")),
+                complete=bool(result.get("complete", False)),
+                candidates=list(result.get("candidates") or []),
+                public_candidates=list(result.get("public_candidates") or []),
+                warnings=list(result.get("warnings") or []),
+                notes=list(result.get("notes") or []),
+                compared=bool(result.get("compared", False)),
+                exit_ipv4=result.get("exit_ipv4"),
+                exit_ipv6=result.get("exit_ipv6"),
+            )
+            dns_status = body.get("dns_status") if isinstance(body, dict) else None
+            if dns_status not in {"clear", "warning", "unknown"}:
+                dns_status = None
+            saved = _save_leak_audit(speedbench_leak.make_audit_record(
+                evaluation, dns_status=dns_status))
+            result["persistence"] = saved
+            self._json(result)
         elif path == "/api/quit":
             with STATE_LOCK:
                 busy = STATE["running"]
