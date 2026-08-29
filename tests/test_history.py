@@ -65,7 +65,11 @@ class ResultToDictTest(unittest.TestCase):
         expected_top = {"name", "provider", "node_key", "proto", "latency_ms",
                         "jitter_ms", "connect_ms", "median_mbps", "multi_mbps",
                         "best_mbps", "sample_mb", "samples_mbps", "score",
-                        "stars", "tags", "status", "fail_reason", "ip"}
+                        "stars", "tags", "status", "fail_reason", "ip",
+                        "probe_attempts", "probe_successes", "probe_failures",
+                        "probe_success_rate", "probe_loss_pct", "exit_ipv4",
+                        "exit_ipv6", "intel_v4", "intel_v6", "network_score",
+                        "ip_quality_score", "ip_grade", "dual_stack_inconsistent"}
         self.assertEqual(set(d), expected_top)
         expected_ip = {"exit_ip", "country", "country_code", "region", "city",
                        "isp", "org", "asn", "asname", "kind",

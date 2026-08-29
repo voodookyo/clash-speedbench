@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""compute_score（0.55/0.25/0.20 权重）与 make_tags 触发条件测试。"""
+"""Network/Overall score and make_tags regression tests."""
 import sys
 import unittest
 from pathlib import Path
@@ -36,20 +36,38 @@ class ComputeScoreTest(unittest.TestCase):
         r = mk_result(median=100.0, latency=80, ip=None)
         self.assertEqual(csb.compute_score(r), 100.0)
 
-    def test_weights_055_025_020(self):
-        # 带宽 20Mbps→20 分；延迟 224ms→(800-224)/720*100=80 分；proxy 标记→30 分
+    def test_network_weights_and_unknown_ip_do_not_add_points(self):
+        # 带宽 20Mbps→20 分；延迟 224ms→80 分；只有两个有效维度时归一化。
         r = mk_result(median=20.0, latency=224, ip=mk_ip(proxy=True))
-        self.assertEqual(csb.compute_score(r),
-                         round(0.55 * 20 + 0.25 * 80 + 0.20 * 30, 1))  # 37.0
+        self.assertEqual(csb.compute_network_score(r), 41.8)
+        self.assertEqual(csb.compute_score(r), 41.8)
 
     def test_bandwidth_capped_at_100(self):
         r = mk_result(median=250.0, latency=80, ip=None)
         self.assertEqual(csb.compute_score(r), 100.0)
 
     def test_latency_none_scores_zero_on_latency_part(self):
-        # 55 + 0 + 0.20*100 = 75
+        # Missing latency is omitted and the valid bandwidth dimension is
+        # normalized to 100; missing IP intelligence is not a 100-point bonus.
         r = mk_result(median=100.0, latency=None, ip=mk_ip(kind="ISP/非托管"))
-        self.assertEqual(csb.compute_score(r), 75.0)
+        self.assertEqual(csb.compute_score(r), 100.0)
+
+    def test_all_network_dimensions_full_marks(self):
+        r = mk_result(median=100.0, latency=80)
+        r.multi_mbps = 400.0
+        r.jitter_ms = 5.0
+        r.connect_ms = 100.0
+        r.probe_attempts = 10
+        r.probe_successes = 10
+        r.probe_failures = 0
+        r.probe_success_rate = 100.0
+        r.probe_loss_pct = 0.0
+        self.assertEqual(csb.compute_network_score(r), 100.0)
+
+    def test_available_ip_quality_uses_80_20_overall(self):
+        r = mk_result(median=100.0, latency=80)
+        r.ip_quality_score = 40.0
+        self.assertEqual(csb.compute_score(r), 88.0)
 
     def test_latency_extremes(self):
         self.assertEqual(csb.latency_score(80), 100.0)

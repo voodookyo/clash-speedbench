@@ -125,6 +125,9 @@ class FetchIpInfoTest(unittest.TestCase):
     def test_invalid_json_none(self):
         self.assertIsNone(self.run_fetch(self.proc(stdout="<html>blocked</html>")))
 
+    def test_non_object_json_none(self):
+        self.assertIsNone(self.run_fetch(self.proc(stdout='["success"]')))
+
     def test_status_fail_none(self):
         self.assertIsNone(self.run_fetch(self.proc(stdout='{"status":"fail"}')))
 
@@ -134,9 +137,9 @@ class FetchIpInfoTest(unittest.TestCase):
 
 
 class IpFlagScoreTest(unittest.TestCase):
-    def test_no_ip_or_not_ok_is_100(self):
-        self.assertEqual(csb.ip_flag_score(None), 100.0)
-        self.assertEqual(csb.ip_flag_score(csb.IpInfo()), 100.0)  # ok=False
+    def test_no_ip_or_not_ok_is_unknown_not_clean(self):
+        self.assertIsNone(csb.ip_flag_score(None))
+        self.assertIsNone(csb.ip_flag_score(csb.IpInfo()))  # ok=False
 
     def test_flag_scores(self):
         self.assertEqual(csb.ip_flag_score(csb.IpInfo(proxy=True, ok=True)), 30.0)

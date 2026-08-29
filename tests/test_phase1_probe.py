@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Phase 1 延迟改走主实例 /delay 的测试（全 mock，不起 mihomo、不连网）：
 
-- probe_latency_pool：10 路线程池并发打主实例 /delay、返回 {name: (lat, jit)} map、
+- probe_latency_pool：10 路线程池并发打主实例 /delay、返回 {name: ProbeStats} map（可解包为旧二元组）、
   探测期间把 api.timeout 放宽到 delay_timeout/1000+3s（更宽的旧值不收窄）、
   失败节点值为 (None, None)、进度行「Phase 1 粗筛 [N/M] ...（主实例）」与
   Web 端 app.js 进度正则 /\\[\\s*(\\d+)\\/(\\d+)\\]/ 匹配
@@ -123,7 +123,7 @@ class ProbeLatencyPoolTest(unittest.TestCase):
         seen = set()
         for line in lines:
             self.assertTrue(line.startswith("Phase 1 粗筛 "), line)
-            self.assertTrue(line.endswith("（主实例）"), line)
+            self.assertIn("（主实例", line)
             self.assertIn("74±2 ms", line)
             m = WEB_PROGRESS_RE.search(line)       # Web 端正则必须能解析
             self.assertIsNotNone(m, line)
@@ -153,7 +153,7 @@ class ProbeNodeInWorkerTest(unittest.TestCase):
 
     def test_given_latency_skips_reprobe(self):
         with mock.patch.object(sbw, "probe_latency") as pl, \
-                mock.patch.object(sbw, "fetch_ip_info", return_value=None):
+                mock.patch.object(sbw, "fetch_exit_ips", return_value=(None, None, None)):
             r = sbw._probe_node_in_worker(self.worker, "节点A", "ss",
                                           self.args, 120, 3.0)
         pl.assert_not_called()                          # 不在 worker 内重测
@@ -164,8 +164,9 @@ class ProbeNodeInWorkerTest(unittest.TestCase):
 
     def test_ip_profile_runs_with_given_latency(self):
         with mock.patch.object(sbw, "probe_latency") as pl, \
-                mock.patch.object(sbw, "fetch_ip_info",
-                                  return_value=IP_API_DATA) as fip:
+                mock.patch.object(sbw, "fetch_exit_ips",
+                                  return_value=("203.0.113.9", None,
+                                                IP_API_DATA)) as fip:
             r = sbw._probe_node_in_worker(self.worker, "节点A", "ss",
                                           self.args, 120, 3.0)
         pl.assert_not_called()
@@ -179,10 +180,11 @@ class ProbeNodeInWorkerTest(unittest.TestCase):
     def test_none_latency_falls_back_to_worker_reprobe(self):
         with mock.patch.object(sbw, "probe_latency",
                                return_value=(88, 1.5)) as pl, \
-                mock.patch.object(sbw, "fetch_ip_info", return_value=None):
+                mock.patch.object(sbw, "fetch_exit_ips", return_value=(None, None, None)):
             r = sbw._probe_node_in_worker(self.worker, "节点A", "ss",
                                           self.args, None, None)
-        pl.assert_called_once_with(self.worker.api, "节点A", self.args.delay_timeout)
+        pl.assert_called_once_with(self.worker.api, "节点A", self.args.delay_timeout,
+                                   count=3)
         self.assertEqual(r.status, "ok")
         self.assertEqual(r.latency_ms, 88)
         self.assertEqual(r.jitter_ms, 1.5)
@@ -288,6 +290,26 @@ class RunPoolMainApiTest(unittest.TestCase):
         self.assertEqual(by_name["B"].jitter_ms, 5.0)
         # Phase 2 照常串行精测连通节点
         self.assertEqual([c[1] for c in calls if c[0] == "speed"], ["A", "B"])
+
+    def test_no_ip_main_api_accepts_real_probe_stats(self):
+        # Production probe_latency_pool returns ProbeStats rather than a tuple.
+        # Keep this path covered because --no-ip skips the Phase 1 worker and
+        # therefore inspects latency_map directly.
+        main_api = mock.Mock(name="MainAPI")
+        stats = {
+            "A": csb.ProbeStats(100, 2.0, 3, 2, 1),
+            "B": csb.ProbeStats(200, 5.0, 3, 3, 0),
+        }
+        results, calls, worker_cls, _out = self._run(
+            mk_args(no_ip=True), main_api, stats)
+
+        self.assertFalse(any(c[0] == "probe" for c in calls))
+        by_name = {r.name: r for r in results}
+        self.assertEqual(by_name["A"].latency_ms, 100)
+        self.assertEqual(by_name["A"].probe_failures, 1)
+        self.assertEqual(by_name["A"].probe_loss_pct, 33.3)
+        self.assertEqual(by_name["B"].probe_successes, 3)
+        worker_cls.assert_called_once()
 
     def test_main_api_failure_nodes_fall_back_to_worker(self):
         main_api = mock.Mock(name="MainAPI")
@@ -413,6 +435,40 @@ class Phase1InterruptCleanupTest(unittest.TestCase):
         w.stop()
         w.stop()
         self.assertEqual(calls, ["terminate", "wait"])
+
+    def test_worker_start_failure_is_cleaned(self):
+        """A failed startup still owns a temp process/config and must stop it."""
+        started, stopped = [], []
+
+        class FailingWorker:
+            def __init__(self, *a, **k):
+                self.api = None
+                self.proxy_url = ""
+
+            def start(self):
+                started.append(self)
+                raise RuntimeError("startup failed")
+
+            def stop(self):
+                stopped.append(self)
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                sbw, "find_mihomo_bin", return_value="/fake/mihomo"))
+            stack.enter_context(mock.patch.object(
+                sbw, "extract_proxies", return_value=list(self.PROXIES)))
+            stack.enter_context(mock.patch.object(
+                sbw, "physical_interface", return_value="en0"))
+            stack.enter_context(mock.patch.object(
+                sbw, "build_hosts", return_value=dict(HOSTS)))
+            stack.enter_context(mock.patch.object(sbw, "Worker", FailingWorker))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            results = sbw.run_pool(
+                ["A", "B"], {"A": "ss", "B": "trojan"},
+                mk_args(workers=2), main_api=None)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual({id(w) for w in started}, {id(w) for w in stopped})
 
 
 if __name__ == "__main__":

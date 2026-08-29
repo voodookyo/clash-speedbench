@@ -3,10 +3,13 @@
 """
 Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速
 - Reads the running Mihomo controller API (TCP, Unix socket or Windows named pipe)
-- Measures per-node latency with Mihomo's /delay API
+- Measures per-node latency with Mihomo's /delay API and repeated
+  HTTP/HTTPS application-level probes
 - Temporarily switches Mihomo to GLOBAL mode for real download tests
 - Downloads through the running mixed-port with curl
-- Fetches exit-IP profile per node via ip-api.com (ASN/国家/ISP/机房托管·移动·代理标记)
+- Discovers IPv4/IPv6 exits through the tested proxy and keeps the legacy
+  ip-api profile; optional multi-source Intelligence is queried after exits
+  are deduplicated
 - Restores the original mode and proxy selections on exit
 - Renders a star-rated box table and writes a CSV report
 
@@ -20,6 +23,7 @@ import csv
 import getpass
 import hashlib
 import http.client
+import ipaddress
 import io
 import json
 import os
@@ -37,6 +41,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from speedbench_ip_intel import (
+    IpIntelCache,
+    IpIntelligence,
+    aggregate_ip_intelligence,
+    make_default_providers,
+)
 
 
 # Clash Verge Rev (recent versions) launches mihomo with -ext-ctl-unix instead of
@@ -59,6 +70,8 @@ DEFAULT_CONTROLLERS = tuple(
 )
 DEFAULT_DELAY_URL = "https://cp.cloudflare.com/generate_204"
 DEFAULT_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
+DEFAULT_IPIFY4_URL = "https://api.ipify.org?format=json"
+DEFAULT_IPIFY6_URL = "https://api6.ipify.org?format=json"
 # ip-api.com 免费端点（仅 HTTP）；每个节点经各自出口 IP 查询，45 次/分钟限制足够
 DEFAULT_IP_API_URL = (
     "http://ip-api.com/json/?fields=status,message,query,country,countryCode,"
@@ -397,6 +410,98 @@ class IpInfo:
 
 
 @dataclass
+class ProbeStats:
+    """Application-level HTTP/HTTPS probe statistics.
+
+    ``__iter__`` intentionally yields only the legacy ``(latency, jitter)``
+    pair.  Existing callers can therefore continue to unpack the return value
+    while new callers retain the attempt/success/failure accounting required
+    for a meaningful application-level failure rate.
+    """
+
+    latency_ms: Optional[int] = None
+    jitter_ms: Optional[float] = None
+    attempts: int = 0
+    successes: int = 0
+    failures: int = 0
+
+    def __post_init__(self) -> None:
+        self.attempts = max(0, int(self.attempts))
+        self.successes = max(0, int(self.successes))
+        self.failures = max(0, int(self.failures))
+        if not self.attempts:
+            self.successes = 0
+            self.failures = 0
+        if self.attempts:
+            self.successes = min(self.successes, self.attempts)
+            self.failures = min(self.failures, self.attempts - self.successes)
+        # A caller may provide attempts and successes but omit failures.  Keep
+        # the three counters internally consistent without inventing attempts.
+        if self.attempts and self.successes + self.failures != self.attempts:
+            self.failures = max(0, self.attempts - self.successes)
+
+    @property
+    def success_rate(self) -> Optional[float]:
+        if self.attempts <= 0:
+            return None
+        return round(self.successes / self.attempts * 100.0, 1)
+
+    @property
+    def loss_pct(self) -> Optional[float]:
+        if self.attempts <= 0:
+            return None
+        return round(self.failures / self.attempts * 100.0, 1)
+
+    # Names used in persisted Result/history records.
+    @property
+    def probe_success_rate(self) -> Optional[float]:
+        return self.success_rate
+
+    @property
+    def probe_loss_pct(self) -> Optional[float]:
+        return self.loss_pct
+
+    def __iter__(self):
+        yield self.latency_ms
+        yield self.jitter_ms
+
+    def __len__(self) -> int:
+        # Keep the small tuple-like surface used by older callers/tests.
+        return 2
+
+    def __getitem__(self, index: int):
+        if index == 0:
+            return self.latency_ms
+        if index == 1:
+            return self.jitter_ms
+        raise IndexError(index)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, tuple) and len(other) == 2:
+            return (self.latency_ms, self.jitter_ms) == other
+        if not isinstance(other, ProbeStats):
+            return False
+        return (
+            self.latency_ms, self.jitter_ms, self.attempts,
+            self.successes, self.failures,
+        ) == (
+            other.latency_ms, other.jitter_ms, other.attempts,
+            other.successes, other.failures,
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "attempts": self.attempts,
+            "successes": self.successes,
+            "failures": self.failures,
+            "success_rate": self.success_rate,
+            "loss_pct": self.loss_pct,
+            "latency_ms": self.latency_ms,
+            "jitter_ms": self.jitter_ms,
+        }
+
+
+@dataclass
 class Result:
     name: str
     provider: str
@@ -414,6 +519,23 @@ class Result:
     multi_mbps: Optional[float] = None   # 4 路并发流合计峰值带宽（--multi）
     sample_mb: Optional[int] = None      # 实际带宽样本大小 MB（自适应时逐节点不同）
     node_key: str = ""                   # 节点稳定身份（proto|server|port 哈希），改名不断链
+    # Application-level probe counters; these are deliberately separate from
+    # ICMP/physical packet loss (the latter is not measured by SpeedBench).
+    probe_attempts: int = 0
+    probe_successes: int = 0
+    probe_failures: int = 0
+    probe_success_rate: Optional[float] = None
+    probe_loss_pct: Optional[float] = None
+    # Exit identities and multi-source intelligence.  ``ip`` remains the
+    # legacy ip-api-shaped IPv4 profile for old JSONL/UI consumers.
+    exit_ipv4: Optional[str] = None
+    exit_ipv6: Optional[str] = None
+    intel_v4: Optional[IpIntelligence] = None
+    intel_v6: Optional[IpIntelligence] = None
+    network_score: Optional[float] = None
+    ip_quality_score: Optional[float] = None
+    ip_grade: Optional[str] = None
+    dual_stack_inconsistent: bool = False
 
 
 def detect_controller(secret: str, explicit: Optional[str]) -> Tuple[str, bool]:
@@ -674,20 +796,86 @@ def multi_stream_speed(proxy_url: str, byte_count: int, max_time: float,
     return round(sum(speeds), 3) if speeds else None
 
 
+def _probe_count_from_args(args: Any) -> int:
+    """Resolve the CLI probe mode while keeping old test namespaces valid."""
+    explicit = getattr(args, "probe_count", None)
+    if explicit is not None:
+        try:
+            return max(1, int(explicit))
+        except (TypeError, ValueError):
+            return 3
+    return 10 if bool(getattr(args, "stability", False)) else 3
+
+
+def _coerce_probe_stats(value: Any, attempts: Optional[int] = None) -> ProbeStats:
+    """Accept new ProbeStats and old two-item tuple test doubles."""
+    if isinstance(value, ProbeStats):
+        return value
+    try:
+        latency, jitter = value
+    except (TypeError, ValueError):
+        latency, jitter = None, None
+    # A two-value legacy result carries no counter metadata.  Use the requested
+    # attempt count when available, which accurately reflects the normal path;
+    # test doubles can still return a tuple without breaking callers.
+    n = max(0, int(attempts or 0))
+    successes = n if latency is not None else 0
+    failures = max(0, n - successes)
+    return ProbeStats(latency, jitter, n, successes, failures)
+
+
 def probe_latency(api: MihomoAPI, name: str, timeout_ms: int,
-                  count: int = 3) -> Tuple[Optional[int], Optional[float]]:
-    """多次延迟采样（首个样本兼作预热，遇失败即停止），
-    返回 (中位延迟 ms, 抖动=样本标准差 ms)；完全不通返回 (None, None)。"""
+                  count: int = 3) -> ProbeStats:
+    """Run independent application-level probes and retain failure counters.
+
+    A failed HTTP/HTTPS probe does not stop the remaining attempts.  The
+    returned object remains unpackable as the legacy ``(latency, jitter)``
+    pair, while exposing attempts/successes/failures and percentages for new
+    callers.  This is *not* ICMP packet loss measurement.
+    """
+    attempts = max(1, int(count))
     vals: List[float] = []
-    for _ in range(max(1, count)):
-        d = api.proxy_delay(name, DEFAULT_DELAY_URL, timeout_ms)
+    failures = 0
+    for _ in range(attempts):
+        try:
+            d = api.proxy_delay(name, DEFAULT_DELAY_URL, timeout_ms)
+        except Exception:
+            d = None
         if d is None:
-            break
-        vals.append(float(d))
+            failures += 1
+            continue
+        try:
+            vals.append(float(d))
+        except (TypeError, ValueError):
+            failures += 1
     if not vals:
-        return None, None
+        return ProbeStats(None, None, attempts, 0, failures)
     jitter = statistics.stdev(vals) if len(vals) > 1 else 0.0
-    return int(round(statistics.median(vals))), round(jitter, 1)
+    return ProbeStats(
+        int(round(statistics.median(vals))),
+        round(jitter, 1),
+        attempts,
+        len(vals),
+        failures,
+    )
+
+
+def _apply_probe_stats(result: Result, stats: Any,
+                       fallback_attempts: Optional[int] = None) -> Result:
+    """Copy probe counters onto a Result without changing its legacy fields."""
+    probe = _coerce_probe_stats(stats, attempts=fallback_attempts)
+    result.probe_attempts = probe.attempts
+    result.probe_successes = probe.successes
+    result.probe_failures = probe.failures
+    result.probe_success_rate = probe.success_rate
+    result.probe_loss_pct = probe.loss_pct
+    # ProbeStats is authoritative for latency/jitter when a caller supplied it;
+    # a tuple fallback is intentionally also accepted for compatibility.
+    if result.latency_ms is None and probe.latency_ms is not None:
+        result.latency_ms = probe.latency_ms
+    if result.jitter_ms is None and probe.jitter_ms is not None:
+        result.jitter_ms = probe.jitter_ms
+    return result
 
 
 def fetch_ip_info(proxy_url: str, timeout: float) -> Optional[dict]:
@@ -707,7 +895,7 @@ def fetch_ip_info(proxy_url: str, timeout: float) -> Optional[dict]:
                            encoding="utf-8", errors="replace",
                            timeout=timeout + 5,
                            **_no_window_kwargs())
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         return None
     if p.returncode != 0 or not p.stdout:
         return None
@@ -715,9 +903,112 @@ def fetch_ip_info(proxy_url: str, timeout: float) -> Optional[dict]:
         data = json.loads(p.stdout)
     except json.JSONDecodeError:
         return None
+    if not isinstance(data, dict):
+        return None
     if data.get("status") != "success":
         return None
     return data
+
+
+def fetch_exit_ip(proxy_url: str, timeout: float,
+                  ipv6: bool = False) -> Optional[str]:
+    """Discover one exit address through the tested proxy.
+
+    ``api6.ipify.org`` is IPv6-only, so it naturally reports ``None`` when a
+    node or its worker cannot reach IPv6.  We do not pass ``--ipv6`` to curl:
+    that flag would force the localhost HTTP proxy connection itself onto an
+    IPv6 socket on systems where the proxy only listens on 127.0.0.1.  Mihomo
+    resolves the IPv6-only destination according to its worker IPv6 setting.
+    """
+    url = DEFAULT_IPIFY6_URL if ipv6 else DEFAULT_IPIFY4_URL
+    cmd = [
+        "curl", "--proxy", proxy_url, "--silent", "--show-error",
+        "--connect-timeout", str(min(4.0, timeout)),
+        "--max-time", str(timeout), url,
+    ]
+    try:
+        p = subprocess.run(
+            cmd, text=True, capture_output=True, encoding="utf-8",
+            errors="replace", timeout=timeout + 5, **_no_window_kwargs()
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if p.returncode != 0 or not p.stdout:
+        return None
+    try:
+        payload = json.loads(p.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    value = payload.get("ip") if isinstance(payload, dict) else payload
+    try:
+        parsed = ipaddress.ip_address(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if ipv6 and parsed.version != 6:
+        return None
+    if not ipv6 and parsed.version != 4:
+        return None
+    return str(parsed)
+
+
+def _coerce_exit_family(value: Any, version: int) -> Optional[str]:
+    """Validate an exit address at the aggregate boundary as well.
+
+    ``fetch_exit_ip`` already validates its subprocess response, but keeping
+    this second guard makes ``fetch_exit_ips`` safe when a transport/test
+    adapter is replaced or returns a value from the wrong address family.
+    """
+    try:
+        parsed = ipaddress.ip_address(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return str(parsed) if parsed.version == version else None
+
+
+def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
+    """Return ``(IPv4, IPv6, legacy ip-api payload)`` for one tested node.
+
+    The three independent HTTP requests run together so a slow IPv6-only
+    endpoint cannot add a second or third full timeout to every node.  IPv4
+    uses ipify first and falls back to the existing ip-api self lookup after
+    all three requests have completed.  The third return value keeps the old
+    ``IpInfo`` mapping available to the rest of the application.  IPv6 failure
+    is a normal ``None`` outcome.
+    """
+    # Keep the ip-api self lookup for the legacy country/ISP profile.  It is
+    # intentionally submitted alongside both ipify calls: the query remains
+    # the documented IPv4 fallback, while a slow/failed source cannot multiply
+    # the per-node timeout.  Each worker is independent and failures are
+    # treated as unavailable data rather than aborting the node measurement.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            "ipv4": pool.submit(fetch_exit_ip, proxy_url, timeout, False),
+            "legacy": pool.submit(fetch_ip_info, proxy_url, timeout),
+            "ipv6": pool.submit(fetch_exit_ip, proxy_url, timeout, True),
+        }
+
+        def read(name: str):
+            try:
+                return futures[name].result()
+            except Exception:
+                return None
+
+    ipv4 = _coerce_exit_family(read("ipv4"), 4)
+    legacy = read("legacy")
+    ipv6 = _coerce_exit_family(read("ipv6"), 6)
+
+    # Keep the fallback after all requests are joined.  Do not trust an
+    # arbitrary ip-api query value: validate that it really is IPv4 so a
+    # malformed/dual-stack response cannot populate the IPv4 field.
+    if ipv4 is None and legacy:
+        candidate = legacy.get("query")
+        try:
+            parsed = ipaddress.ip_address(str(candidate).strip())
+            if parsed.version == 4:
+                ipv4 = str(parsed)
+        except (TypeError, ValueError):
+            pass
+    return ipv4, ipv6, legacy
 
 
 def classify_ip(data: dict) -> IpInfo:
@@ -773,12 +1064,100 @@ def bandwidth_score(mbps: Optional[float]) -> float:
     return min(mbps, 100.0) / 100 * 100
 
 
-def ip_flag_score(ip: Optional[IpInfo]) -> float:
-    """IP 画像分项（启发式扣分，不是真实风险库评分）：
-    proxy 标记→30、hosting 标记→55、mobile 标记→80、无标记/查询失败/未知→100。
-    仅反映"代理/机房出口通常更可能被风控"的经验倾向，不代表该 IP 的真实风险等级。"""
-    if not ip or not ip.ok:
+def multi_bandwidth_score(mbps: Optional[float]) -> float:
+    """Score the optional four-stream aggregate on a 400 Mbps scale."""
+    if not mbps or mbps <= 0:
+        return 0.0
+    return min(float(mbps), 400.0) / 400.0 * 100.0
+
+
+def jitter_score(jitter_ms: Optional[float]) -> Optional[float]:
+    """Map jitter to a simple, testable 0-100 score.
+
+    Up to 5 ms is excellent; 200 ms or more is unusable.  Missing jitter is
+    omitted from the weighted network score rather than treated as a bonus or
+    penalty.
+    """
+    if jitter_ms is None:
+        return None
+    try:
+        value = float(jitter_ms)
+    except (TypeError, ValueError):
+        return None
+    if value <= 5:
         return 100.0
+    if value >= 200:
+        return 0.0
+    return (200.0 - value) / 195.0 * 100.0
+
+
+def connect_score(connect_ms: Optional[float]) -> Optional[float]:
+    """Map TCP/TLS connect time to a simple, testable 0-100 score."""
+    if connect_ms is None:
+        return None
+    try:
+        value = float(connect_ms)
+    except (TypeError, ValueError):
+        return None
+    if value <= 100:
+        return 100.0
+    if value >= 2000:
+        return 0.0
+    return (2000.0 - value) / 1900.0 * 100.0
+
+
+def probe_success_score(result: Result) -> Optional[float]:
+    """Return application-level probe success percentage when measured."""
+    value = result.probe_success_rate
+    if value is None and result.probe_attempts > 0:
+        value = result.probe_successes / result.probe_attempts * 100.0
+    if value is None:
+        return None
+    try:
+        return max(0.0, min(100.0, float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_network_score(r: Result) -> float:
+    """Compute the network-only score with valid-dimension re-normalization.
+
+    A valid single-stream bandwidth sample is a prerequisite.  Optional
+    multi-stream, latency, jitter, connect and application-level probe
+    dimensions are omitted when unavailable and the remaining weights are
+    normalized to 100.  This score contains no IP/reputation signal.
+    """
+    if r.median_mbps is None or r.median_mbps <= 0:
+        return 0.0
+    dimensions: List[Tuple[float, float]] = [(35.0, bandwidth_score(r.median_mbps))]
+    if r.multi_mbps is not None and r.multi_mbps > 0:
+        dimensions.append((15.0, multi_bandwidth_score(r.multi_mbps)))
+    if r.latency_ms is not None:
+        dimensions.append((20.0, latency_score(r.latency_ms)))
+    jitter = jitter_score(r.jitter_ms)
+    if jitter is not None:
+        dimensions.append((10.0, jitter))
+    connect = connect_score(r.connect_ms)
+    if connect is not None:
+        dimensions.append((10.0, connect))
+    probe = probe_success_score(r)
+    if probe is not None:
+        dimensions.append((10.0, probe))
+    total_weight = sum(weight for weight, _value in dimensions)
+    if total_weight <= 0:
+        return 0.0
+    return round(sum(weight * value for weight, value in dimensions) / total_weight, 1)
+
+
+def ip_flag_score(ip: Optional[IpInfo]) -> Optional[float]:
+    """Legacy IP marker helper.
+
+    It is retained for callers that display the old ip-api flags, but an
+    unavailable/unknown profile returns ``None``.  Unknown is never a clean
+    100-point IP result, and ``compute_score`` no longer uses this heuristic.
+    """
+    if not ip or not ip.ok:
+        return None
     if ip.proxy:
         return 30.0
     if ip.hosting:
@@ -789,12 +1168,205 @@ def ip_flag_score(ip: Optional[IpInfo]) -> float:
 
 
 def compute_score(r: Result) -> float:
-    """综合评分 0-100：带宽 55% + 延迟 25% + IP 标记 20%。不通的节点为 0。"""
-    bw = bandwidth_score(r.median_mbps)
-    if bw == 0.0:
-        return 0.0
-    lat = latency_score(r.latency_ms)
-    return round(0.55 * bw + 0.25 * lat + 0.20 * ip_flag_score(r.ip), 1)
+    """Compute Overall score from Network and optional IP quality.
+
+    IP quality is supplied only by the multi-source intelligence layer.  When
+    it is unavailable, Overall equals Network; there is no implicit 100-point
+    reward for an unknown/failed IP query.
+    """
+    network = compute_network_score(r)
+    r.network_score = network
+    # Accept callers that attach unified v4/v6 objects directly without first
+    # calling _apply_intelligence; this keeps the public scoring helper useful
+    # in tests and for future integrations.
+    if r.ip_quality_score is None:
+        quality_values = [intel.ip_quality_score for intel in (r.intel_v4, r.intel_v6)
+                          if intel is not None and intel.ip_quality_score is not None]
+        if quality_values:
+            r.ip_quality_score = min(quality_values)
+            worst = min(
+                (intel for intel in (r.intel_v4, r.intel_v6)
+                 if intel is not None and intel.ip_quality_score is not None),
+                key=_intel_risk_key,
+            )
+            r.ip_grade = worst.ip_grade
+    if r.ip_quality_score is None:
+        r.score = network
+    elif network <= 0.0:
+        # A node without a valid single-stream sample cannot earn an Overall
+        # score from reputation alone.  This preserves the bandwidth
+        # prerequisite even when an exit-IP provider happened to respond.
+        r.score = 0.0
+    else:
+        quality = max(0.0, min(100.0, float(r.ip_quality_score)))
+        r.ip_quality_score = round(quality, 1)
+        r.score = round(network * 0.80 + quality * 0.20, 1)
+    return r.score
+
+
+def _intel_dict(intel: Optional[IpIntelligence]) -> Optional[dict]:
+    """Serialize only normalized Intelligence fields (never provider raw data)."""
+    if intel is None:
+        return None
+    try:
+        data = intel.to_dict()
+    except Exception:
+        return None
+    # ``IpIntelligence.to_dict`` intentionally excludes ProviderResult.raw;
+    # keep this boundary explicit in case that model gains internal fields.
+    if isinstance(data, dict):
+        data.pop("provider_results", None)
+        data.pop("raw", None)
+    return data if isinstance(data, dict) else None
+
+
+def _intel_risk_key(intel: IpIntelligence) -> Tuple[int, float]:
+    """Sort usable IP quality results from worse to better."""
+    score = intel.ip_quality_score
+    if score is None:
+        return (1, 101.0)
+    return (0, float(score))
+
+
+def _apply_intelligence(result: Result, intel_by_ip: Dict[str, IpIntelligence]) -> Result:
+    """Attach v4/v6 Intelligence and derive node-level worst-IP summary."""
+    # Resolve the legacy ip-api identity before looking up intelligence.  Some
+    # callers only have the old ``Result.ip`` profile (for compatibility with
+    # v0.x history/test records), so doing the lookup first would silently
+    # discard an already-fetched normalized intelligence record.
+    if not result.exit_ipv4 and result.ip and result.ip.ok and result.ip.exit_ip:
+        result.exit_ipv4 = result.ip.exit_ip
+    if result.exit_ipv4:
+        result.intel_v4 = intel_by_ip.get(result.exit_ipv4)
+    if result.exit_ipv6:
+        result.intel_v6 = intel_by_ip.get(result.exit_ipv6)
+
+    usable = [intel for intel in (result.intel_v4, result.intel_v6)
+              if intel is not None and intel.ip_quality_score is not None]
+    worst = min(usable, key=_intel_risk_key) if usable else None
+    result.ip_quality_score = worst.ip_quality_score if worst else None
+    result.ip_grade = worst.ip_grade if worst else None
+
+    comparable: Dict[str, set] = {"country": set(), "asn": set(), "category": set()}
+    for intel in (result.intel_v4, result.intel_v6):
+        if intel is None:
+            continue
+        for key, value in (
+            ("country", intel.country),
+            ("asn", intel.asn),
+            ("category", intel.classification.category),
+        ):
+            if value and (key != "category" or value != "unknown"):
+                comparable[key].add(str(value).strip().lower())
+    result.dual_stack_inconsistent = any(len(values) > 1 for values in comparable.values())
+    return result
+
+
+class _IntelEnrichment:
+    """Asynchronous, deduplicated IP Intelligence coordinator.
+
+    One outer worker handles one unique exit IP.  Provider calls inside that
+    job are serial, keeping total external concurrency bounded by the outer
+    pool (2-4) instead of accidentally multiplying nested pools.
+    """
+
+    def __init__(self, args: Any):
+        history_value = getattr(args, "history", None)
+        history = Path(history_value) if history_value else Path(__file__).with_name(
+            "speedbench-history.jsonl"
+        )
+        self.cache = IpIntelCache(history.with_suffix(".db"))
+        timeout = float(getattr(args, "ip_timeout", 8.0) or 8.0)
+        self.providers = make_default_providers(timeout=timeout)
+        configured = getattr(args, "intel_workers", 3)
+        try:
+            workers = max(2, min(4, int(configured)))
+        except (TypeError, ValueError):
+            workers = 3
+        self.pool = ThreadPoolExecutor(max_workers=workers)
+        self.futures: Dict[str, Any] = {}
+        self.values: Dict[str, IpIntelligence] = {}
+
+    def _query_one(self, ip: str) -> IpIntelligence:
+        provider_results = self.cache.query_many(
+            ip, self.providers, max_workers=1
+        )
+        return aggregate_ip_intelligence(ip, provider_results)
+
+    def submit_ip(self, ip: Optional[str]) -> None:
+        if not ip or ip in self.futures:
+            return
+        try:
+            parsed = ipaddress.ip_address(str(ip))
+            normalized = str(parsed)
+        except (TypeError, ValueError):
+            return
+        if normalized in self.futures:
+            return
+        self.futures[normalized] = self.pool.submit(self._query_one, normalized)
+
+    def submit_result(self, result: Result) -> None:
+        if not result.exit_ipv4 and result.ip and result.ip.ok:
+            result.exit_ipv4 = result.ip.exit_ip or None
+        self.submit_ip(result.exit_ipv4)
+        self.submit_ip(result.exit_ipv6)
+
+    def finish(self) -> None:
+        try:
+            for ip, future in list(self.futures.items()):
+                try:
+                    value = future.result()
+                except Exception:
+                    # Intelligence is optional; retain the network result if a
+                    # provider/cache/database operation unexpectedly fails.
+                    continue
+                if isinstance(value, IpIntelligence):
+                    self.values[ip] = value
+        finally:
+            self.pool.shutdown(wait=True)
+
+    def apply(self, results: List[Result]) -> None:
+        for result in results:
+            _apply_intelligence(result, self.values)
+            compute_score(result)
+            result.tags = make_tags(result)
+
+
+def start_intelligence_enrichment(results: List[Result], args: Any) -> Optional[_IntelEnrichment]:
+    """Create an enrichment pool and submit all already-known exit IPs."""
+    if bool(getattr(args, "no_ip", False)):
+        return None
+    # Avoid creating the cache database at all when Phase 1 found no exits
+    # (important for --no-ip-like test doubles and failed nodes).
+    has_ip = any(
+        (result.exit_ipv4 or result.exit_ipv6 or
+         (result.ip and result.ip.ok and result.ip.exit_ip))
+        for result in results
+    )
+    if not has_ip:
+        return None
+    try:
+        enricher = _IntelEnrichment(args)
+    except Exception:
+        # Cache/provider setup is optional and must never abort network tests.
+        return None
+    for result in results:
+        enricher.submit_result(result)
+    if not enricher.futures:
+        enricher.pool.shutdown(wait=False)
+        return None
+    return enricher
+
+
+def finish_intelligence_enrichment(enricher: Optional[_IntelEnrichment],
+                                   results: List[Result]) -> None:
+    if enricher is None:
+        for result in results:
+            compute_score(result)
+            result.tags = make_tags(result)
+        return
+    enricher.finish()
+    enricher.apply(results)
 
 
 def star_str(score: float) -> str:
@@ -824,6 +1396,10 @@ def make_tags(r: Result) -> str:
             tags.append("机房托管")
         elif r.ip.kind == "代理/VPN":
             tags.append("脏IP")
+    if r.dual_stack_inconsistent:
+        # This describes the node's two observed proxy exits.  It is not a
+        # client-side IPv6 leak verdict (that belongs to the Leak Audit page).
+        tags.append("双栈出口不一致")
     return ",".join(tags)
 
 
@@ -874,7 +1450,8 @@ def print_speedbench(results: List[Result], top: int) -> None:
     ranked = rank_results(results)
     shown = ranked[:top] if top > 0 else ranked
 
-    headers = ["节点", "延迟", "抖动", "建连", "带宽", "评分", "IP画像", "标签"]
+    headers = ["节点", "延迟", "抖动", "建连", "带宽", "Network", "Overall",
+               "IP Grade", "IP画像", "应用层失败率", "标签"]
 
     def row_of(r: Result) -> List[str]:
         ip_desc = ip_brief(r.ip) if r.ip and r.ip.ok else "-"
@@ -890,8 +1467,11 @@ def print_speedbench(results: List[Result], top: int) -> None:
             "-" if r.jitter_ms is None else f"{r.jitter_ms:.1f}ms",
             "-" if r.connect_ms is None else f"{r.connect_ms:.0f}ms",
             bw,
+            "-" if r.network_score is None else f"{r.network_score:.1f}",
             star_str(r.score),
+            r.ip_grade or "N/A",
             ip_desc,
+            "-" if r.probe_loss_pct is None else f"{r.probe_loss_pct:.1f}%",
             r.tags or "-",
         ]
 
@@ -919,7 +1499,7 @@ def print_speedbench(results: List[Result], top: int) -> None:
     for row in rows:
         print(line(row))
     print(hline("└", "┴", "┘"))
-    print("  延迟/抖动/建连单位 ms │ 带宽 = 单流 Mbps（/ 后为 --multi 4 路合计峰值） │ 评分 = 带宽55% + 延迟25% + IP标记20%（启发式扣分，非风险评分）")
+    print("  延迟/抖动/建连单位 ms │ 带宽 = 单流 Mbps（/ 后为 --multi 4 路合计峰值） │ 应用层失败率 = HTTP/HTTPS application-level probe failure rate（非 ICMP packet loss）")
 
 
 def write_csv(results: List[Result], path: Path) -> None:
@@ -928,7 +1508,10 @@ def write_csv(results: List[Result], path: Path) -> None:
         w = csv.writer(f)
         w.writerow(["rank", "name", "provider", "protocol", "latency_ms", "jitter_ms",
                     "connect_ms", "median_mbps", "multi_mbps", "best_mbps", "sample_mb",
-                    "all_samples_mbps", "score", "stars", "tags",
+                    "all_samples_mbps", "network_score", "ip_quality_score", "ip_grade",
+                    "score", "stars", "tags", "probe_attempts", "probe_successes",
+                    "probe_failures", "probe_success_rate", "probe_loss_pct",
+                    "exit_ipv4", "exit_ipv6",
                     "exit_ip", "country", "asn", "asname", "isp", "org",
                     "ip_kind", "ip_flags", "status"])
         for rank, r in enumerate(ranked, 1):
@@ -949,9 +1532,19 @@ def write_csv(results: List[Result], path: Path) -> None:
                 "" if r.best_mbps is None else f"{r.best_mbps:.3f}",
                 "" if r.sample_mb is None else r.sample_mb,
                 "|".join(f"{x:.3f}" for x in r.speeds_mbps),
+                "" if r.network_score is None else f"{r.network_score:.1f}",
+                "" if r.ip_quality_score is None else f"{r.ip_quality_score:.1f}",
+                r.ip_grade or "",
                 f"{r.score:.1f}",
                 star_str(r.score),
                 r.tags,
+                r.probe_attempts,
+                r.probe_successes,
+                r.probe_failures,
+                "" if r.probe_success_rate is None else f"{r.probe_success_rate:.1f}",
+                "" if r.probe_loss_pct is None else f"{r.probe_loss_pct:.1f}",
+                r.exit_ipv4 or "",
+                r.exit_ipv6 or "",
                 ip.exit_ip, ip.country, ip.asn, ip.asname, ip.isp, ip.org,
                 ip.kind, ip_flags,
                 r.status,
@@ -1001,16 +1594,31 @@ def result_to_dict(r: Result) -> dict:
         "latency_ms": r.latency_ms,
         "jitter_ms": r.jitter_ms,
         "connect_ms": r.connect_ms,
+        "probe_attempts": r.probe_attempts,
+        "probe_successes": r.probe_successes,
+        "probe_failures": r.probe_failures,
+        "probe_success_rate": r.probe_success_rate,
+        "probe_loss_pct": r.probe_loss_pct,
         "median_mbps": None if r.median_mbps is None else round(r.median_mbps, 3),
         "multi_mbps": None if r.multi_mbps is None else round(r.multi_mbps, 3),
         "best_mbps": None if r.best_mbps is None else round(r.best_mbps, 3),
         "sample_mb": r.sample_mb,
         "samples_mbps": [round(x, 3) for x in r.speeds_mbps],
+        "network_score": r.network_score,
+        "ip_quality_score": r.ip_quality_score,
+        "ip_grade": r.ip_grade,
         "score": r.score,
         "stars": star_str(r.score),
         "tags": r.tags,
         "status": r.status,
         "fail_reason": classify_failure(r.status),
+        "exit_ipv4": r.exit_ipv4 or (ip.exit_ip if ip.ok else None),
+        "exit_ipv6": r.exit_ipv6,
+        "dual_stack_inconsistent": bool(r.dual_stack_inconsistent),
+        # These are normalized provider fields only.  ProviderResult.raw and
+        # all credentials remain strictly internal to the cache/provider layer.
+        "intel_v4": _intel_dict(r.intel_v4),
+        "intel_v6": _intel_dict(r.intel_v6),
         "ip": {
             "exit_ip": ip.exit_ip, "country": ip.country, "country_code": ip.country_code,
             "region": ip.region, "city": ip.city, "isp": ip.isp, "org": ip.org,
@@ -1087,7 +1695,7 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
     )
     write_csv(results, out)
     print(f"\nCSV 已保存: {out.resolve()}")
-    print("排序规则：按综合评分（带宽 55% + 延迟 25% + IP 标记 20%）从高到低。")
+    print("排序规则：按 Overall（Network + 可用 IP Quality，未知 IP 不加分）从高到低。")
     if any("未精测" in (r.tags or "") for r in results):
         print("注：「未精测」节点仅完成 Phase 1 粗筛（延迟/连通性/IP 画像），未参与带宽精测。")
     if not args.no_history:
@@ -1100,7 +1708,7 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速（延迟 + 真实带宽 + IP 画像）"
+        description="Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速（网络性能 + IP Intelligence）"
     )
     parser.add_argument("--controller",
                         help="External Controller，例如 http://127.0.0.1:9097、"
@@ -1121,10 +1729,16 @@ def main() -> int:
                         help="切换节点后等待秒数，默认 0.35")
     parser.add_argument("--delay-timeout", type=int, default=5000,
                         help="延迟测试超时毫秒，默认 5000")
+    parser.add_argument("--probe-count", type=int, default=None,
+                        help="HTTP/HTTPS application-level probe 次数，默认 3；与 --stability 同时指定时以本参数为准")
+    parser.add_argument("--stability", action="store_true",
+                        help="稳定性模式：未指定 --probe-count 时执行 10 次 application-level probe")
     parser.add_argument("--no-ip", action="store_true",
                         help="跳过出口 IP 画像查询（只测延迟和带宽）")
     parser.add_argument("--ip-timeout", type=float, default=8.0,
                         help="IP 画像查询超时秒数，默认 8")
+    parser.add_argument("--intel-workers", type=int, default=3,
+                        help="不同出口 IP 的 Intelligence 查询并发数（2~4，默认 3）")
     parser.add_argument("--top", type=int, default=0,
                         help="终端只显示前 N 名；0=全部")
     parser.add_argument("--limit", type=int, default=0,
@@ -1161,6 +1775,12 @@ def main() -> int:
         return 2
     if args.rounds < 1 or args.rounds > 5:
         print("错误：--rounds 建议范围 1~5。", file=sys.stderr)
+        return 2
+    if args.probe_count is not None and args.probe_count < 1:
+        print("错误：--probe-count 至少为 1。", file=sys.stderr)
+        return 2
+    if args.intel_workers < 1:
+        print("错误：--intel-workers 至少为 1。", file=sys.stderr)
         return 2
     if args.top_n < 1:
         print("错误：--top-n 至少为 1。", file=sys.stderr)
@@ -1317,6 +1937,7 @@ def main() -> int:
             return 0
 
     results: List[Result] = []
+    intel_enricher: Optional[_IntelEnrichment] = None
     saved_groups: Dict[str, Tuple[str, Optional[str]]] = {}
     mode_changed = False
 
@@ -1353,7 +1974,11 @@ def main() -> int:
                 results.append(res)
                 continue
 
-            latency, jitter = probe_latency(api, name, args.delay_timeout)
+            probe = probe_latency(
+                api, name, args.delay_timeout,
+                count=_probe_count_from_args(args),
+            )
+            latency, jitter = probe
 
             # 带宽采样：--mb 未显式指定时先 ~1MB 预热估速，再自适应样本大小
             mb = args.mb
@@ -1395,8 +2020,10 @@ def main() -> int:
             # Exit-IP profile through the same node (even when download failed,
             # an IP profile still tells whether the node is alive at all).
             ip = None
+            exit_ipv4 = None
+            exit_ipv6 = None
             if not args.no_ip:
-                data = fetch_ip_info(proxy_url, args.ip_timeout)
+                exit_ipv4, exit_ipv6, data = fetch_exit_ips(proxy_url, args.ip_timeout)
                 if data:
                     ip = classify_ip(data)
 
@@ -1416,7 +2043,20 @@ def main() -> int:
                 sample_mb=mb,
                 # /proxies 快照没有 server/port，node_key 走 proto|name 退化路径
                 node_key=node_key_of(str(info.get("type", "")), "", "", name),
+                exit_ipv4=exit_ipv4,
+                exit_ipv6=exit_ipv6,
             )
+            _apply_probe_stats(res, probe, fallback_attempts=_probe_count_from_args(args))
+            if not args.no_ip:
+                if (intel_enricher is None and
+                        (res.exit_ipv4 or res.exit_ipv6 or
+                         (res.ip and res.ip.ok and res.ip.exit_ip))):
+                    try:
+                        intel_enricher = _IntelEnrichment(args)
+                    except Exception:
+                        intel_enricher = None
+                if intel_enricher is not None:
+                    intel_enricher.submit_result(res)
             res.score = compute_score(res)
             res.tags = make_tags(res)
             results.append(res)
@@ -1427,6 +2067,8 @@ def main() -> int:
                 f"[{idx:>3}/{len(candidates)}] "
                 f"{name} | {fmt_ms(latency)} ms | "
                 f"{fmt_speed(median)}{multi_brief} Mbps（{mb}MB）{ip_txt}"
+                + (f" | application-level probe failure {res.probe_loss_pct:.1f}%"
+                   if res.probe_loss_pct is not None else "")
             )
 
     except KeyboardInterrupt:
@@ -1438,6 +2080,10 @@ def main() -> int:
                 api.patch("/configs", {"mode": original_mode})
             except Exception as e:
                 print(f"⚠️ 恢复原模式失败，请手动切回 {original_mode}: {e}", file=sys.stderr)
+
+    # Enrichment was submitted while the serial network work was in progress;
+    # only now wait for the deduplicated provider jobs and recompute Overall.
+    finish_intelligence_enrichment(intel_enricher, results)
 
     return report(results, args, api, proxies)
 

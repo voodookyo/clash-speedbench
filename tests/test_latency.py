@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""probe_latency：多次采样取中位数、jitter 为标准差、遇失败即停止。"""
+"""probe_latency：多次采样取中位数、jitter 为标准差并保留应用层失败率。"""
 import statistics
 import sys
 import unittest
@@ -38,19 +38,29 @@ class ProbeLatencyTest(unittest.TestCase):
         self.assertEqual(lat, 88)
         self.assertEqual(jitter, 0.0)
 
-    def test_stops_at_first_failure(self):
+    def test_continues_after_failure_and_tracks_loss(self):
         api = fake_api([100, None, 300])
-        lat, jitter = csb.probe_latency(api, "节点A", 5000, count=3)
-        self.assertEqual(lat, 100)          # 只采到第一个样本
-        self.assertEqual(jitter, 0.0)
-        self.assertEqual(api.proxy_delay.call_count, 2)  # 失败后不再继续
+        stats = csb.probe_latency(api, "节点A", 5000, count=3)
+        lat, jitter = stats
+        self.assertEqual(lat, 200)          # 成功样本为 [100, 300]
+        self.assertAlmostEqual(jitter, 141.4)
+        self.assertEqual(api.proxy_delay.call_count, 3)
+        self.assertEqual(stats.attempts, 3)
+        self.assertEqual(stats.successes, 2)
+        self.assertEqual(stats.failures, 1)
+        self.assertAlmostEqual(stats.loss_pct, 33.3)
 
     def test_all_failed_returns_none(self):
         api = fake_api([None])
-        lat, jitter = csb.probe_latency(api, "节点A", 5000)
+        stats = csb.probe_latency(api, "节点A", 5000)
+        lat, jitter = stats
         self.assertIsNone(lat)
         self.assertIsNone(jitter)
-        self.assertEqual(api.proxy_delay.call_count, 1)
+        self.assertEqual(api.proxy_delay.call_count, 3)
+        self.assertEqual(stats.attempts, 3)
+        self.assertEqual(stats.successes, 0)
+        self.assertEqual(stats.failures, 3)
+        self.assertEqual(stats.loss_pct, 100.0)
 
     def test_count_zero_still_probes_once(self):
         api = fake_api([77])
@@ -69,6 +79,15 @@ class ProbeLatencyTest(unittest.TestCase):
         api = fake_api(vals)
         _, jitter = csb.probe_latency(api, "节点A", 5000, count=3)
         self.assertEqual(jitter, round(statistics.stdev(vals), 1))
+
+    def test_ten_probes_nine_success_is_ten_percent_application_loss(self):
+        api = fake_api([100, 101, None, 99, 102, 100, 98, 101, 100, 99])
+        stats = csb.probe_latency(api, "节点A", 5000, count=10)
+        self.assertEqual(stats.attempts, 10)
+        self.assertEqual(stats.successes, 9)
+        self.assertEqual(stats.failures, 1)
+        self.assertEqual(stats.success_rate, 90.0)
+        self.assertEqual(stats.loss_pct, 10.0)
 
 
 if __name__ == "__main__":

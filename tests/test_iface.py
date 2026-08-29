@@ -16,6 +16,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -165,7 +167,7 @@ class WorkerConfigTest(unittest.TestCase):
         self.assertEqual(cfg["mode"], "global")
         self.assertEqual(cfg["hosts"], HOSTS)
         self.assertFalse(cfg["allow-lan"])
-        self.assertFalse(cfg["ipv6"])
+        self.assertTrue(cfg["ipv6"])
         self.assertEqual(cfg["log-level"], "warning")
         self.assertIsInstance(cfg["mixed-port"], int)
         ctl = cfg["external-controller"]
@@ -224,6 +226,69 @@ class WorkerConfigTest(unittest.TestCase):
         fake_proc.terminate.assert_not_called()
         fake_proc.kill.assert_not_called()
         self.assertFalse(os.path.exists(dir_name))
+
+
+class WorkerLifecycleRaceTest(unittest.TestCase):
+    """Startup/stop coordination must not strand a partially started worker."""
+
+    def test_stop_can_interrupt_readiness_and_terminate_process(self):
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        class BlockingAPI:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get(self, path):
+                entered.set()
+                release.wait(timeout=2)
+                return {"version": "ready"}
+
+        proc = mock.MagicMock(name="ReadinessProc")
+        proc.poll.return_value = None
+
+        worker = sbw.Worker("/fake/mihomo", [], {}, None)
+
+        def run_start():
+            try:
+                worker.start()
+            except Exception as exc:  # assertion below checks exact type
+                errors.append(exc)
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                sbw.subprocess, "Popen", return_value=proc))
+            stack.enter_context(mock.patch.object(
+                sbw, "MihomoAPI", BlockingAPI))
+            stack.enter_context(mock.patch.object(
+                sbw, "_free_port", side_effect=[12001, 12002]))
+            thread = threading.Thread(target=run_start)
+            thread.start()
+            self.assertTrue(entered.wait(timeout=1))
+
+            started = time.monotonic()
+            worker.stop()
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 0.5)
+            proc.terminate.assert_called_once_with()
+            proc.wait.assert_called_once_with(timeout=3)
+            release.set()
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], sbw.WorkerUnavailable)
+
+    def test_stop_before_start_prevents_process_creation(self):
+        worker = sbw.Worker("/fake/mihomo", [], {}, None)
+        with mock.patch.object(sbw.subprocess, "Popen") as popen:
+            worker.stop()
+            with self.assertRaises(sbw.WorkerUnavailable):
+                worker.start()
+        popen.assert_not_called()
+        self.assertIsNone(worker.dir)
 
 
 class _ReachedBuildHosts(Exception):

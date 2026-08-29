@@ -5,10 +5,11 @@ Clash SpeedBench — concurrent worker pool (two-phase).
 
 Phase 1 粗筛：latency/connectivity is measured through the MAIN mihomo
 instance's /delay API — same caliber as Clash Verge's ping (no node switching;
+repeated application-level probes retain success/failure counts;
 the main instance dials the HTTPS probe through the named proxy itself), so the
 numbers match what Verge shows. The throwaway worker pool (several temporary
 mihomo processes reusing the binary that ships with Clash Verge, minimal
-generated config) is narrowed to exit-IP profiling plus a latency fallback for
+generated config) is narrowed to IPv4/IPv6 exit profiling plus a latency fallback for
 nodes whose main-instance /delay failed — NO bandwidth download, so the user's
 running Clash instance is never touched and the WAN link stays idle.
 
@@ -41,6 +42,7 @@ fallback.
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
 import shutil
@@ -59,6 +61,7 @@ from clash_speedbench import (
     DEFAULT_DOWNLOAD_URL,
     IpInfo,
     MihomoAPI,
+    ProbeStats,
     Result,
     _no_window_kwargs,
     cancel_requested,
@@ -66,6 +69,7 @@ from clash_speedbench import (
     classify_ip,
     compute_score,
     curl_speed,
+    fetch_exit_ips,
     fetch_ip_info,
     fmt_ms,
     fmt_speed,
@@ -74,6 +78,11 @@ from clash_speedbench import (
     multi_stream_speed,
     node_key_of,
     probe_latency,
+    start_intelligence_enrichment,
+    finish_intelligence_enrichment,
+    _apply_probe_stats,
+    _coerce_probe_stats,
+    _probe_count_from_args,
     warmup_speed,
 )
 
@@ -120,6 +129,10 @@ else:
     )
 
 TEST_DOMAINS = ("speed.cloudflare.com", "cp.cloudflare.com", "ip-api.com")
+# Exit discovery is intentionally separate from the required Phase 1 test
+# hosts: api6.ipify.org has no IPv4 record and its absence must not make an
+# otherwise usable worker fail to start.
+EXIT_IP_DOMAINS = ("api.ipify.org", "api6.ipify.org")
 
 # DoH 端点（主机名 + 固定 IP，curl --resolve 钉住，避免被本机 DNS 劫持影响）
 # 注意阿里云 JSON API 在 /resolve，Cloudflare 在 /dns-query
@@ -822,7 +835,11 @@ def is_virtual_iface(name: Optional[str]) -> bool:
     return name.startswith(VIRTUAL_IFACE_PREFIXES)
 
 
-def doh_resolve(domain: str) -> Optional[str]:
+def doh_resolve(domain: str, record_type: str = "A") -> Optional[str]:
+    record_type = str(record_type or "A").upper()
+    if record_type not in {"A", "AAAA"}:
+        record_type = "A"
+    answer_type = 1 if record_type == "A" else 28
     for host, ip, path in DOH_SERVERS:
         try:
             # 钉 UTF-8：与 fetch_ip_info/curl_speed 保持一致，避免中文 Windows
@@ -831,14 +848,14 @@ def doh_resolve(domain: str) -> Optional[str]:
                 ["curl", "-s", "-m", "6",
                  "--resolve", f"{host}:443:{ip}",
                  "-H", "accept: application/dns-json",
-                 f"https://{host}{path}?name={domain}&type=A"],
+                     f"https://{host}{path}?name={domain}&type={record_type}"],
                 capture_output=True, text=True, timeout=9,
                 encoding="utf-8", errors="replace",
                 **_no_window_kwargs())
             if p.returncode == 0 and p.stdout:
                 data = json.loads(p.stdout)
                 for ans in data.get("Answer", []):
-                    if ans.get("type") == 1:
+                    if ans.get("type") == answer_type:
                         return ans.get("data")
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
             continue
@@ -858,6 +875,15 @@ def build_hosts(proxies: List[dict]) -> Dict[str, str]:
         for domain, ip in zip(domains, pool.map(doh_resolve, domains)):
             if ip:
                 hosts[domain] = ip
+    # Pin the IPv4 endpoint normally and pin the IPv6-only endpoint when an
+    # AAAA record is available.  A missing AAAA is normal and does not affect
+    # the required IPv4 worker hosts.
+    api4 = doh_resolve("api.ipify.org", "A")
+    if api4:
+        hosts["api.ipify.org"] = api4
+    api6 = doh_resolve("api6.ipify.org", "AAAA")
+    if api6:
+        hosts["api6.ipify.org"] = api6
     missing = [d for d in TEST_DOMAINS if d not in hosts]
     if missing:
         raise WorkerUnavailable(f"无法通过 DoH 解析测试域名: {', '.join(missing)}")
@@ -866,9 +892,9 @@ def build_hosts(proxies: List[dict]) -> Dict[str, str]:
 
 def _is_ip(s: str) -> bool:
     try:
-        socket.inet_aton(s)
+        ipaddress.ip_address(str(s))
         return True
-    except OSError:
+    except (TypeError, ValueError):
         return False
 
 
@@ -897,6 +923,24 @@ class Worker:
         self._stopped = False
 
     def start(self) -> None:
+        # Serialize only resource initialization with stop().  Phase 1
+        # registers workers before startup, so stop() may be called while the
+        # readiness probe is waiting; keeping the lock across that wait would
+        # prevent cancellation from terminating the process promptly.
+        try:
+            with self._stop_lock:
+                if self._stopped:
+                    raise WorkerUnavailable("worker startup cancelled")
+                deadline, mix_port = self._initialize_unlocked()
+            self._wait_until_ready(deadline, mix_port)
+        except BaseException:
+            # Covers Popen/config failures, readiness timeout, and cancellation
+            # races.  stop() is idempotent, so the shard finally block and the
+            # cancellation registry may safely call it again.
+            self.stop()
+            raise
+
+    def _initialize_unlocked(self) -> Tuple[float, int]:
         self.dir = tempfile.TemporaryDirectory(prefix="speedbench-worker-")
         mix_port = _free_port()
         ctl_port = _free_port()
@@ -910,7 +954,11 @@ class Worker:
             "external-controller": f"127.0.0.1:{ctl_port}",
             "log-level": "warning",
             "allow-lan": False,
-            "ipv6": False,
+            # Enabling IPv6 does not force any node to use it; it merely lets
+            # the explicit api6.ipify.org discovery request succeed when the
+            # node/host network supports IPv6.  The existing physical-interface
+            # binding and proxy definitions remain unchanged.
+            "ipv6": True,
             "hosts": self.hosts,
             "proxies": proxies,
         }
@@ -929,15 +977,32 @@ class Worker:
         )
         self.api = MihomoAPI(f"http://127.0.0.1:{ctl_port}", timeout=8.0)
         self.proxy_url = f"http://127.0.0.1:{mix_port}"
-        deadline = time.time() + 8
+        return time.time() + 8, mix_port
+
+    def _wait_until_ready(self, deadline: float, mix_port: int) -> None:
+        """Poll readiness without holding the lifecycle lock."""
         while time.time() < deadline:
-            if self.proc.poll() is not None:
+            with self._stop_lock:
+                if self._stopped:
+                    raise WorkerUnavailable("worker startup cancelled")
+                proc = self.proc
+                api = self.api
+            if proc is None or api is None:
+                raise WorkerUnavailable("worker startup cancelled")
+            if proc.poll() is not None:
                 raise WorkerUnavailable(f"worker 进程启动后立即退出（端口 {mix_port}）")
             try:
-                self.api.get("/version")
-                return
+                api.get("/version")
             except Exception:
+                with self._stop_lock:
+                    if self._stopped:
+                        raise WorkerUnavailable("worker startup cancelled")
                 time.sleep(0.25)
+                continue
+            with self._stop_lock:
+                if self._stopped:
+                    raise WorkerUnavailable("worker startup cancelled")
+            return
         raise WorkerUnavailable(f"worker 进程启动超时（端口 {mix_port}）")
 
     def stop(self) -> None:
@@ -963,30 +1028,40 @@ class Worker:
 
 
 def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
-                       max_workers: int = 10
-                       ) -> Dict[str, Tuple[Optional[int], Optional[float]]]:
+                       max_workers: int = 10, probe_count: int = 3
+                       ) -> Dict[str, ProbeStats]:
     """Phase 1 第 1 步：经主实例 /delay API 并发测全部节点延迟，
-    返回 {节点名: (中位延迟 ms, 抖动 ms)}；完全不通的节点值为 (None, None)。
+    返回 {节点名: ProbeStats}；对象可继续解包为旧的 (latency, jitter) pair，
+    同时保留 application-level probe attempts/success/failure 计数。
     固定 10 路并发：/delay 是小流量 HTTPS 探测（Clash Verge 的「全部测速」
     就是这么并发打的），与临时 worker 进程数（--workers）无关。"""
     # 主实例 HTTP 超时默认 5s，慢节点的 /delay 探测可能刚好顶到 --delay-timeout
     # 才被本地 HTTP 超时砍掉（proxy_delay 对一切异常返回 None，会把「慢但通」
     # 误判成不通），探测期间放宽到 delay_timeout + 3s
     api.timeout = max(api.timeout, timeout_ms / 1000 + 3.0)
-    out: Dict[str, Tuple[Optional[int], Optional[float]]] = {}
+    out: Dict[str, ProbeStats] = {}
     lock = threading.Lock()
     done = {"n": 0}
     total = len(names)
 
     def one(name: str) -> None:
-        lat, jit = probe_latency(api, name, timeout_ms)
+        try:
+            raw = probe_latency(api, name, timeout_ms, count=probe_count)
+        except TypeError:
+            # Keep tiny legacy test doubles/callers that only accept three
+            # positional arguments working during the transition.
+            raw = probe_latency(api, name, timeout_ms)
+        stats = _coerce_probe_stats(raw, attempts=probe_count)
+        lat, jit = stats
         with lock:
-            out[name] = (lat, jit)
+            out[name] = stats
             done["n"] += 1
             idx = done["n"]
         jitter_brief = f"±{jit:.0f}" if jit else ""
+        loss_brief = (f"，application-level probe failure {stats.loss_pct:.1f}%"
+                      if stats.loss_pct is not None else "")
         print(f"Phase 1 粗筛 [{idx:>3}/{total}] {name} | "
-              f"{fmt_ms(lat)}{jitter_brief} ms（主实例）")
+              f"{fmt_ms(lat)}{jitter_brief} ms（主实例{loss_brief}）")
 
     with ThreadPoolExecutor(max_workers=min(max_workers, max(1, total))) as pool:
         list(pool.map(one, names))
@@ -1000,26 +1075,50 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
     latency/jitter 来自主实例 /delay 探测结果；为 None 的节点（主实例探测失败，
     或调用方未提供主实例 api）在 worker 内兜底重测一次，worker 也失败才标「不通」。"""
     assert worker.api is not None
+    probe_stats: Optional[ProbeStats] = None
     if latency is None:
-        latency, jitter = probe_latency(worker.api, name, args.delay_timeout)
+        try:
+            raw = probe_latency(
+                worker.api, name, args.delay_timeout,
+                count=_probe_count_from_args(args),
+            )
+        except TypeError:
+            # Keep tiny legacy test doubles/callers that only accept three
+            # positional arguments working during the transition.
+            raw = probe_latency(worker.api, name, args.delay_timeout)
+        probe_stats = _coerce_probe_stats(
+            raw, attempts=_probe_count_from_args(args)
+        )
+        latency, jitter = probe_stats
     if latency is None:
-        return Result(name=name, provider="", proto=proto, latency_ms=None,
-                      speeds_mbps=[], median_mbps=None, best_mbps=None,
-                      status="unreachable")
+        result = Result(name=name, provider="", proto=proto, latency_ms=None,
+                        speeds_mbps=[], median_mbps=None, best_mbps=None,
+                        status="unreachable")
+        if probe_stats is not None:
+            _apply_probe_stats(result, probe_stats)
+        return result
 
     ip: Optional[IpInfo] = None
+    exit_ipv4: Optional[str] = None
+    exit_ipv6: Optional[str] = None
     if not args.no_ip:
         try:
             worker.select(name)
             time.sleep(args.settle)
-            data = fetch_ip_info(worker.proxy_url, args.ip_timeout)
+            exit_ipv4, exit_ipv6, data = fetch_exit_ips(
+                worker.proxy_url, args.ip_timeout
+            )
             if data:
                 ip = classify_ip(data)
         except Exception:
             pass  # IP 画像失败不影响粗筛结论
-    return Result(name=name, provider="", proto=proto, latency_ms=latency,
-                  speeds_mbps=[], median_mbps=None, best_mbps=None,
-                  status="ok", ip=ip, jitter_ms=jitter)
+    result = Result(name=name, provider="", proto=proto, latency_ms=latency,
+                    speeds_mbps=[], median_mbps=None, best_mbps=None,
+                    status="ok", ip=ip, jitter_ms=jitter,
+                    exit_ipv4=exit_ipv4, exit_ipv6=exit_ipv6)
+    if probe_stats is not None:
+        _apply_probe_stats(result, probe_stats)
+    return result
 
 
 def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
@@ -1145,13 +1244,23 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     # 进度展示方案：延迟先行快速刷完一轮「Phase 1 粗筛 [N/M]」，随后 worker 的
     # IP 画像再计第二轮 [N/M]——Web 端只认最后一条 [N/M] 计数（app.js 正则），
     # 表现为进度条涨满后回退再涨，阶段标签始终是「Phase 1 粗筛」，无需改 Web。
-    latency_map: Dict[str, Tuple[Optional[int], Optional[float]]] = {}
+    latency_map: Dict[str, ProbeStats] = {}
     if main_api is not None:
         print(f"Phase 1 粗筛 · 延迟探测: 经主实例 /delay 并发测 {total} 个节点"
               f"（Clash Verge ping 同口径，不切换节点）…")
         try:
-            latency_map = probe_latency_pool(
-                main_api, [str(p.get("name")) for p in selected], args.delay_timeout)
+            try:
+                latency_map = probe_latency_pool(
+                    main_api, [str(p.get("name")) for p in selected],
+                    args.delay_timeout,
+                    probe_count=_probe_count_from_args(args),
+                )
+            except TypeError:
+                # Preserve compatibility with older injected pool functions.
+                latency_map = probe_latency_pool(
+                    main_api, [str(p.get("name")) for p in selected],
+                    args.delay_timeout,
+                )
         except KeyboardInterrupt:
             print("\n\n收到 Ctrl+C，停止测速……")
             raise
@@ -1165,9 +1274,20 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     # /delay 失败、需要 worker 兜底复测的节点（main_api 缺省时 latency_map 为空，
     # 全部节点都进 worker 测延迟，即旧行为）。全部连通且 --no-ip 时 worker 无活可干，
     # 直接跳过，省得起一批临时 mihomo 进程。
-    ip_pending = [p for p in selected
-                  if not args.no_ip
-                  or latency_map.get(str(p.get("name")), (None, None))[0] is None]
+    if args.no_ip:
+        # ``probe_latency_pool`` returns ProbeStats in production.  Resolve its
+        # legacy tuple-compatible value explicitly rather than relying on
+        # indexing (old injected test doubles may still return a tuple).
+        ip_pending = []
+        for p in selected:
+            stats = _coerce_probe_stats(
+                latency_map.get(str(p.get("name")), (None, None)),
+                attempts=_probe_count_from_args(args),
+            )
+            if stats.latency_ms is None:
+                ip_pending.append(p)
+    else:
+        ip_pending = list(selected)
 
     results: List[Result] = []
     results_lock = threading.Lock()
@@ -1176,12 +1296,18 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     if not ip_pending:
         for p in selected:
             name = str(p.get("name"))
-            lat, jit = latency_map.get(name, (None, None))
-            results.append(Result(name=name, provider="", proto=str(p.get("type", "")),
-                                  latency_ms=lat, speeds_mbps=[], median_mbps=None,
-                                  best_mbps=None,
-                                  status="ok" if lat is not None else "unreachable",
-                                  jitter_ms=jit))
+            stats = _coerce_probe_stats(
+                latency_map.get(name, (None, None)),
+                attempts=_probe_count_from_args(args),
+            )
+            lat, jit = stats
+            result = Result(name=name, provider="", proto=str(p.get("type", "")),
+                            latency_ms=lat, speeds_mbps=[], median_mbps=None,
+                            best_mbps=None,
+                            status="ok" if lat is not None else "unreachable",
+                            jitter_ms=jit)
+            _apply_probe_stats(result, stats)
+            results.append(result)
     else:
         worker_count = max(1, min(args.workers, len(ip_pending)))
         print(f"Phase 1 粗筛 · IP 画像: 启动 {worker_count} 个并发 worker"
@@ -1228,18 +1354,31 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
             # worker 配置 = 分片节点 + 各自的 dialer-proxy 依赖闭包；
             # 探测仍只针对分片内的入选节点，依赖节点仅供链式拨号、不计入结果
             worker = Worker(mihomo_bin, with_dependencies(shard, all_proxies), hosts, iface)
-            worker.start()
             with workers_lock:
+                # Register before startup: Worker.start() creates its temporary
+                # directory/process incrementally, so a startup exception or
+                # Ctrl+C during readiness polling must still be collectable by
+                # stop_live_workers().
                 live_workers.append(worker)
             try:
+                worker.start()
                 for p in shard:
                     if cancelled():  # 节点间检查取消标志，尽快收队
                         return
                     name = str(p.get("name"))
                     proto = str(p.get("type", ""))
-                    lat, jit = latency_map.get(name, (None, None))
+                    stats = _coerce_probe_stats(
+                        latency_map.get(name, (None, None)),
+                        attempts=_probe_count_from_args(args),
+                    )
+                    lat, jit = stats
                     try:
                         r = _probe_node_in_worker(worker, name, proto, args, lat, jit)
+                        # Main-instance stats are authoritative when the main
+                        # probe succeeded.  A failed main probe lets the worker
+                        # fallback retain its own independent ProbeStats.
+                        if lat is not None:
+                            _apply_probe_stats(r, stats)
                     except Exception as e:
                         r = Result(name=name, provider="", proto=proto, latency_ms=None,
                                    speeds_mbps=[], median_mbps=None, best_mbps=None,
@@ -1297,6 +1436,12 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                                      str(cred.get("port") or ""),
                                      r.name)
 
+    # Start deduplicated Intelligence jobs now that Phase 1 has collected all
+    # exits.  The executor runs while Phase 2 performs its strictly serial
+    # bandwidth measurements, so Phase 1/2 timing remains independent of paid
+    # provider latency.  Only normalized aggregate data is attached later.
+    intel_enricher = start_intelligence_enrichment(results, args)
+
     # Phase 2 选节点：剔除不通节点后按延迟升序，取 Top N（--all 时取全部连通节点）
     chosen = select_phase2_nodes(results, getattr(args, "top_n", 15),
                                  getattr(args, "all", False))
@@ -1328,6 +1473,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                         _speed_node_in_worker(worker2, r, args)
                     except Exception as e:
                         r.status = f"error: {e}"[:160]
+                    # Compute a provisional network-only score for progress;
+                    # final Overall is recomputed after Intelligence joins.
                     r.score = compute_score(r)
                     r.tags = make_tags(r)
                     ip_txt = f" | {ip_brief(r.ip)}" if r.ip and r.ip.ok else ""
@@ -1336,7 +1483,9 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                     print(f"Phase 2 精测 [{i:>3}/{len(chosen)}] {r.name} | "
                           f"{fmt_ms(r.latency_ms)} ms | "
                           f"{fmt_speed(r.median_mbps)}{multi_brief} Mbps"
-                          f"{mb_brief}{ip_txt}")
+                          f"{mb_brief}{ip_txt}"
+                          + (f" | application-level probe failure {r.probe_loss_pct:.1f}%"
+                             if r.probe_loss_pct is not None else ""))
             except KeyboardInterrupt:
                 # 保留已完成的精测结果，继续走报告
                 print("\n\n收到 Ctrl+C，停止精测（保留已完成结果，正在清理 worker）……")
@@ -1351,6 +1500,10 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         r.score = compute_score(r)
         r.tags = make_tags(r)
         relabel_unmeasured(r)
+
+    # Wait for the bounded, deduplicated provider pool only after all network
+    # work has completed, then derive node-level worst-IP quality and Overall.
+    finish_intelligence_enrichment(intel_enricher, results)
 
     sample_desc = f"{args.mb}MB" if args.mb else "自适应10~95MB"
     if getattr(args, "multi", False):
