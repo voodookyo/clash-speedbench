@@ -633,7 +633,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(200, body, ctype)
 
+    def _check_host(self) -> bool:
+        """Reject requests without exactly one allowed local Host value."""
+        hosts = self.headers.get_all("Host") or []
+        port = self.server.server_port
+        if len(hosts) != 1 or hosts[0] not in (
+                f"127.0.0.1:{port}", f"localhost:{port}"):
+            self._json({"ok": False, "msg": "Forbidden: Host 不允许"}, 403)
+            return False
+        return True
+
     def do_GET(self) -> None:
+        if not self._check_host():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path in ("/", "/index.html"):
             self._serve_index()
@@ -715,8 +727,7 @@ class Handler(BaseHTTPRequestHandler):
         if not secrets.compare_digest(token, WEB_TOKEN):
             self._json({"ok": False, "msg": "Forbidden: 令牌无效"}, 403)
             return False
-        if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
-            self._json({"ok": False, "msg": "Forbidden: Host 不允许"}, 403)
+        if not self._check_host():
             return False
         origin = self.headers.get("Origin")
         if origin and origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):

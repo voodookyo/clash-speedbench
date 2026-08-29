@@ -13,6 +13,7 @@
 
 全程只打本机随机端口，不起 mihomo、不碰真 Clash、不发外网请求。
 """
+import http.client
 import json
 import re
 import sys
@@ -77,6 +78,60 @@ class TokenInjectionTest(WebServerCase):
         status, body = self.request("GET", "/nope")
         self.assertEqual(status, 404)
         self.assertFalse(json.loads(body)["ok"])
+
+
+class GetHostGateTest(WebServerCase):
+    """Every GET/static entrypoint must require one exact local Host value."""
+
+    GET_PATHS = (
+        "/", "/index.html", "/static/app.js", "/static/style.css",
+        "/api/latest", "/api/current", "/api/history",
+        "/api/ip-intel/status", "/api/leak/audits", "/api/leak/history",
+        "/api/node?name=probe", "/api/subscriptions",
+        "/api/subscription", "/api/run/status",
+    )
+
+    def raw_get(self, path, hosts):
+        """Send a GET with zero or multiple Host headers."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.putrequest("GET", path, skip_host=True)
+            for host in hosts:
+                conn.putheader("Host", host)
+            conn.endheaders()
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def test_bad_host_rejected_before_every_get_route(self):
+        for path in self.GET_PATHS:
+            with self.subTest(path=path):
+                status, body = self.request(
+                    "GET", path, headers={"Host": "evil.example.com"})
+                self.assertEqual(status, 403)
+                self.assertFalse(json.loads(body)["ok"])
+
+    def test_missing_or_duplicate_host_rejected_before_get_routes(self):
+        valid = f"127.0.0.1:{self.port}"
+        for path in ("/", "/api/leak/audits", "/api/node?name=probe"):
+            with self.subTest(path=path, case="missing"):
+                status, body = self.raw_get(path, [])
+                self.assertEqual(status, 403)
+                self.assertFalse(json.loads(body)["ok"])
+            with self.subTest(path=path, case="duplicate"):
+                status, body = self.raw_get(
+                    path, [valid, f"evil.example.com:{self.port}"])
+                self.assertEqual(status, 403)
+                self.assertFalse(json.loads(body)["ok"])
+
+    def test_localhost_and_loopback_hosts_allow_get(self):
+        for host in (f"127.0.0.1:{self.port}", f"localhost:{self.port}"):
+            for path in ("/", "/api/run/status"):
+                with self.subTest(host=host, path=path):
+                    status, _ = self.request(
+                        "GET", path, headers={"Host": host})
+                    self.assertEqual(status, 200)
 
 
 class StaticFilesTest(WebServerCase):
