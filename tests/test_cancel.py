@@ -102,10 +102,19 @@ class CancelStateMachineTest(unittest.TestCase):
     def test_terminate_timeout_escalates_to_kill(self):
         proc = make_proc(wait_side_effect=[TIMEOUT, TIMEOUT])
         self.arm(proc)
-        r = web.cancel_benchmark()
-        self.assertTrue(r["ok"])
-        proc.terminate.assert_called_once_with()
-        proc.kill.assert_called_once_with()
+        with tempfile.TemporaryDirectory() as td:
+            sentinel = Path(td) / "cancel-request"
+            with mock.patch.object(web, "CANCEL_FILE", sentinel):
+                r = web.cancel_benchmark()
+            self.assertTrue(r["ok"])
+            if sys.platform == "win32":
+                self.assertTrue(sentinel.exists())
+            else:
+                self.assertFalse(sentinel.exists())
+            self.assertEqual(sentinel.parent, Path(td))
+            proc.terminate.assert_called_once_with()
+            proc.kill.assert_called_once_with()
+        self.assertFalse(sentinel.exists())
 
     def test_send_signal_failure_returns_not_ok(self):
         proc = make_proc()

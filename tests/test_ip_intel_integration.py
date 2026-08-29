@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Main-process Intelligence enrichment integration (all transports mocked)."""
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -13,7 +14,11 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import clash_speedbench as csb
-from speedbench_ip_intel import IpIntelligence, ProviderResult, aggregate_ip_intelligence
+from speedbench_ip_intel import (
+    IpIntelligence,
+    ProviderResult,
+    aggregate_ip_intelligence,
+)
 
 
 def result(name, ipv4=None, ipv6=None):
@@ -110,12 +115,76 @@ class IntelligenceIntegrationTest(unittest.TestCase):
 
     def test_legacy_ip_api_fallback_supplies_ipv4(self):
         data = {"status": "success", "query": "203.0.113.42"}
-        with mock.patch.object(csb, "fetch_ip_info", return_value=data), \
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": ""}, clear=False), \
+                mock.patch.object(csb, "fetch_ip_info", return_value=data), \
                 mock.patch.object(csb, "fetch_exit_ip", side_effect=[None, None]):
             ipv4, ipv6, legacy = csb.fetch_exit_ips("http://127.0.0.1:1", 1)
         self.assertEqual(ipv4, "203.0.113.42")
         self.assertIsNone(ipv6)
         self.assertIs(legacy, data)
+
+    def test_disabled_ip_api_skips_legacy_request_but_keeps_dual_stack_ipify(self):
+        """Opt-out must remove only the legacy HTTP request, not ipify probes."""
+        barrier = threading.Barrier(2)
+        ipify_calls = []
+
+        def fake_ipify(_proxy_url, _timeout, ipv6=False):
+            ipify_calls.append(ipv6)
+            barrier.wait(timeout=2)
+            return "2001:db8::45" if ipv6 else "203.0.113.45"
+
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": "1"}, clear=False), \
+                mock.patch.object(csb, "fetch_exit_ip", side_effect=fake_ipify), \
+                mock.patch.object(csb, "fetch_ip_info") as legacy:
+            ipv4, ipv6, legacy_payload = csb.fetch_exit_ips(
+                "http://127.0.0.1:1", 1
+            )
+
+        self.assertEqual(sorted(ipify_calls), [False, True])
+        self.assertEqual(ipv4, "203.0.113.45")
+        self.assertEqual(ipv6, "2001:db8::45")
+        self.assertIsNone(legacy_payload)
+        legacy.assert_not_called()
+
+    def test_disabled_ip_api_sink_does_not_invoke_curl(self):
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": "1"}, clear=False), \
+                mock.patch.object(csb.subprocess, "run") as run:
+            self.assertIsNone(csb.fetch_ip_info("http://127.0.0.1:1", 1))
+        run.assert_not_called()
+
+    def test_build_hosts_skips_disabled_ip_api_domain_but_keeps_ipify(self):
+        import speedbench_workers as sbw
+
+        calls = []
+
+        def fake_doh(domain, record_type="A"):
+            calls.append((domain, record_type))
+            return "2001:db8::46" if record_type == "AAAA" else "192.0.2.46"
+
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": "1"}, clear=False), \
+                mock.patch.object(sbw, "doh_resolve", side_effect=fake_doh):
+            hosts = sbw.build_hosts([{"server": "node.example"}])
+
+        self.assertNotIn("ip-api.com", {domain for domain, _ in calls})
+        self.assertNotIn("ip-api.com", hosts)
+        self.assertIn("api.ipify.org", hosts)
+        self.assertIn("api6.ipify.org", hosts)
+
+    def test_build_hosts_keeps_ip_api_domain_by_default(self):
+        import speedbench_workers as sbw
+
+        calls = []
+
+        def fake_doh(domain, record_type="A"):
+            calls.append((domain, record_type))
+            return "2001:db8::47" if record_type == "AAAA" else "192.0.2.47"
+
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": ""}, clear=False), \
+                mock.patch.object(sbw, "doh_resolve", side_effect=fake_doh):
+            hosts = sbw.build_hosts([{"server": "node.example"}])
+
+        self.assertIn("ip-api.com", {domain for domain, _ in calls})
+        self.assertIn("ip-api.com", hosts)
 
     def test_exit_ip_requests_are_deterministically_overlapped(self):
         """The three independent exit probes must start before any returns.
@@ -148,7 +217,8 @@ class IntelligenceIntegrationTest(unittest.TestCase):
             enter_probe()
             return {"status": "success", "query": "203.0.113.44"}
 
-        with mock.patch.object(csb, "fetch_exit_ip", side_effect=fake_ipify), \
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": ""}, clear=False), \
+                mock.patch.object(csb, "fetch_exit_ip", side_effect=fake_ipify), \
                 mock.patch.object(csb, "fetch_ip_info", side_effect=fake_legacy):
             ipv4, ipv6, legacy = csb.fetch_exit_ips("http://127.0.0.1:1", 1)
 
@@ -159,7 +229,8 @@ class IntelligenceIntegrationTest(unittest.TestCase):
 
     def test_exit_aggregate_rejects_wrong_address_family(self):
         data = {"status": "success", "query": "203.0.113.45"}
-        with mock.patch.object(
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": ""}, clear=False), \
+                mock.patch.object(
                 csb, "fetch_exit_ip",
                 side_effect=lambda _proxy, _timeout, ipv6=False:
                     "203.0.113.46" if ipv6 else "2001:db8::45"), \

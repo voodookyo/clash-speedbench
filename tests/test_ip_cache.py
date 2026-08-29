@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -15,19 +17,22 @@ from speedbench_ip_intel import IpApiProvider, IpIntelCache, ProviderResult
 
 class CacheTest(unittest.TestCase):
     def test_ttl_and_expiry(self):
-        now = [1000.0]
-        with tempfile.TemporaryDirectory() as td:
-            cache = IpIntelCache(Path(td) / "intel.db", basic_ttl=70,
-                                 risk_ttl=10, clock=lambda: now[0])
-            result = ProviderResult("ip-api", "203.0.113.20", "ok",
-                                    raw={"country": "US"}, normalized={"country": "US"})
-            cache.put(result)
-            hit = cache.get("ip-api", "203.0.113.20")
-            self.assertIsNotNone(hit)
-            self.assertEqual(hit.status, "cache_hit")
-            self.assertEqual(hit.expires_at, 1070.0)
-            now[0] = 1070.0
-            self.assertIsNone(cache.get("ip-api", "203.0.113.20"))
+        # This test exercises the enabled ip-api cache path even when the
+        # complete suite is launched with the opt-out environment set.
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": ""}, clear=False):
+            now = [1000.0]
+            with tempfile.TemporaryDirectory() as td:
+                cache = IpIntelCache(Path(td) / "intel.db", basic_ttl=70,
+                                     risk_ttl=10, clock=lambda: now[0])
+                result = ProviderResult("ip-api", "203.0.113.20", "ok",
+                                        raw={"country": "US"}, normalized={"country": "US"})
+                cache.put(result)
+                hit = cache.get("ip-api", "203.0.113.20")
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit.status, "cache_hit")
+                self.assertEqual(hit.expires_at, 1070.0)
+                now[0] = 1070.0
+                self.assertIsNone(cache.get("ip-api", "203.0.113.20"))
 
     def test_risk_ttl_is_shorter(self):
         now = [1000.0]

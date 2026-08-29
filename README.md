@@ -96,7 +96,7 @@ v1.0.0 将基础画像与第三方 Intelligence 分开。默认仍调用无需 K
 
 | 来源 | 主要内容 | 配置 | 默认缓存 |
 |---|---|---|---|
-| ip-api | 国家、ASN/AS 名、ISP/组织、Hosting、Proxy、Mobile | 无需 Key | 7 天 |
+| ip-api | 国家、ASN/AS 名、ISP/组织、Hosting、Proxy、Mobile | 无需 Key；`SPEEDBENCH_DISABLE_IP_API=1` 可禁用 | 7 天 |
 | IPinfo | ASN/Company/ISP、Privacy、Hosting、VPN/Proxy/Tor、套餐支持的 Residential Proxy | `SPEEDBENCH_IPINFO_TOKEN` | 24 小时 |
 | IPQualityScore (IPQS) | Fraud Score、Proxy/VPN/Tor、ISP/Organization/ASN、Connection Type、Recent Abuse、Abuse Velocity、Bot Status | `SPEEDBENCH_IPQS_KEY` | 24 小时 |
 | Scamalytics | Fraud Score、Risk、Datacenter、Proxy/VPN/Server、Blacklist 等官方返回字段 | Username + Key + Region | 24 小时 |
@@ -112,13 +112,29 @@ export SPEEDBENCH_SCAMALYTICS_KEY='…'
 export SPEEDBENCH_SCAMALYTICS_REGION='eu'   # 或 us
 ```
 
+注意：ip-api 的官方免费 JSON 接口仅提供明文 HTTP（不是 HTTPS），因此保留它只是为了
+兼容无 Key 的基础画像模式；SpeedBench 不向该接口发送任何 Key。官方免费服务限制为
+每分钟 45 次请求且仅限非商业使用。ip-api 的字段不能单独
+生成 IP Quality Score 或 IP Grade，也不会因查询成功而奖励节点。对传输保密有要求时可显式
+禁用它：
+
+```bash
+export SPEEDBENCH_DISABLE_IP_API=1
+# Windows PowerShell：
+$env:SPEEDBENCH_DISABLE_IP_API='1'
+```
+
+禁用后 provider 仍会在状态列表中显示为 `disabled`，不会发起请求；IPinfo、IPQS 和
+Scamalytics（若配置）仍独立运行。未设置该变量时 ip-api 默认启用，确保没有第三方 Key
+时继续保留 v0.x 的退化能力。
+
 也可以在 Web 面板的「⚙️ IP 设置」中输入。输入只提交给
 `127.0.0.1` 上的 SpeedBench 后端并默认驻留当前进程内；不会写入
 `localStorage`、Cookie、URL、命令行、日志、CSV、JSONL、SQLite 或 API response。
 面板只显示每个 provider 的 `configured` 和运行状态（如 `cache_hit`、
 `timeout`、`rate_limited`、`quota_unavailable`、`key_missing`），不会回显 Key。
 
-没有任何第三方 Key 时，测速、历史和 Web UI 仍完整工作，退化为 ip-api 基础画像。
+未禁用且没有任何第三方 Key 时，测速、历史和 Web UI 仍完整工作，退化为 ip-api 基础画像。
 IP Quality Score 与 IP Grade 此时显示 **N/A**，绝不会因为查询失败获得满分。
 相同 provider 的相同出口 IP 共享 SQLite `ip_intel_cache`：基础 ASN/ISP 数据 TTL
 为 7 天，Privacy/风险信誉 TTL 为 24 小时；同一轮多个节点使用相同出口 IP 时只查询一次。
@@ -275,7 +291,7 @@ export MIHOMO_SECRET='你的secret'
 - **探测失败率定义**：`probe_loss_pct` 是 HTTP/HTTPS application-level probe failure rate（应用层探测失败率），不是 ICMP 层真实 packet loss，也不等于物理链路丢包率。延迟/jitter 只按成功样本计算；全部失败时显示 N/A。
 - **评分**：100 Mbps 仍是单流带宽满分标尺；Network Score 由单流/多流、延迟、jitter、TCP/TLS connect 和 probe success 组成。IP Quality Score 可用时 Overall 按 Network 80% + IP Quality 20%，数据缺失时按剩余有效维度重新归一化；未知 IP 不会得到 100 分。
 - **双栈边界**：节点支持 IPv6 与客户端真实 IPv6 是否绕过代理是两件事。每节点分别记录出口 IPv4/IPv6；双栈国家/ASN 不一致只是出口画像提示，只有「环境泄漏检测」页面才判断当前客户端是否绕过。
-- **IP 画像与配额**：无 Key 时使用 ip-api 免费基础画像；第三方 provider 可能受账户套餐、配额、限速和 TTL 影响，缺失字段保持未知，不把缺失解释为 false。
+- **IP 画像与配额**：未禁用且无 Key 时使用 ip-api 免费基础画像；第三方 provider 可能受账户套餐、配额、限速和 TTL 影响，缺失字段保持未知，不把缺失解释为 false。
 
 ## 环境泄漏检测的边界
 

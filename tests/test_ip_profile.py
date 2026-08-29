@@ -2,6 +2,7 @@
 """classify_ip / fetch_ip_info / ip_flag_score / ip_brief 测试。
 IP 画像新口径：代理/VPN、机房托管、移动网络、ISP/非托管、未知 —— 不存在「住宅」。"""
 import subprocess
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -101,7 +102,8 @@ class FetchIpInfoTest(unittest.TestCase):
     """查询失败路径：fetch_ip_info 一律返回 None（调用方随后 ip=None）。"""
 
     def run_fetch(self, proc=None, side_effect=None):
-        with mock.patch.object(csb.subprocess, "run",
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": ""}, clear=False), \
+                mock.patch.object(csb.subprocess, "run",
                                return_value=proc, side_effect=side_effect):
             return csb.fetch_ip_info("http://127.0.0.1:7897", 8.0)
 

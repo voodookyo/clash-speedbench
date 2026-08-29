@@ -1,3 +1,13 @@
+## v1.0.1：IPinfo 官方响应兼容与 ip-api 传输边界
+
+- **IPinfo 修复**：按当前官方 lookup 响应优先解析顶层 `as` 对象，同时兼容旧版
+  `asn` mapping/scalar fixture；ASN、AS 名称/类型、ISP 和组织信息可继续参与
+  Corporate/Business 等证据式分类，不会把业务 ASN 机械判为住宅。
+- **ip-api opt-out**：保留默认启用的无 Key 基础画像，但明确官方免费 JSON 接口仅为
+  明文 HTTP；它不能单独生成 IP Quality Score/Grade。设置
+  `SPEEDBENCH_DISABLE_IP_API=1` 后 provider 状态为 `disabled` 且不发起请求，其他
+  provider 不受影响。
+
 ## v1.0.0：多源 IP Intelligence、风险评级与环境泄漏检测
 
 Clash SpeedBench v1.0.0 在保留原有两阶段测速、Mihomo worker、自动恢复、SQLite 历史和本地 Web 面板的基础上，增加了网络稳定性、多源出口 IP 情报和客户端环境审计。

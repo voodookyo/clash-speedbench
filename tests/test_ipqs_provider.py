@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import json
+import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -118,24 +120,27 @@ class IpqsProviderTest(unittest.TestCase):
         self.assertEqual(len(transport.urls), 1)
 
     def test_ip_api_x_rl_zero_and_x_ttl_cooldown_are_case_insensitive(self):
-        clock = [3000.0]
-        transport = SequenceTransport([
-            (200, {
-                "status": "success", "query": "203.0.113.14",
-                "countryCode": "US", "isp": "Example ISP",
-            }, {"x-rL": "0", "x-tTl": "4"}),
-            (200, {
-                "status": "success", "query": "203.0.113.15",
-                "countryCode": "US", "isp": "Example ISP",
-            }, {}),
-        ])
-        provider = IpApiProvider(transport=transport, clock=lambda: clock[0])
-        self.assertEqual(provider.query("203.0.113.14").status, "ok")
-        self.assertEqual(provider.query("203.0.113.15").status, "rate_limited")
-        self.assertEqual(len(transport.urls), 1)
-        clock[0] = 3004.1
-        self.assertEqual(provider.query("203.0.113.15").status, "ok")
-        self.assertEqual(len(transport.urls), 2)
+        # Verify the enabled provider's header handling independently of the
+        # outer-suite SPEEDBENCH_DISABLE_IP_API setting.
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": ""}, clear=False):
+            clock = [3000.0]
+            transport = SequenceTransport([
+                (200, {
+                    "status": "success", "query": "203.0.113.14",
+                    "countryCode": "US", "isp": "Example ISP",
+                }, {"x-rL": "0", "x-tTl": "4"}),
+                (200, {
+                    "status": "success", "query": "203.0.113.15",
+                    "countryCode": "US", "isp": "Example ISP",
+                }, {}),
+            ])
+            provider = IpApiProvider(transport=transport, clock=lambda: clock[0])
+            self.assertEqual(provider.query("203.0.113.14").status, "ok")
+            self.assertEqual(provider.query("203.0.113.15").status, "rate_limited")
+            self.assertEqual(len(transport.urls), 1)
+            clock[0] = 3004.1
+            self.assertEqual(provider.query("203.0.113.15").status, "ok")
+            self.assertEqual(len(transport.urls), 2)
 
     def test_invalid_json(self):
         result = IpqsProvider("key", transport=FakeTransport("not-json")).query("203.0.113.10")

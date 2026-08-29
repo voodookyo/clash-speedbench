@@ -41,6 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 PROVIDER_STATUSES = {
     "ok",
     "cache_hit",
+    "disabled",
     "key_missing",
     "configuration_incomplete",
     "timeout",
@@ -71,6 +72,7 @@ IPQS_KEY_ENV = "SPEEDBENCH_IPQS_KEY"
 SCAMALYTICS_USERNAME_ENV = "SPEEDBENCH_SCAMALYTICS_USERNAME"
 SCAMALYTICS_KEY_ENV = "SPEEDBENCH_SCAMALYTICS_KEY"
 SCAMALYTICS_REGION_ENV = "SPEEDBENCH_SCAMALYTICS_REGION"
+DISABLE_IP_API_ENV = "SPEEDBENCH_DISABLE_IP_API"
 
 
 def _now() -> float:
@@ -415,17 +417,22 @@ class ProviderConfig:
     scamalytics_username: Optional[str] = None
     scamalytics_key: Optional[str] = None
     scamalytics_region: Optional[str] = None
+    # Keep this new field at the end so existing positional construction stays
+    # compatible with the v1.0.0 five-field configuration.
+    ip_api_enabled: bool = True
 
     @classmethod
     def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> "ProviderConfig":
         env = os.environ if environ is None else environ
         region = _clean_text(env.get(SCAMALYTICS_REGION_ENV))
+        disable_ip_api = _clean_text(env.get(DISABLE_IP_API_ENV)) == "1"
         return cls(
             ipinfo_token=_clean_text(env.get(IPINFO_TOKEN_ENV)),
             ipqs_key=_clean_text(env.get(IPQS_KEY_ENV)),
             scamalytics_username=_clean_text(env.get(SCAMALYTICS_USERNAME_ENV)),
             scamalytics_key=_clean_text(env.get(SCAMALYTICS_KEY_ENV)),
             scamalytics_region=region.lower() if region else None,
+            ip_api_enabled=not disable_ip_api,
         )
 
 
@@ -714,6 +721,23 @@ class IpApiProvider(IpIntelProvider):
     ttl_seconds = BASIC_TTL_SECONDS
     endpoint = "http://ip-api.com/json/{ip}"
 
+    def __init__(self, transport: Optional[Transport] = None,
+                 timeout: float = 8.0,
+                 clock: Callable[[], float] = _now,
+                 enabled: Optional[bool] = None) -> None:
+        # Keep the historical positional transport/timeout/clock order while
+        # allowing the free provider to be explicitly disabled by config.  A
+        # direct constructor call also honors the environment opt-out; the
+        # factory passes an explicit value from ProviderConfig.
+        super().__init__(transport=transport, timeout=timeout, clock=clock)
+        self.enabled = (
+            load_provider_config().ip_api_enabled
+            if enabled is None else bool(enabled)
+        )
+
+    def configured_status(self) -> str:
+        return "ok" if self.enabled else "disabled"
+
     def _url(self, ip: str) -> str:
         fields = (
             "status,message,query,country,countryCode,regionName,city,isp,org,as,asname,"
@@ -762,16 +786,37 @@ class IpInfoProvider(IpIntelProvider):
 
     def _parse(self, ip: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
         if not any(key in payload for key in (
-            "ip", "asn", "geo", "company", "anonymous", "privacy",
+            "ip", "as", "asn", "geo", "company", "anonymous", "privacy",
             "is_hosting", "is_mobile", "country", "country_code",
         )):
             raise _ProviderFailure("invalid_response", "missing_fields")
-        asn = payload.get("asn") if isinstance(payload.get("asn"), Mapping) else {}
+        # Current official lookup responses use a top-level ``as`` object.
+        # Keep accepting the older test/fixture shape under ``asn`` and its
+        # scalar ASN compatibility form.
+        official_as = payload.get("as")
+        legacy_asn = payload.get("asn")
+        official_as = official_as if isinstance(official_as, Mapping) else {}
+        legacy_asn_mapping = legacy_asn if isinstance(legacy_asn, Mapping) else {}
+        legacy_asn_scalar = (
+            _clean_text(legacy_asn)
+            if not isinstance(legacy_asn, Mapping) else None
+        )
         geo = payload.get("geo") if isinstance(payload.get("geo"), Mapping) else {}
         company = payload.get("company") if isinstance(payload.get("company"), Mapping) else {}
         anonymous = payload.get("anonymous") if isinstance(payload.get("anonymous"), Mapping) else {}
         privacy = payload.get("privacy") if isinstance(payload.get("privacy"), Mapping) else {}
-        asn_owner = _clean_text(_first(asn, "name"))
+
+        def as_text(*keys: str) -> Optional[str]:
+            # Prefer each non-empty official field independently, then fill
+            # only missing/empty fields from the legacy compatibility mapping.
+            for source in (official_as, legacy_asn_mapping):
+                value = _clean_text(_first(source, *keys))
+                if value:
+                    return value
+            return None
+
+        asn_owner = as_text("name")
+        normalized_asn = as_text("asn") or legacy_asn_scalar
 
         # Max responses expose anonymous.is_* and top-level is_hosting/is_mobile;
         # older official privacy responses use privacy.*.  Missing fields stay
@@ -782,9 +827,8 @@ class IpInfoProvider(IpIntelProvider):
             or _clean_text(payload.get("country")),
             "country_code": _clean_text(_first(geo, "country_code", "countryCode"))
             or _clean_text(payload.get("country_code")),
-            "asn": _clean_text(_first(asn, "asn")) or _clean_text(payload.get("asn"))
-            if not isinstance(payload.get("asn"), Mapping) else _clean_text(asn.get("asn")),
-            "as_name": _clean_text(_first(asn, "name", "as_name"))
+            "asn": normalized_asn,
+            "as_name": as_text("name", "as_name")
             or _clean_text(payload.get("as_name"))
             or _clean_text(payload.get("asname")),
             "isp": _clean_text(_first(company, "name"))
@@ -794,7 +838,9 @@ class IpInfoProvider(IpIntelProvider):
             or _clean_text(payload.get("organization"))
             or _clean_text(payload.get("org"))
             or asn_owner,
-            "asn_type": _clean_text(_first(asn, "type")),
+            "asn_type": as_text("type", "asn_type", "as_type")
+            or _clean_text(payload.get("asn_type"))
+            or _clean_text(payload.get("as_type")),
             "hosting": _bool_or_none(_first(payload, "is_hosting", "hosting"))
             if _first(payload, "is_hosting", "hosting") is not None
             else _bool_or_none(_first(privacy, "hosting", "is_hosting")),
@@ -1006,7 +1052,8 @@ def make_default_providers(
 ) -> List[IpIntelProvider]:
     cfg = config or load_provider_config()
     return [
-        IpApiProvider(transport=transport, timeout=timeout),
+        IpApiProvider(transport=transport, timeout=timeout,
+                      enabled=cfg.ip_api_enabled),
         IpInfoProvider(token=cfg.ipinfo_token, transport=transport, timeout=timeout),
         IpqsProvider(key=cfg.ipqs_key, transport=transport, timeout=timeout),
         ScamalyticsProvider(
@@ -1090,6 +1137,11 @@ class IpIntelCache:
             now: Optional[float] = None) -> Optional[ProviderResult]:
         name = str(getattr(provider, "name", provider))
         normalized_ip = _valid_ip(ip) or str(ip)
+        # A direct cache lookup has no provider object from which to obtain
+        # configured_status(); honor the same ip-api environment opt-out so a
+        # stale cached success cannot resurrect a disabled request path.
+        if name == "ip-api" and not load_provider_config().ip_api_enabled:
+            return None
         current = self.clock() if now is None else float(now)
         with self._db_lock:
             conn = self._connect()
@@ -1190,7 +1242,34 @@ class IpIntelCache:
         """
         name = str(getattr(provider, "name", provider))
         normalized_ip = _valid_ip(ip) or str(ip)
-        cached = self.get(name, normalized_ip, now=now)
+        # An explicit opt-out is stronger than a historical cache entry.  Do
+        # not let a cached success make a disabled provider appear active;
+        # other configuration states (key_missing, quota, etc.) retain the
+        # historical cache-first behavior.
+        provider_disabled = False
+        configured_status = getattr(provider, "configured_status", None)
+        if callable(configured_status):
+            try:
+                provider_disabled = configured_status() == "disabled"
+            except Exception:
+                provider_disabled = False
+        elif name == "ip-api":
+            # String provider names are used by legacy callers and have no
+            # configured_status method, so use the environment as fallback.
+            provider_disabled = not load_provider_config().ip_api_enabled
+        if provider_disabled:
+            # The provider itself owns the disabled result.  Ignore an
+            # optional legacy query callback so an opt-out cannot be bypassed
+            # by a caller-supplied fetch function.
+            query = None
+            if not callable(getattr(provider, "query", None)):
+                return ProviderResult(
+                    provider=name,
+                    ip=normalized_ip,
+                    status="disabled",
+                    error="disabled",
+                )
+        cached = None if provider_disabled else self.get(name, normalized_ip, now=now)
         if cached is not None:
             return cached
 
@@ -1213,7 +1292,7 @@ class IpIntelCache:
         try:
             # A second lookup closes the race where another process/thread
             # populated SQLite after the first lookup.
-            cached = self.get(name, normalized_ip, now=now)
+            cached = None if provider_disabled else self.get(name, normalized_ip, now=now)
             if cached is not None:
                 result = cached
             else:
@@ -1412,6 +1491,7 @@ def classify_ip(results: Any = None, **provider_results: Any) -> IpClassificatio
         if not isinstance(payload, Mapping):
             continue
         conn = str(_value(payload, "connection_type") or "").strip().lower()
+        asn_type = str(_value(payload, "asn_type", "as_type") or "").strip().lower()
         if conn in {"residential", "residential broadband", "home"}:
             res_sources.add(name)
             evidence.append(display + " Residential")
@@ -1424,6 +1504,20 @@ def classify_ip(results: Any = None, **provider_results: Any) -> IpClassificatio
         elif conn in {"mobile", "cellular"}:
             mobile_sources.add(name)
             evidence.append(display + " Mobile")
+
+        # IPinfo's official ``as.type`` is ASN ownership metadata rather than
+        # a residential verdict.  Business/corporate ownership is useful
+        # evidence for the Corporate category, while hosting/mobile ownership
+        # contributes to their respective categories.
+        if asn_type in {"business", "corporate", "enterprise", "organization"}:
+            corporate_sources.add(name)
+            evidence.append(display + " AS type=Business")
+        elif asn_type in {"hosting", "data center", "datacenter", "server"}:
+            dc_sources.add(name)
+            evidence.append(display + " AS type=Hosting/Data Center")
+        elif asn_type in {"mobile", "cellular"}:
+            mobile_sources.add(name)
+            evidence.append(display + " AS type=Mobile")
 
         hosting = _bool_or_none(_value(payload, "hosting", "is_hosting"))
         datacenter = _bool_or_none(_value(payload, "datacenter", "is_datacenter"))
@@ -1782,6 +1876,7 @@ def provider_status_snapshot(providers: Sequence[IpIntelProvider]) -> Dict[str, 
 __all__ = [
     "BASIC_TTL_SECONDS", "RISK_TTL_SECONDS", "DEFAULT_COOLDOWN_SECONDS",
     "MAX_COOLDOWN_SECONDS", "PROVIDER_STATUSES", "IP_CATEGORIES",
+    "DISABLE_IP_API_ENV",
     "ProviderConfig", "ProviderResult", "IpClassification", "IpIntelligence",
     "IpIntelProvider", "IpApiProvider", "IpInfoProvider", "IpqsProvider",
     "ScamalyticsProvider", "IpIntelCache", "load_provider_config",

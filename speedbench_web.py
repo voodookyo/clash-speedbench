@@ -111,6 +111,10 @@ _IP_INTEL_SETTINGS_LOCK = threading.RLock()
 
 def _provider_config() -> speedbench_ip_intel.ProviderConfig:
     """Return an env + in-memory credential snapshot without exposing it."""
+    # Keep provider feature flags sourced from the same environment parser as
+    # the CLI.  Credentials may be overridden in memory below, but the
+    # explicit ip-api opt-out remains an environment-level switch.
+    env_config = speedbench_ip_intel.load_provider_config()
     values = {}
     with _IP_INTEL_SETTINGS_LOCK:
         for field, env_name in _IP_INTEL_SETTING_ENV.items():
@@ -130,6 +134,7 @@ def _provider_config() -> speedbench_ip_intel.ProviderConfig:
         scamalytics_username=values.get("scamalytics_username"),
         scamalytics_key=values.get("scamalytics_key"),
         scamalytics_region=region,
+        ip_api_enabled=env_config.ip_api_enabled,
     )
 
 
@@ -164,9 +169,17 @@ def _provider_status_payload() -> dict:
     for name, status in statuses.items():
         # ``configured`` is deliberately a Boolean rather than a credential
         # hint.  The status itself is one of the documented safe states.
+        # A current explicit disable must win over an older cache_hit from a
+        # previous run; the opt-out is not revoked by history.
+        observed_status = observed.get(name)
+        effective_status = (
+            status
+            if status == "disabled" or observed_status == "disabled"
+            else observed_status or status
+        )
         result[name] = {
             "configured": status == "ok",
-            "status": observed.get(name, status),
+            "status": effective_status,
             "cache": "available",
         }
     return {
@@ -477,7 +490,9 @@ def _basic_ip_lookup(ip: str) -> dict:
     quota.
     """
     try:
-        provider = speedbench_ip_intel.IpApiProvider()
+        provider = speedbench_ip_intel.IpApiProvider(
+            enabled=_provider_config().ip_api_enabled
+        )
         result = provider.query(ip)
         if result.ok:
             return dict(result.normalized)

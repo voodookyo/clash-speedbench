@@ -645,8 +645,9 @@ class SubprocessEncodingTest(unittest.TestCase):
         self.assertEqual(kw.get("errors"), "replace")
 
     def test_fetch_ip_info_pins_utf8(self):
-        kw = self._last_run_kwargs(csb, csb.fetch_ip_info,
-                                   "http://127.0.0.1:7897", 8.0)
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": ""}, clear=False):
+            kw = self._last_run_kwargs(csb, csb.fetch_ip_info,
+                                       "http://127.0.0.1:7897", 8.0)
         self.assertEqual(kw.get("encoding"), "utf-8")
         self.assertEqual(kw.get("errors"), "replace")
 

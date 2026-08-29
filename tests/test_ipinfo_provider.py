@@ -9,7 +9,12 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import speedbench_ip_intel as intel
-from speedbench_ip_intel import IpInfoProvider, ProviderConfig, load_provider_config
+from speedbench_ip_intel import (
+    IpInfoProvider,
+    ProviderConfig,
+    aggregate_ip_intelligence,
+    load_provider_config,
+)
 
 
 class FakeTransport:
@@ -24,6 +29,63 @@ class FakeTransport:
 
 
 class IpInfoProviderTest(unittest.TestCase):
+    def test_official_as_object_preserves_asn_metadata_and_business_evidence(self):
+        """The current lookup response uses the top-level ``as`` object."""
+        transport = FakeTransport({
+            "ip": "203.0.113.8",
+            "as": {
+                "asn": "AS64500",
+                "name": "Example Business Network",
+                "type": "business",
+            },
+            "geo": {"country_code": "US"},
+            "privacy": {"hosting": False, "proxy": False, "vpn": False},
+        })
+
+        result = IpInfoProvider("token-sentinel", transport=transport).query(
+            "203.0.113.8"
+        )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.normalized["asn"], "AS64500")
+        self.assertEqual(result.normalized["as_name"], "Example Business Network")
+        self.assertEqual(result.normalized["asn_type"], "business")
+        self.assertEqual(result.normalized["isp"], "Example Business Network")
+        self.assertEqual(result.normalized["organization"], "Example Business Network")
+
+        aggregate = aggregate_ip_intelligence("203.0.113.8", {"ipinfo": result})
+        self.assertEqual(aggregate.asn, "AS64500")
+        self.assertEqual(aggregate.as_name, "Example Business Network")
+        self.assertEqual(aggregate.classification.category, "corporate")
+        self.assertIn("IPinfo AS type=Business", aggregate.classification.evidence)
+        # ASN ownership/type is evidence, not proof of a residential exit.
+        self.assertNotEqual(aggregate.classification.category, "residential")
+
+    def test_official_as_fields_are_completed_by_legacy_asn_mapping(self):
+        transport = FakeTransport({
+            "ip": "203.0.113.26",
+            "as": {
+                "asn": "AS64526",
+                "name": "",
+                "type": None,
+            },
+            "asn": {
+                "asn": "AS64527",
+                "name": "Legacy Business Network",
+                "type": "business",
+            },
+        })
+
+        result = IpInfoProvider("token", transport=transport).query("203.0.113.26")
+
+        # A non-empty official field wins; empty/missing official fields are
+        # completed from the compatibility mapping.
+        self.assertEqual(result.normalized["asn"], "AS64526")
+        self.assertEqual(result.normalized["as_name"], "Legacy Business Network")
+        self.assertEqual(result.normalized["asn_type"], "business")
+        self.assertEqual(result.normalized["isp"], "Legacy Business Network")
+        self.assertEqual(result.normalized["organization"], "Legacy Business Network")
+
     def test_max_response_is_normalized(self):
         transport = FakeTransport({
             "ip": "203.0.113.8",

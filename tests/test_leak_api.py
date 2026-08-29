@@ -5,6 +5,7 @@ All third-party/basic lookups are injected fixtures.  These tests must never
 contact ipify, ip-api, BrowserLeaks, DNSLeakTest or paid reputation APIs.
 """
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -94,7 +95,9 @@ class LeakApiTest(WebServerCase):
         self.assertNotIn("secret-sentinel", json.dumps(data))
 
     def test_save_endpoint_is_safe_when_db_adapter_is_missing(self):
-        with mock.patch.object(web.speedbench_db, "insert_leak_audit", None):
+        with mock.patch.object(web.speedbench_db, "insert_leak_audit", None), \
+                mock.patch.object(web, "LEAK_BASIC_LOOKUP",
+                                  lambda _ip: {"country_code": "US"}):
             status, data = self.post_eval({
                 "candidates": [{"type": "srflx", "address": "8.8.8.8"}],
                 "exit_ipv4": "1.1.1.1",
@@ -109,6 +112,41 @@ class LeakApiTest(WebServerCase):
         data = json.loads(raw.decode("utf-8"))
         self.assertFalse(data["available"])
         self.assertEqual(data["audits"], [])
+
+    def test_web_provider_status_reports_ip_api_disabled_from_environment(self):
+        observed = {"results": [{
+            "intel_v4": {"provider_status": {"ip-api": "cache_hit"}}
+        }]}
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": "1"}, clear=False), \
+                mock.patch.object(web, "latest_record", return_value=observed):
+            status, raw = self.request("GET", "/api/ip-intel/status")
+
+        self.assertEqual(status, 200)
+        data = json.loads(raw.decode("utf-8"))
+        self.assertEqual(data["providers"]["ip-api"]["status"], "disabled")
+        self.assertFalse(data["providers"]["ip-api"]["configured"])
+
+    def test_reenabled_ip_api_ignores_stale_disabled_history(self):
+        observed = {"results": [{
+            "intel_v4": {"provider_status": {"ip-api": "disabled"}}
+        }]}
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": ""}, clear=False), \
+                mock.patch.object(web, "latest_record", return_value=observed):
+            status, raw = self.request("GET", "/api/ip-intel/status")
+
+        self.assertEqual(status, 200)
+        data = json.loads(raw.decode("utf-8"))
+        self.assertEqual(data["providers"]["ip-api"]["status"], "ok")
+        self.assertTrue(data["providers"]["ip-api"]["configured"])
+
+    def test_disabled_ip_api_is_not_used_by_basic_leak_lookup(self):
+        transport = mock.Mock(return_value=(200, {
+            "status": "success", "query": "203.0.113.25",
+        }))
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_DISABLE_IP_API": "1"}, clear=False), \
+                mock.patch.object(web.speedbench_ip_intel, "_urllib_transport", transport):
+            self.assertEqual(web._basic_ip_lookup("203.0.113.25"), {})
+        transport.assert_not_called()
 
 
 class IpIntelSettingsTest(WebServerCase):

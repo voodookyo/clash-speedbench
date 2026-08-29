@@ -22,8 +22,9 @@ Key tricks (validated against Clash Verge Rev + TUN on macOS):
   the `proxies` list via a fallback chain: PyYAML (if the user installed it) ->
   macOS/Linux built-in ruby (YAML -> JSON) -> built-in mini YAML parser (zero
   dependency, covers only the serde_yaml-style subset Verge emits). No pip needed.
-- Worker configs are written as JSON (valid YAML) with three test domains pinned
-  in `hosts` — the main instance's TUN DNS hijack would otherwise return fake-ips.
+- Worker configs are written as JSON (valid YAML) with the required test domains
+  pinned in `hosts` — the main instance's TUN DNS hijack would otherwise return
+  fake-ips; the no-key ip-api domain is omitted when explicitly disabled.
 - Selected nodes are expanded with their `dialer-proxy` dependency closure, so
   relay nodes whose entry node lives outside the shard stay dialable.
 - Worker configs set a global top-level `interface-name: <physical if>` so worker
@@ -85,6 +86,7 @@ from clash_speedbench import (
     _probe_count_from_args,
     warmup_speed,
 )
+from speedbench_ip_intel import load_provider_config
 
 
 class WorkerUnavailable(RuntimeError):
@@ -864,8 +866,18 @@ def doh_resolve(domain: str, record_type: str = "A") -> Optional[str]:
 
 def build_hosts(proxies: List[dict]) -> Dict[str, str]:
     """Pin test domains + every node-server domain to real IPs (bypasses the
-    fake-ip answers produced by the running instance's TUN DNS hijack)."""
-    domains = set(TEST_DOMAINS)
+    fake-ip answers produced by the running instance's TUN DNS hijack).
+
+    The no-key ip-api fallback is part of the required hosts only while that
+    provider is enabled.  IPv4/IPv6 ipify exit discovery stays required in
+    either mode.
+    """
+    ip_api_enabled = load_provider_config().ip_api_enabled
+    required_domains = tuple(
+        domain for domain in TEST_DOMAINS
+        if domain != "ip-api.com" or ip_api_enabled
+    )
+    domains = set(required_domains)
     for p in proxies:
         srv = p.get("server", "")
         if srv and not _is_ip(srv):
@@ -884,7 +896,7 @@ def build_hosts(proxies: List[dict]) -> Dict[str, str]:
     api6 = doh_resolve("api6.ipify.org", "AAAA")
     if api6:
         hosts["api6.ipify.org"] = api6
-    missing = [d for d in TEST_DOMAINS if d not in hosts]
+    missing = [d for d in required_domains if d not in hosts]
     if missing:
         raise WorkerUnavailable(f"无法通过 DoH 解析测试域名: {', '.join(missing)}")
     return hosts

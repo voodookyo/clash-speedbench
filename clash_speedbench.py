@@ -46,6 +46,7 @@ from speedbench_ip_intel import (
     IpIntelCache,
     IpIntelligence,
     aggregate_ip_intelligence,
+    load_provider_config,
     make_default_providers,
 )
 
@@ -880,6 +881,10 @@ def _apply_probe_stats(result: Result, stats: Any,
 
 def fetch_ip_info(proxy_url: str, timeout: float) -> Optional[dict]:
     """Query ip-api.com through the given proxy; returns parsed dict or None."""
+    # Keep the legacy HTTP sink itself opt-out aware so direct callers cannot
+    # bypass the provider-level SPEEDBENCH_DISABLE_IP_API guard.
+    if not load_provider_config().ip_api_enabled:
+        return None
     cmd = [
         "curl",
         "--proxy", proxy_url,
@@ -968,24 +973,27 @@ def _coerce_exit_family(value: Any, version: int) -> Optional[str]:
 def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
     """Return ``(IPv4, IPv6, legacy ip-api payload)`` for one tested node.
 
-    The three independent HTTP requests run together so a slow IPv6-only
-    endpoint cannot add a second or third full timeout to every node.  IPv4
-    uses ipify first and falls back to the existing ip-api self lookup after
-    all three requests have completed.  The third return value keeps the old
-    ``IpInfo`` mapping available to the rest of the application.  IPv6 failure
-    is a normal ``None`` outcome.
+    The independent exit requests run together so a slow IPv6-only endpoint
+    cannot add a second or third full timeout to every node.  IPv4 uses ipify
+    first and, when the legacy provider is enabled, falls back to the existing
+    ip-api self lookup after all requests have completed.  The third return
+    value keeps the old ``IpInfo`` mapping available to the rest of the
+    application.  IPv6 failure is a normal ``None`` outcome; disabling
+    ip-api leaves both ipify probes active and returns a ``None`` legacy value.
     """
-    # Keep the ip-api self lookup for the legacy country/ISP profile.  It is
-    # intentionally submitted alongside both ipify calls: the query remains
-    # the documented IPv4 fallback, while a slow/failed source cannot multiply
-    # the per-node timeout.  Each worker is independent and failures are
-    # treated as unavailable data rather than aborting the node measurement.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    ip_api_enabled = load_provider_config().ip_api_enabled
+    # Keep the legacy ip-api self lookup alongside both ipify calls only when
+    # enabled: it remains the documented IPv4 fallback, while a slow/failed
+    # source cannot multiply the per-node timeout.  Each worker is independent
+    # and failures are treated as unavailable data rather than aborting the
+    # node measurement.
+    with ThreadPoolExecutor(max_workers=3 if ip_api_enabled else 2) as pool:
         futures = {
             "ipv4": pool.submit(fetch_exit_ip, proxy_url, timeout, False),
-            "legacy": pool.submit(fetch_ip_info, proxy_url, timeout),
             "ipv6": pool.submit(fetch_exit_ip, proxy_url, timeout, True),
         }
+        if ip_api_enabled:
+            futures["legacy"] = pool.submit(fetch_ip_info, proxy_url, timeout)
 
         def read(name: str):
             try:
@@ -994,7 +1002,7 @@ def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optio
                 return None
 
     ipv4 = _coerce_exit_family(read("ipv4"), 4)
-    legacy = read("legacy")
+    legacy = read("legacy") if ip_api_enabled else None
     ipv6 = _coerce_exit_family(read("ipv6"), 6)
 
     # Keep the fallback after all requests are joined.  Do not trust an
