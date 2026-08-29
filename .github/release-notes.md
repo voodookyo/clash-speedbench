@@ -13,6 +13,7 @@ Clash SpeedBench v1.0.0 在保留原有两阶段测速、Mihomo worker、自动�
 - **双栈出口**：分别发现和展示出口 IPv4、IPv6；节点 IPv6 不可用是正常状态，不与客户端 IPv6 绕过混淆。
 - **环境泄漏检测**：新增 `#/leak` 页面。WebRTC 使用浏览器标准 ICE/STUN，mDNS、隐私策略或 STUN 失败显示“无法确认”。DNS 采用 Guided Audit，打开 BrowserLeaks DNS / DNSLeakTest，由用户人工判读，不读取系统 DNS、不抓取网页 HTML。
 - **密钥安全**：支持 `SPEEDBENCH_IPINFO_TOKEN`、`SPEEDBENCH_IPQS_KEY`、`SPEEDBENCH_SCAMALYTICS_USERNAME`、`SPEEDBENCH_SCAMALYTICS_KEY`、`SPEEDBENCH_SCAMALYTICS_REGION`；面板输入只驻留 localhost backend 内存，不写 localStorage、日志、JSONL、SQLite、CSV 或 HTTP response。Scamalytics v3 必须提供 Username + Key + Region（`eu`/`us`）。
+- **面板加固**：所有 GET 路由同样强制校验唯一本机 Host（防 DNS rebinding）；拒绝请求时先读尽请求体再响应，修复 Windows 上偶发连接被 RST（WinError 10053）的问题。
 - **兼容升级**：v0.8.2/v0.9.1 的 JSONL 和 SQLite 可直接回放。启动时只增量创建 `ip_intel_cache`、`ip_intel_results`、`leak_audits` 及兼容列，不删除或重写 `runs.raw`。
 
 ### 安装
