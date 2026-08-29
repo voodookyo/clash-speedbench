@@ -134,6 +134,35 @@ class IpHistoryDbTest(unittest.TestCase):
         self.assertNotIn("api_key", row[-1])
         self.assertEqual(len(json.loads(row[8])), 1)
 
+    def test_intel_only_multi_node_results_keep_exit_identity(self):
+        records = []
+        for name, ip in (("node-a", "198.51.100.91"),
+                         ("node-b", "198.51.100.92")):
+            records.append({
+                "name": name,
+                "node_key": name,
+                "status": "ok",
+                "intel_v4": {
+                    "ip": ip,
+                    "ip_version": 4,
+                    "classification": {"category": "residential", "confidence": 86},
+                    "ip_quality_score": 90,
+                    "ip_grade": "S",
+                },
+            })
+        self.write([record("2026-08-29T00:01:30", records)])
+        self.assertEqual(db.import_jsonl(self.db_path, self.jsonl), 1)
+        self.assertEqual(
+            self.query("SELECT name, exit_ipv4 FROM node_results ORDER BY name"),
+            [("node-a", "198.51.100.91"), ("node-b", "198.51.100.92")],
+        )
+        for name, ip in (("node-a", "198.51.100.91"),
+                         ("node-b", "198.51.100.92")):
+            timeline = db.ip_reputation_changes(self.db_path, name)
+            self.assertEqual(len(timeline), 1)
+            self.assertEqual(timeline[0]["exit_ip"], ip)
+            self.assertTrue(timeline[0]["intel_available"])
+
     def test_old_schema_migrates_idempotently_and_old_fields_are_null(self):
         conn = sqlite3.connect(str(self.db_path))
         try:

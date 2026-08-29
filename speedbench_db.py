@@ -198,7 +198,7 @@ def _bool_or_none(v):
 
 _SECRET_FIELD_RE = re.compile(
     r"(?:token|api[_-]?key|access[_-]?key|secret|password|authorization|credential|"
-    r"(?:^|[_-])key$)",
+    r"(?:^|[_-])key$|username|user[_-]?name)",
     re.IGNORECASE,
 )
 
@@ -473,6 +473,17 @@ def _insert_ip_intel(conn, run_id, result):
 
 def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
     name = str(r.get("name") or "")
+    # A staged/new serializer may include only ``intel_v4``/``intel_v6`` and
+    # omit both the top-level family fields and the legacy ``ip`` object.  Use
+    # those normalized IPs as a fallback so multi-node runs do not lose their
+    # per-node exit identity in node_results/history.
+    intel_candidates = _intel_candidates(r)
+    candidate_ips = {}
+    for version, _value, candidate_ip in intel_candidates:
+        if candidate_ip and version not in candidate_ips:
+            candidate_ips[version] = candidate_ip
+    exit_ipv4 = _family_ip(r, 4) or candidate_ips.get(4)
+    exit_ipv6 = _family_ip(r, 6) or candidate_ips.get(6)
     # 旧行缺 node_key/fail_reason/provider 等新字段时落 ""，保持可聚合
     conn.execute(
         "INSERT INTO node_results(run_id, name, proto, provider, node_key,"
@@ -498,18 +509,18 @@ def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
          _db_int(r.get("probe_failures")), _db_number(r.get("probe_success_rate")),
          _db_number(r.get("probe_loss_pct")), _db_number(r.get("network_score")),
          _db_number(r.get("ip_quality_score")), _db_text(r.get("ip_grade") or r.get("grade")),
-         _family_ip(r, 4), _family_ip(r, 6)))
+         exit_ipv4, exit_ipv6))
     ip = r.get("ip")
     if isinstance(ip, dict) and ip:
         # 旧格式（v0.2 及更早）的 ip 没有 ok 字段：按 exit_ip 是否存在推断查询成功
         ok = ip.get("ok")
         if ok is None:
-            ok = bool(ip.get("exit_ip") or _family_ip(r, 4))
+            ok = bool(ip.get("exit_ip") or exit_ipv4)
         conn.execute(
             "INSERT INTO ip_profiles(run_id, name, exit_ip, country, country_code,"
             " region, city, isp, org, asn, asname, kind, ok, proxy, hosting, mobile)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (run_id, name, _db_text(ip.get("exit_ip") or _family_ip(r, 4)),
+            (run_id, name, _db_text(ip.get("exit_ip") or exit_ipv4),
              _db_text(ip.get("country")),
              _db_text(ip.get("country_code")), _db_text(ip.get("region")),
              _db_text(ip.get("city")), _db_text(ip.get("isp")),
@@ -517,7 +528,7 @@ def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
              _db_text(ip.get("asname")), _db_text(ip.get("kind")), int(bool(ok)),
              _bool_or_none(ip.get("proxy")), _bool_or_none(ip.get("hosting")),
              _bool_or_none(ip.get("mobile"))))
-    elif _family_ip(r, 4):
+    elif exit_ipv4:
         # A new serializer may place all basic data in intel_v4 and omit the
         # legacy ip object.  Create a minimal profile solely to keep the old
         # IP/ASN timeline useful; risk/provider payloads stay in the new table.
@@ -527,7 +538,7 @@ def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
             "INSERT INTO ip_profiles(run_id, name, exit_ip, country, country_code,"
             " region, city, isp, org, asn, asname, kind, ok, proxy, hosting, mobile)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (run_id, name, _family_ip(r, 4), _db_text(basic.get("country")),
+            (run_id, name, exit_ipv4, _db_text(basic.get("country")),
              _db_text(basic.get("country_code")), _db_text(basic.get("region")),
              _db_text(basic.get("city")), _db_text(basic.get("isp")),
              _db_text(basic.get("organization") or basic.get("org")),

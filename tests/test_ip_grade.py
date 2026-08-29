@@ -20,6 +20,17 @@ class IpGradeTest(unittest.TestCase):
         }))
         self.assertIsNone(ip_quality_grade(None))
 
+    def test_ipinfo_false_only_privacy_flags_are_not_clean_grade(self):
+        self.assertIsNone(compute_ip_quality_score({
+            "ipinfo": {
+                "hosting": False,
+                "proxy": False,
+                "vpn": False,
+                "tor": False,
+                "residential_proxy": False,
+            }
+        }))
+
     def test_all_intelligence_failures_are_na(self):
         result = aggregate_ip_intelligence("203.0.113.30", {
             "ipqs": {"status": "timeout"},
@@ -49,6 +60,34 @@ class IpGradeTest(unittest.TestCase):
         })
         self.assertEqual(score, 17.0)
         self.assertEqual(compute_ip_grade(score), "D")
+
+    def test_blacklist_and_very_high_risk_are_capped_at_d(self):
+        self.assertEqual(
+            compute_ip_grade(compute_ip_quality_score({
+                "scamalytics": {"blacklisted": True},
+            })),
+            "D",
+        )
+        self.assertEqual(
+            compute_ip_grade(compute_ip_quality_score({
+                "scamalytics": {"scamalytics_risk": "very high"},
+            })),
+            "D",
+        )
+
+    def test_recent_abuse_and_high_fraud_are_capped_at_c(self):
+        self.assertEqual(
+            compute_ip_grade(compute_ip_quality_score({
+                "ipqs": {"recent_abuse": True},
+            })),
+            "C",
+        )
+        self.assertEqual(
+            compute_ip_grade(compute_ip_quality_score({
+                "ipqs": {"fraud_score": 75},
+            })),
+            "C",
+        )
 
     def test_clean_explicit_risk_provider_can_grade(self):
         score = compute_ip_quality_score({

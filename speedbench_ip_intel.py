@@ -151,7 +151,8 @@ def _safe_json(value: Any) -> Any:
 
 
 _SECRET_KEY_RE = re.compile(
-    r"(?:token|api[_-]?key|access[_-]?key|secret|password|authorization|credential|key)",
+    r"(?:token|api[_-]?key|access[_-]?key|secret|password|authorization|credential|"
+    r"key|username|user[_-]?name)",
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
@@ -1524,6 +1525,20 @@ def _has_substantive_risk_data(payloads: Mapping[str, Mapping[str, Any]]) -> boo
             continue
         if not isinstance(payload, Mapping):
             continue
+        # IPinfo's lookup/privacy flags are useful evidence when they identify
+        # a hosting/anonymous/residential-proxy condition.  A false-only
+        # basic response, however, is not a vendor reputation verdict and
+        # must not manufacture a clean IP Grade.
+        if name == "ipinfo":
+            if any(
+                _bool_or_none(payload.get(key)) is True
+                for key in (
+                    "hosting", "is_hosting", "proxy", "vpn", "tor",
+                    "residential_proxy", "is_res_proxy", "is_residential_proxy",
+                )
+            ):
+                return True
+            continue
         for key in (
             "fraud_score", "scamalytics_score", "scamalytics_risk",
             "recent_abuse", "abuse_velocity", "bot_status", "blacklisted",
@@ -1531,12 +1546,6 @@ def _has_substantive_risk_data(payloads: Mapping[str, Mapping[str, Any]]) -> boo
         ):
             if payload.get(key) is not None:
                 return True
-        # IPinfo privacy flags are substantive only when explicitly true; a
-        # missing/false-only basic response is not a clean score.
-        if name == "ipinfo" and any(
-            payload.get(key) is True for key in ("hosting", "is_hosting", "proxy", "vpn", "tor")
-        ):
-            return True
     return False
 
 
@@ -1585,16 +1594,23 @@ def compute_ip_quality_score(results: Any) -> Optional[float]:
             score -= 7
 
     risk_levels = _risk_text(payloads, "scamalytics_risk", "risk")
-    if any(level in {"very high", "very_high", "critical"} for level in risk_levels):
+    very_high_risk = any(
+        level in {"very high", "very_high", "critical"} for level in risk_levels
+    )
+    if very_high_risk:
         score -= 18
     elif any(level == "high" for level in risk_levels):
         score -= 12
     elif any(level == "medium" for level in risk_levels):
         score -= 5
 
-    if _risk_bool(payloads, "blacklisted", "scamalytics_blacklisted", "is_blacklisted_external"):
+    blacklisted = _risk_bool(
+        payloads, "blacklisted", "scamalytics_blacklisted", "is_blacklisted_external"
+    )
+    if blacklisted:
         score -= 55
-    if _risk_bool(payloads, "recent_abuse", "frequent_abuser"):
+    recent_abuse = _risk_bool(payloads, "recent_abuse", "frequent_abuser")
+    if recent_abuse:
         score -= 28
     abuse_velocity = _risk_text(payloads, "abuse_velocity")
     if any(any(word in value for word in ("high", "rapid", "very")) for value in abuse_velocity):
@@ -1612,7 +1628,18 @@ def compute_ip_quality_score(results: Any) -> Optional[float]:
     classification = classify_ip(results)
     if classification.conflicts:
         score -= 10
-    return round(max(0.0, min(100.0, score)), 1)
+    score = max(0.0, min(100.0, score))
+
+    # These are safety caps, not vendor-score conversions.  A blacklist or a
+    # very-high risk signal must never appear as a clean-looking S/A/B/C
+    # recommendation merely because no other penalty happened to be present.
+    # Recent abuse and a high fraud score are capped at C; a more severe
+    # fraud score (>=90) already falls into D through the penalty above.
+    if blacklisted or very_high_risk:
+        score = min(score, 39.0)
+    elif recent_abuse or (highest is not None and highest >= 75):
+        score = min(score, 59.0)
+    return round(score, 1)
 
 
 def ip_quality_grade(score: Optional[float]) -> Optional[str]:

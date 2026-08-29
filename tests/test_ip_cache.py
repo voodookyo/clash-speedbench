@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -91,6 +92,24 @@ class CacheTest(unittest.TestCase):
             self.assertNotIn("secret-sentinel", blob)
             hit = cache.get("ipqs", "203.0.113.24")
             self.assertNotIn("secret-sentinel", json.dumps(hit.to_dict()))
+
+    def test_username_and_key_fields_are_not_persisted(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "intel.db"
+            cache = IpIntelCache(path)
+            cache.put(ProviderResult(
+                "scamalytics", "203.0.113.25", "ok",
+                raw={"username": "user-sentinel", "key": "key-sentinel"},
+                normalized={"user_name": "user-sentinel", "api_key": "key-sentinel"},
+            ))
+            conn = sqlite3.connect(path)
+            try:
+                blob = " ".join(str(value) for value in conn.execute(
+                    "SELECT raw_json, normalized_json FROM ip_intel_cache").fetchone())
+            finally:
+                conn.close()
+            self.assertNotIn("user-sentinel", blob)
+            self.assertNotIn("key-sentinel", blob)
 
 
 if __name__ == "__main__":
