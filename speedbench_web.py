@@ -610,6 +610,31 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
+    def _drain_body(self) -> None:
+        """丢弃尚未读取的请求体（上限与 _read_body 一致）。
+
+        面板响应后即关闭连接；若拒绝请求时 body 仍残留在 socket 缓冲区，
+        Windows 关连接会发 RST，客户端可能收到 WinError 10053 而不是
+        正常的 4xx 响应（CI windows-latest 实测）。拒绝前先把 body 读尽，
+        关闭时就是干净的 FIN。超限/畸形的声明直接交给关连接处理。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return
+        if length <= 0 or length > 1024 * 1024:
+            return
+        try:
+            self.rfile.read(length)
+        except (OSError, ValueError):
+            pass
+
+    def _reject(self, msg: str, code: int = 403) -> bool:
+        """拒绝请求的公共出口：先丢弃 body 再响应，返回 False 供 gate 使用。"""
+        self._drain_body()
+        self._json({"ok": False, "msg": msg}, code)
+        return False
+
     def _serve_index(self) -> None:
         """读 web/index.html 并注入本次启动的随机令牌；缺失说明安装/构建不完整。"""
         try:
@@ -639,8 +664,7 @@ class Handler(BaseHTTPRequestHandler):
         port = self.server.server_port
         if len(hosts) != 1 or hosts[0] not in (
                 f"127.0.0.1:{port}", f"localhost:{port}"):
-            self._json({"ok": False, "msg": "Forbidden: Host 不允许"}, 403)
-            return False
+            return self._reject("Forbidden: Host 不允许")
         return True
 
     def do_GET(self) -> None:
@@ -725,14 +749,12 @@ class Handler(BaseHTTPRequestHandler):
         port = self.server.server_port
         token = self.headers.get("X-SpeedBench-Token") or ""
         if not secrets.compare_digest(token, WEB_TOKEN):
-            self._json({"ok": False, "msg": "Forbidden: 令牌无效"}, 403)
-            return False
+            return self._reject("Forbidden: 令牌无效")
         if not self._check_host():
             return False
         origin = self.headers.get("Origin")
         if origin and origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
-            self._json({"ok": False, "msg": "Forbidden: Origin 不允许"}, 403)
-            return False
+            return self._reject("Forbidden: Origin 不允许")
         return True
 
     def do_POST(self) -> None:
@@ -743,7 +765,7 @@ class Handler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 busy = STATE["running"]
             if busy:
-                self._json({"ok": False, "msg": "已有测速任务进行中"}, 409)
+                self._reject("已有测速任务进行中", 409)
                 return
             params = self._read_body()
             threading.Thread(target=run_benchmark, args=(params,), daemon=True).start()
@@ -798,7 +820,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "msg": msg})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         else:
-            self._json({"ok": False, "msg": "not found"}, 404)
+            self._reject("not found", 404)
 
 
 def main() -> int:

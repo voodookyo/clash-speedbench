@@ -218,6 +218,24 @@ class PostGateTest(WebServerCase):
             SAFE_POST, {}, headers={"Host": f"localhost:{self.port}"})
         self.assertEqual(status, 200)
 
+    def test_rejected_post_with_large_unread_body_gets_clean_response(self):
+        # 回归（CI windows-latest/Py3.12 实测）：拒绝时不读尽请求体，
+        # 面板关连接会发 RST，客户端可能收到 WinError 10053 而不是 403。
+        # 64 KiB body 让"响应读完前 RST 先到"的竞态几乎必现；
+        # 修复后所有拒绝路径先 drain 再响应，任何平台都应拿到干净 403。
+        big = json.dumps({"pad": "x" * 65536})
+        for headers in (
+                {},  # 无令牌
+                {"X-SpeedBench-Token": TOKEN, "Host": "evil.example.com"},
+                {"X-SpeedBench-Token": TOKEN,
+                 "Origin": "http://evil.example.com"}):
+            with self.subTest(headers=sorted(headers)):
+                status, body = self.request(
+                    "POST", SAFE_POST, body=big,
+                    headers={"Content-Type": "application/json", **headers})
+                self.assertEqual(status, 403)
+                self.assertFalse(json.loads(body)["ok"])
+
     def test_unknown_path_with_valid_token_404(self):
         # 过了闸门才轮到路由：路径不存在 → 404 而非 403
         status, body = self.post_authorized("/no-such-endpoint", {})
