@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """with_dependencies：dialer-proxy 依赖闭包展开的全场景测试。
 覆盖：链式 A→B→C、共享依赖（菱形去重）、循环依赖、自引用、悬空引用、
-空选、入选顺序保持（依赖追加尾部）、入参不被修改、非 dict/无名条目安全。"""
+空选、入选顺序保持（依赖追加尾部）、入参不被修改、非 dict/无名条目安全；
+同时保护 v1.0 新增运行时模块在零 pip 依赖环境下可直接导入。"""
 import copy
 import sys
 import unittest
@@ -10,6 +11,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from speedbench_workers import with_dependencies
+
+
+class RuntimeDependencyClosureTest(unittest.TestCase):
+    """新增 runtime 模块不得把可选 provider 变成硬依赖。"""
+
+    def test_ip_intel_and_leak_modules_import_without_optional_packages(self):
+        import speedbench_ip_intel
+        import speedbench_leak
+
+        self.assertTrue(callable(speedbench_ip_intel.IpApiProvider))
+        self.assertTrue(callable(speedbench_ip_intel.IpInfoProvider))
+        self.assertTrue(callable(speedbench_ip_intel.IpqsProvider))
+        self.assertTrue(callable(speedbench_ip_intel.ScamalyticsProvider))
+        self.assertTrue(callable(speedbench_leak.evaluate_webrtc))
+        self.assertTrue(callable(speedbench_leak.DnsLeakProvider))
 
 
 def node(name, dep=None, **extra):

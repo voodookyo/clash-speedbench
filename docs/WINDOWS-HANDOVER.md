@@ -1,64 +1,112 @@
-# Windows 端适配交接文件（v0.8.0）
+# Windows 端适配交接文件（v1.0.0）
 
-> 给 Windows PC 上的 Kimi Code 会话：本项目在 macOS 上完成了 v0.8.0 Windows 适配的全部离线开发（326 个单元测试全绿，CI 含 windows-latest 矩阵），但**没有经过真机验证**。你的任务是按本文档做真机验收、修补问题、然后发版。
+本文档用于 Windows 10/11 的安装、离线回归和真机验收。v1.0.0 在保留 v0.9.1
+哨兵取消路径、托盘和 Mihomo worker 的基础上，加入多源 IP Intelligence、应用层稳定性探测、
+双栈出口及环境泄漏检测。当前仓库验证不等于真实机场配置上的端到端保证；发布前仍应在一台
+实际 Windows 机器上执行下方 checklist。
 
 ## 30 秒项目速览
 
-- **Clash SpeedBench**：给 Clash Verge Rev (mihomo) 做的节点测速工具。不自己解析订阅、不自己实现协议，而是利用正在运行的 mihomo：通过 external-controller API 拿节点/测延迟，另起临时 mihomo worker 进程测出口 IP 与带宽。
-- **架构**：两阶段测速。Phase 1 = 并发粗筛（延迟走主 mihomo `/delay` API + worker 池探测出口 IP，不抢带宽）；Phase 2 = 单 worker 串行带宽精测 Top N（curl 真实下载 Cloudflare）。
-- **入口**：`speedbench_web.py` = Web 面板（127.0.0.1:8950，token 鉴权）；`clash_speedbench.py` = 测速核心 CLI；`speedbench_workers.py` = worker 池/配置解析/网卡检测；`speedbench_db.py` = SQLite 历史。
-- **Windows 入口**：根目录 `SpeedBench.bat`（双击 → pythonw 无窗口跑面板 → 自动开浏览器；pythonw 缺失时回退最小化控制台）。数据目录 `%APPDATA%\ClashSpeedBench`。
-- **硬约束**：零第三方依赖（仅标准库 + 系统 curl；PyYAML 只可 try-import 可选使用）；中文注释/文案；改代码必须保持 `python -m unittest discover -s tests` 全绿。
-- 仓库：github.com/voodookyo/clash-speedbench，分支 master。
+- **入口**：根目录 `SpeedBench.bat` → `pythonw` 无窗口启动 `speedbench_web.py`；缺少
+  `pythonw` 时回退最小化控制台。数据目录默认 `%APPDATA%\ClashSpeedBench`。
+- **架构**：Phase 1 并发粗筛（主 Mihomo `/delay` + application-level probe + worker 出口 IP），
+  Phase 2 串行 Top-N 真实带宽（curl / mixed-port）。`--workers 1` 或并发不可用时回退到串行 GLOBAL 模式，
+  测完自动恢复原模式和节点。
+- **运行时模块**：`clash_speedbench.py`、`speedbench_workers.py`、`speedbench_web.py`、
+  `speedbench_db.py`、`speedbench_ip_intel.py`、`speedbench_leak.py`、`speedbench_tray.py`。
+- **硬约束**：Python 3.9/3.12、Windows/macOS/Linux、标准库 + 系统 curl；无 pip runtime dependency。
+  PyYAML 仅是可选配置解析 fallback。
 
-## 已完成的 6 个适配点（代码位置）
+## 安装与路径确认
 
-| # | 适配点 | 位置 |
-|---|--------|------|
-| 1 | controller 候选按平台过滤（win32 跳过 unix socket） | `clash_speedbench.py:44-52` |
-| 2 | Verge 配置/mihomo 二进制 Windows 路径候选 | `speedbench_workers.py:91-118`，`find_mihomo_bin()` :131 |
-| 3 | YAML 解析 fallback 链：PyYAML → ruby（posix）→ 内置迷你解析器 → 清晰报错 | `extract_proxies()` :672；迷你解析器 :149-634 |
-| 4 | Windows 网卡检测（PowerShell Get-NetRoute）+ 虚拟网卡前缀扩充 | `physical_interface()` :742；`WIN_VIRTUAL_IFACE_PREFIXES` :782 |
-| 5 | 中断测速：win32 面板无控制台，cancel 写哨兵文件 `SPEEDBENCH_CANCEL_FILE`，测速核心在节点/轮次间隙 `cancel_requested()` 轮询、转 KeyboardInterrupt（走与 SIGINT 相同的 finally 恢复路径）；CLI 控制台场景仍保留 SIGBREAK handler | `speedbench_web.py`（CANCEL_FILE / run_benchmark / cancel_benchmark）；`clash_speedbench.py`（cancel_requested / clear_cancel_request / SIGBREAK） |
-| 6 | `SpeedBench.bat` 启动器、CI windows-latest 矩阵、release.yml windows job、README Windows 章节 | 根目录 / `.github/workflows/` |
+1. 安装 Python 3.9+（推荐 Microsoft Store 版），确认 `python --version` 可用；如 PATH 中
+   `pythonw` 被禁用，先修复 Python 安装或接受 bat 的控制台 fallback。
+2. 确认 Clash Verge Rev / Mihomo 正在运行并开启 External Controller。Windows 默认候选包括
+   `pipe://verge-mihomo`；TCP 9097 仅作为 fallback。若 Controller Secret 必填，设置
+   `MIHOMO_SECRET`，不要把 Secret 写进命令历史。
+3. 确认运行配置 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\clash-verge.yaml`
+   存在；找不到时把实际路径通过 `--config-file` 传给 CLI。`verge-mihomo.exe` 的候选路径在
+   `speedbench_workers.py`，不同安装方式可能需要补路径和 mock 测试。
+4. 从 Release 解压 `Clash-SpeedBench-v1.0.0-windows.zip`，保持 `web\` 目录与入口脚本同级，
+   双击 `SpeedBench.bat`。面板应打开 `http://127.0.0.1:8950`，并出现托盘图标。
 
-测试：`tests/test_windows.py`（39 个，mock 平台分支）、`tests/test_verge_yaml.py`（54 个，迷你解析器），全部在 mac 上 mock 验证过。
+## 离线回归
 
-## 真机验收 checklist（按顺序执行）
+在仓库根目录运行：
 
-1. **环境确认**：`python --version` ≥ 3.9（推荐 Microsoft Store 版）；Clash Verge Rev 已安装且正在运行。
-2. **路径确认（最重要）**：
-   - 确认 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\clash-verge.yaml` 存在；
-   - 找到 `verge-mihomo.exe` 实际位置，对照 `speedbench_workers.py:91-118` 的候选列表。不在列表里就补进去（常见：`%LOCALAPPDATA%\Programs\Clash Verge\`、`%ProgramFiles%\Clash Verge\`）。
-3. **跑测试**：仓库根目录 `python -m unittest discover -s tests`，应全绿（少数 PyYAML 对拍用例在无 PyYAML 时自动 skip，正常）。
-4. **双击 `SpeedBench.bat`**：bat 窗口闪过即关，**无常驻控制台**，自动打开浏览器到面板，右下角出现托盘图标。若报「未检测到 Python」但实际已装，检查 PATH（商店版 Python 有时要关掉「应用执行别名」干扰）。
-5. **小量测速**：面板里节点过滤填一个小组名（如 `香港`），每轮 10MB × 1 轮，开始测速。确认：实时进度/日志正常、结果表格有数据、IP 画像列有内容。
-6. **中断测速（重点验证项）**：测速跑到一半点「中断测速」，然后打开 Clash Verge 确认**代理模式/策略组选择已恢复原样**（这是哨兵文件取消路径的真机首验：面板无控制台，取消经 `%APPDATA%\ClashSpeedBench\cancel-request` 传递，mac 上只能 mock）。
-7. **排序与切换**：点表头按延迟/带宽排序；点「切换」换一个节点，确认 Clash Verge 里当前节点跟着变。
-8. **TUN 模式场景**（如果平时开 TUN）：开着 TUN 跑一次测速，worker 模式应检测虚拟网卡拒绝启动并回退串行模式（面板日志有提示），不应给出离谱结果。
-9. **全量测速**：不填过滤跑一次完整测速，确认 100+ 节点时的总耗时与稳定性。
-
-## 已知风险与排查指引
-
-- **verge-mihomo.exe 路径变体**：不同版本/安装方式位置可能不同。症状 = 面板报「未找到 mihomo」。修法 = 往 `MIHOMO_BIN_CANDIDATES` 加候选，补一个 mock 测试。
-- **哨兵文件取消不生效**：症状 = 点「中断测速」几秒后还在跑，或中断后 Clash 配置没恢复。排查 = 确认测速子进程环境里有 `SPEEDBENCH_CANCEL_FILE`（面板 run_benchmark 注入）、`%APPDATA%\ClashSpeedBench\cancel-request` 能被面板写出；5 秒无响应面板会兜底 terminate（不跑 finally，配置可能残留 GLOBAL 模式，需手动切回）。
-- **虚拟网卡名不在前缀表**：症状 = 开 TUN 时 worker 模式没有拒绝启动。修法 = `Get-NetAdapter` 看实际接口名，往 `WIN_VIRTUAL_IFACE_PREFIXES` 加前缀。
-- **PowerShell 输出乱码**：网卡检测已钉 UTF-8 输出 + `errors="replace"`，若中文 Windows 上接口名解析异常，先手动跑 `powershell -NoProfile -Command "(Get-NetRoute -DestinationPrefix '0.0.0.0/0').InterfaceAlias"` 看原始输出。
-- **迷你 YAML 解析器报错**：Verge 机器生成配置理论上是 serde_yaml 稳定子集。若真机配置触发了 `VergeYAMLError`，优先建议用户 `pip install pyyaml`（fallback 链第一级），再把触发样本的**结构**（脱敏后）补进 `tests/test_verge_yaml.py`。
-
-## 验收通过后：发版
-
-```bash
-# 在 Windows PC 上（或回 mac 上）：
-git tag v0.8.0 && git push origin v0.8.0
+```powershell
+python -m unittest discover -s tests -v
+python -c "import ast; from pathlib import Path; files=['clash_speedbench.py','speedbench_workers.py','speedbench_web.py','speedbench_switch.py','speedbench_ip_intel.py','speedbench_leak.py']; [ast.parse(Path(f).read_text(encoding='utf-8'), filename=f) for f in files]; print('AST syntax OK')"
 ```
 
-tag 推送会触发 `.github/workflows/release.yml`：mac job 产 `Clash-SpeedBench-v0.8.0-macos.zip`，windows job 产 `Clash-SpeedBench-v0.8.0-windows.zip`，自动建 GitHub Release（说明取 `.github/release-notes.md`）。两个 job 并发，先到的 create、后到的 upload --clobber，属正常设计。
+测试不调用真实 IPinfo、IPQS 或 Scamalytics API，所有 provider 使用 mock fixture。无 PyYAML 时，
+可选 YAML 对拍用例 skip 属于预期；不应因此安装 runtime package。
 
-发版后建议在 Releases 页面下载 windows zip 做一次**全新解压安装**验证（模拟小白用户路径）。
+## 真机验收 checklist
 
-## 开发约定（在那边改代码时遵守）
+1. **启动与安全**：双击 bat 后无常驻控制台（或仅在 `pythonw` 缺失时出现 fallback）；浏览器只能
+   访问 loopback；页面写操作缺少 token、Host 或 Origin 时返回 403。
+2. **小量测速**：节点过滤填一个小组名，使用 10MB × 1 轮。确认实时日志、结果表格、节点切换和
+   `speedbench-history.jsonl`/SQLite 增量历史正常。
+3. **稳定性指标**：默认 Phase 1 显示 3 次 probe 的 attempts/successes/failures/loss；使用
+   `python clash_speedbench.py --stability --limit 3 --yes` 验证 10 次。这里的 loss 是
+   **HTTP/HTTPS application-level probe failure rate**，不是 ICMP/物理链路 packet loss。
+4. **双栈出口**：详情中分别查看 IPv4 和 IPv6；IPv6 不可用应显示 unavailable/N/A，不应让节点失败。
+   节点 IPv6 能力与客户端真实 IPv6 绕过是两个独立问题。
+5. **取消与恢复**：测速中点“中断测速”，确认 `%APPDATA%\ClashSpeedBench\cancel-request`
+   哨兵可写，Clash 运行模式/策略组选择恢复原样。若 5 秒仍不退出，面板有 terminate 兜底；此时
+   手动检查 Clash 模式，不要继续并发启动第二轮。
+6. **TUN 场景**：保持 TUN 开启跑小规模测速。虚拟网卡检测失败或 worker 不可用时应有明确日志并
+   回退串行，不应输出明显错误的带宽；完成后确认模式恢复。
+7. **IP Intelligence（可选）**：无 Key 先验证 ip-api 基础画像与所有测速功能仍正常，IP Grade 应为
+   `N/A`。配置 Key 只能通过环境变量或 Web “IP 设置”页面；检查状态页只显示 configured/status，
+   不回显凭据。
+8. **泄漏页面**：打开 `#/leak`。WebRTC 采集完整且可比较时仅显示“未发现明显泄漏”；mDNS、隐私策略
+   或 STUN 失败时必须显示“无法确认”。打开 BrowserLeaks DNS / DNSLeakTest 人工查看 resolver；
+   本版不读系统 DNS、不抓 HTML，DNS 结论只能是 Guided Audit。
+9. **历史迁移**：升级前备份 JSONL/DB。首次启动只创建 `ip_intel_cache`、`ip_intel_results`、
+   `leak_audits` 和兼容列，不删除或重写 `runs.raw`；旧轮次 Intelligence 缺失时显示 N/A。
+10. **全量稳定性**：最后再跑 100+ 节点，观察总耗时、Provider cache hit 和退出恢复；确认同一个
+    出口 IP 的多个节点没有重复消耗第三方额度。
 
-- 零第三方依赖；中文注释/文案；改动配套 unittest；commit message 中文、仿 git log 风格。
-- 任何真实订阅配置/节点信息**绝不提交**（测试 fixture 一律手工脱敏构造）。
-- commit 用 `git -c user.name=voodookyo -c user.email=voodookyo@users.noreply.github.com commit ...`。
+## IP Intelligence 配置边界
+
+支持以下环境变量（均为可选）：
+
+```text
+SPEEDBENCH_IPINFO_TOKEN
+SPEEDBENCH_IPQS_KEY
+SPEEDBENCH_SCAMALYTICS_USERNAME
+SPEEDBENCH_SCAMALYTICS_KEY
+SPEEDBENCH_SCAMALYTICS_REGION=eu|us
+```
+
+Scamalytics v3 必须同时提供 Username、Key 和账户对应 Region；缺 Region 时状态为
+`configuration_incomplete`，不猜测 endpoint。Key 不得放在命令行、CSV、JSONL、SQLite、日志、URL、
+浏览器 localStorage/cookie 或 API response；面板输入默认仅保存在当前 localhost backend 进程内。
+
+SQLite cache 按 `provider + exit_ip` 去重：ip-api/基础 ASN/ISP TTL 7 天，Privacy/风险 TTL 24 小时。
+Provider 的 `key_missing`、`timeout`、`rate_limited`、`quota_unavailable` 等状态只影响对应来源，
+不应阻断节点测速。
+
+分类报告必须遵守：`ISP/非托管` 不等于住宅；`Residential` 与 `Residential Proxy` 分开；多源
+Hosting/Data Center 与 Residential 冲突时输出低置信度 Unknown/Conflict。SpeedBench IP Grade 是
+启发式推荐，不是 IPQS/Scamalytics 官方评级，也不是实际诈骗概率。
+
+## 已知风险与排查
+
+- **未检测到 mihomo**：检查 `speedbench_workers.py` 的 Windows 路径候选、PATH 和配置文件，必要时
+  使用 `--config-file`；不要提交真实配置或节点凭据。
+- **取消后模式未恢复**：检查子进程的 `SPEEDBENCH_CANCEL_FILE`、哨兵路径和 Clash Controller；
+  进程被强制 terminate 时 Python finally 不会执行，需手动恢复 Clash 模式后再报问题。
+- **虚拟网卡识别错误**：用 PowerShell 查看实际默认路由接口名，按现有前缀表增加脱敏 fixture，
+  不要在真机提交网络信息。
+- **IP provider 不可用**：先看面板 Provider 状态和 cache；超时、配额、套餐字段缺失属于可选来源
+  降级，不应让 IP 画像失败变成“干净”。
+- **WebRTC 显示无法确认**：可能是 mDNS、浏览器隐私策略或 STUN 不可用；这不是“无泄漏”，也不是
+  节点失败。DNS Guided Audit 同理。
+
+## 发布前边界
+
+本文件只规定本地验收，不执行 tag、push、merge 或 GitHub Release。发布 workflow 会在用户明确
+创建并推送 `v*` tag 后运行；在此之前应先让主 Agent 完成本地全量测试、审查打包清单和安全负向测试。

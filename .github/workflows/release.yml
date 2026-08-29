@@ -59,8 +59,9 @@ jobs:
           # staging：保证 zip 里是一层干净目录结构（Clash-SpeedBench/...）
           $stage = "release-stage/Clash-SpeedBench"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item clash_speedbench.py, speedbench_db.py, speedbench_switch.py, `
-            speedbench_web.py, speedbench_workers.py, speedbench_tray.py -Destination $stage
+          Copy-Item clash_speedbench.py, speedbench_db.py, speedbench_ip_intel.py, `
+            speedbench_leak.py, speedbench_switch.py, speedbench_web.py, `
+            speedbench_workers.py, speedbench_tray.py -Destination $stage
           Copy-Item SpeedBench.bat, speedbench.ico, README.md, LICENSE -Destination $stage
           Copy-Item web -Destination $stage -Recurse
           Compress-Archive -Path $stage -DestinationPath $zip -Force

@@ -750,6 +750,36 @@ class TrayModuleTest(unittest.TestCase):
         self.assertIn("speedbench_tray.py", sh,
                       "build_app.sh 的 macOS 打包清单缺少 speedbench_tray.py")
 
+    def test_release_packages_ip_intelligence_and_leak_modules(self):
+        """发布包必须带上 v1.0 的新增运行时模块。
+
+        这两个文件分别被 CLI/Web 面板导入；漏拷贝会让源码运行正常、
+        但 macOS App 或 Windows zip 在用户机器上启动即失败。因此这里
+        同时钉住 macOS copy/完整性校验、Windows Copy-Item 和 CI AST 清单。
+        """
+        modules = ("speedbench_ip_intel.py", "speedbench_leak.py")
+        release = (self.ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8")
+        build = (self.ROOT / "build_app.sh").read_text(encoding="utf-8")
+        ci = (self.ROOT / ".github" / "workflows" / "test.yml").read_text(
+            encoding="utf-8")
+        for module in modules:
+            self.assertIn(module, release,
+                          f"release.yml 的 Windows 打包清单缺少 {module}")
+            self.assertIn(module, build,
+                          f"build_app.sh 的 macOS 打包清单缺少 {module}")
+            self.assertIn(module, ci,
+                          f"test.yml 的 AST 语法清单缺少 {module}")
+
+        # 这些是当前发行包的运行时 Python 闭包；静态检查防止将新增模块
+        # 加进注释/测试说明，却没有真正加入 copy 命令。
+        win_copy = release[release.index("Copy-Item clash_speedbench.py"):]
+        for module in modules:
+            self.assertIn(module, win_copy)
+        mac_copy = build[build.index('cp "$ROOT/clash_speedbench.py"'):]
+        for module in modules:
+            self.assertIn(module, mac_copy)
+
 
 if __name__ == "__main__":
     unittest.main()

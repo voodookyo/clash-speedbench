@@ -31,6 +31,6 @@ jobs:
       - name: AST syntax check
         run: >-
           python -c "import ast; from pathlib import Path;
-          files = ['clash_speedbench.py', 'speedbench_workers.py', 'speedbench_web.py', 'speedbench_switch.py'];
+          files = ['clash_speedbench.py', 'speedbench_workers.py', 'speedbench_web.py', 'speedbench_switch.py', 'speedbench_ip_intel.py', 'speedbench_leak.py'];
           [ast.parse(Path(f).read_text(encoding='utf-8'), filename=f) for f in files];
           print('AST syntax OK:', ', '.join(files))"
