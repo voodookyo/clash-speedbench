@@ -3,7 +3,7 @@
 给**正在运行中的** Clash Verge Rev / Mihomo 加一个「节点体检」外挂：
 **延迟 + 真实带宽 + 多源出口 IP Intelligence + IP 风险评级 + 节点稳定性**，一次跑完直接排名。
 
-当前升级目标版本：**v1.0.0**。网络质量、IP 质量和客户端环境泄漏现在是三个彼此独立的维度。
+当前版本：**v1.0.1**。网络质量、IP 质量和客户端环境泄漏是三个彼此独立的维度。
 
 > English: A zero-dependency companion benchmark for a *running* Clash Verge Rev / Mihomo
 > instance — real per-node download Mbps, multi-source exit-IP intelligence and
@@ -91,7 +91,7 @@ macOS 用户也可以直接**双击 `speedbench.command`**（可拖到桌面或 
 
 ## IP Intelligence、分类与评分
 
-v1.0.0 将基础画像与第三方 Intelligence 分开。默认仍调用无需 Key 的
+自 v1.0.0 起，基础画像与第三方 Intelligence 分开。默认仍调用无需 Key 的
 `ip-api.com`，可选 provider 只使用各厂商官方 API：
 
 | 来源 | 主要内容 | 配置 | 默认缓存 |
@@ -308,13 +308,13 @@ export MIHOMO_SECRET='你的secret'
   BrowserLeaks DNS 或 DNSLeakTest 并人工判读，不读取系统 DNS、不抓取网页 HTML；未来可接自建
   `DnsLeakProvider`。
 
-## 升级与迁移（v0.8.2 / v0.9.1 → v1.0.0）
+## 升级与迁移（v0.8.2 / v0.9.1 / v1.0.0 → v1.0.1）
 
 这是向后兼容升级，可直接替换代码或重新解压发布包：
 
 1. 先备份现有 `speedbench-history.jsonl` 和 `speedbench-history.db`（Windows 默认在
    `%APPDATA%\ClashSpeedBench\`，macOS App 在 `~/Library/Application Support/ClashSpeedBench/`）。
-2. 安装 v1.0.0 后首次打开 Web 面板会增量导入旧 JSONL，并只创建新的
+2. 安装 v1.0.1 后首次打开 Web 面板会增量导入旧 JSONL，并只创建新的
    `ip_intel_cache`、`ip_intel_results`、`leak_audits` 表/兼容列；不会删除、重写 `runs.raw`，
    旧轮次缺失 Intelligence 时显示 N/A。
 3. 旧的 ip-api `ip_profiles` / 出口 IP / ASN 时间线继续可回放；新的轮次按出口 IP 复用缓存，

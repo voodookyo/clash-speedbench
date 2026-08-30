@@ -1,9 +1,9 @@
-# Windows 端适配交接文件（v1.0.0）
+# Windows 端适配交接文件（v1.0.1）
 
-本文档用于 Windows 10/11 的安装、离线回归和真机验收。v1.0.0 在保留 v0.9.1
-哨兵取消路径、托盘和 Mihomo worker 的基础上，加入多源 IP Intelligence、应用层稳定性探测、
-双栈出口及环境泄漏检测。当前仓库验证不等于真实机场配置上的端到端保证；发布前仍应在一台
-实际 Windows 机器上执行下方 checklist。
+本文档用于 Windows 10/11 的安装、离线回归和真机验收。v1.0.1 在 v1.0.0 的多源
+IP Intelligence、应用层稳定性探测、双栈出口和环境泄漏检测基础上，修复 IPinfo 官方
+`as` 响应兼容，并增加 ip-api 明文接口的完整 opt-out。当前仓库验证不等于真实机场配置上的
+端到端保证；发布前仍应在一台实际 Windows 机器上执行下方 checklist。
 
 ## 30 秒项目速览
 
@@ -27,7 +27,7 @@
 3. 确认运行配置 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\clash-verge.yaml`
    存在；找不到时把实际路径通过 `--config-file` 传给 CLI。`verge-mihomo.exe` 的候选路径在
    `speedbench_workers.py`，不同安装方式可能需要补路径和 mock 测试。
-4. 从 Release 解压 `Clash-SpeedBench-v1.0.0-windows.zip`，保持 `web\` 目录与入口脚本同级，
+4. 从 Release 解压 `Clash-SpeedBench-v1.0.1-windows.zip`，保持 `web\` 目录与入口脚本同级，
    双击 `SpeedBench.bat`。面板应打开 `http://127.0.0.1:8950`，并出现托盘图标。
 
 ## 离线回归
