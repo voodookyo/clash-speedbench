@@ -1,3 +1,10 @@
+## v1.0.2：修复中文 Windows 控制台 emoji 崩溃
+
+- **修复**：中文 Windows（GBK/cp936 控制台）下，节点名含国旗等区域指示符 emoji
+  （如 🇭🇰）时 CLI 打印直接抛 `UnicodeEncodeError` 中断测速。CLI 入口现在与 Web
+  面板一致，把 stdout/stderr 的错误处理设为 `replace`：GBK 能表示的中文不受影响，
+  emoji 在控制台退化为 `?`；面板子进程走管道时同样生效。Web UI 显示不受影响。
+
 ## v1.0.1：IPinfo 官方响应兼容与 ip-api 传输边界
 
 - **IPinfo 修复**：按当前官方 lookup 响应优先解析顶层 `as` 对象，同时兼容旧版

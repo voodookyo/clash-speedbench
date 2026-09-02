@@ -1714,7 +1714,24 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
     return 0
 
 
+def _reconfigure_stdio_for_console() -> None:
+    """让 stdout/stderr 遇到控制台编码无法表示的字符时替换而非崩溃。
+
+    中文 Windows 控制台（GBK/cp936）与西欧 cp1252 都无法编码节点名里的
+    emoji（如 🇭🇰 区域指示符、⚠️ 的 variation selector），直接 print 会
+    UnicodeEncodeError 中断整个测速（v1.0.1 用户实测）。与 Web 面板同款
+    策略：errors="replace"——GBK 能表示的中文不受影响，emoji 退化为 ?。
+    面板子进程走管道时同样继承本设置，覆盖所有启动路径。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass  # 非 TextIOWrapper 环境（IDLE/嵌入式/自定义捕获）跳过即可
+
+
 def main() -> int:
+    _reconfigure_stdio_for_console()
     parser = argparse.ArgumentParser(
         description="Clash SpeedBench — Clash Verge Rev / Mihomo 节点综合测速（网络性能 + IP Intelligence）"
     )
