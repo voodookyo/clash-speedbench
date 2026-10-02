@@ -278,11 +278,51 @@ cp -R "dist/Clash SpeedBench.app" /Applications/
 | `--history PATH` | 历史记录 JSONL 路径 | 脚本目录下 |
 | `--no-history` | 不写历史记录 | 关 |
 
-设置了 External Controller Secret 时，用环境变量传入（避免写进 shell history）：
+### Clash Verge 控制器自动连接
+
+SpeedBench 的 CLI、Web 当前节点/切换和测速入口会自动读取本机 Clash Verge 的
+`clash-verge.yaml`，获得控制器地址及 `secret`，包含新版 Windows 动态命名管道。
+正常情况下直接双击启动即可，不需要每次设置环境变量，也不需要关闭控制器认证。
+此密钥是 **Mihomo External Controller 访问密钥**，与可选的 IPinfo/IPQS/Scamalytics API Key 无关。
+
+默认配置目录：
+
+- Windows：`%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\`
+- macOS：`~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/`
+- Linux：`$XDG_CONFIG_HOME/io.github.clash-verge-rev.clash-verge-rev/`，未设置时使用 `~/.config/`。
+
+运行配置不存在时才回退同目录的 `config.yaml`；不能读取/不支持的格式会明确提示，
+仍保留旧版默认地址探测。便携版或自定义配置目录未被自动发现时，可以通过 CLI 的
+`--controller` 指定控制器，并用环境变量提供密钥；Web 仍支持默认地址与 `MIHOMO_SECRET` 回退。
+控制器字段仅支持 Verge 生成的顶层单行标量，不执行 YAML，不引入第三方 Python 依赖。
+
+优先级为显式 `--secret` > `MIHOMO_SECRET` > 本机配置（显式空值也属于手动设置）。
+错误或过期的手动密钥不会被自动覆盖；恢复自动发现时需移除旧环境变量。
+`--controller` 限定连接目标；自动密钥只发给同一配置文件声明的本机 loopback/IPC 地址，
+不发给不匹配的地址或远程控制器。手动连接远程实例仍需自行提供其密钥。
+每次连接重读本机配置；自动认证失败最多再重读一次，不自动重放节点切换操作。
+
+密钥只在后端内存中使用，不返回浏览器，不写测速历史、SQLite、日志或子进程命令行；
+自动密钥也不写入全局环境，不传给测速 worker 或 IP Intelligence provider。
+Web 测速在启动子进程前验证认证，失败立即报告，不再等待不可见的密码输入。
+交互 CLI 保留隐藏密码输入；`--non-interactive` 或非终端输入时认证失败直接退出。
+
+手动覆盖示例（这些命令仍会进入 shell history，请勿将含实际密钥的历史/截图公开）：
 
 ```bash
 export MIHOMO_SECRET='你的secret'
 ```
+
+Windows PowerShell：
+
+```powershell
+$env:MIHOMO_SECRET = '你的secret'
+.\SpeedBench.bat
+```
+
+若此前设置过临时变量，移除后可测试自动发现：`Remove-Item Env:MIHOMO_SECRET -ErrorAction SilentlyContinue`。
+若用户/系统级变量仍存在，还需在 Windows 环境变量设置中移除旧值，并从新进程启动。
+更新程序后必须退出旧 SpeedBench 后台再重新启动；仅刷新或关闭浏览器不会加载新后端代码。
 
 ## 注意事项
 
