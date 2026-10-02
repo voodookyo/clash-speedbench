@@ -30,15 +30,15 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from clash_speedbench import (  # noqa: E402
-    MihomoAPI,
     build_selectable_graph,
-    detect_controller,
+    connect_controller,
     pick_switch_group,
 )
 import speedbench_db  # noqa: E402
 import speedbench_ip_intel  # noqa: E402
 import speedbench_leak  # noqa: E402
 import speedbench_tray  # noqa: E402
+import speedbench_controller  # noqa: E402
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
@@ -214,7 +214,7 @@ def _provider_env_snapshot() -> dict:
 
 def _redact_runtime_text(value: object) -> str:
     """Redact in-memory provider credentials before a line reaches STATE."""
-    text = str(value)
+    text = speedbench_controller.redact_text(value)
     try:
         config = _provider_config()
         for secret in (config.ipinfo_token, config.ipqs_key,
@@ -348,6 +348,7 @@ def run_benchmark(params: dict) -> None:
     # -u：子进程 stdout 走管道时默认块缓冲，进度行会堵在缓冲区里，
     # 面板看不到实时进度；无缓冲模式让每行立即到达。
     cmd = [sys.executable, "-u", str(SCRIPT), "--yes", "--history", str(HISTORY)]
+    cmd += ["--non-interactive"]
     if params.get("include"):
         cmd += ["--include", str(params["include"])]
     if params.get("mb"):
@@ -364,6 +365,9 @@ def run_benchmark(params: dict) -> None:
         STATE["exit_code"] = None
 
     try:
+        # No hidden getpass prompt or benchmark spawn when authentication fails.
+        # The child resolves fresh local config itself; no auto key in argv/env.
+        connect_controller()
         # Windows：面板无控制台（pythonw 启动），测速子进程同样没有可依附的
         # 控制台——CTRL_BREAK_EVENT 无处可投，取消改走哨兵文件（见
         # cancel_benchmark / CANCEL_FILE）。CREATE_NO_WINDOW 防止子进程弹窗。
@@ -445,10 +449,7 @@ def cancel_benchmark() -> dict:
 
 def do_switch(name: str) -> dict:
     try:
-        base, needs_secret = detect_controller(os.environ.get("MIHOMO_SECRET", ""), None)
-        if needs_secret:
-            return {"ok": False, "msg": "Controller 需要 Secret，请设置环境变量 MIHOMO_SECRET 后再试"}
-        api = MihomoAPI(base, secret=os.environ.get("MIHOMO_SECRET", ""))
+        api = connect_controller()
         proxies = api.get("/proxies").get("proxies", {})
         graph = build_selectable_graph(proxies)
         group = pick_switch_group(proxies, graph, name, "GLOBAL")
@@ -460,16 +461,13 @@ def do_switch(name: str) -> dict:
         api.select(group, name)
         return {"ok": True, "msg": f"已切换 {group} → {name}", "group": group, "now": name}
     except Exception as e:
-        return {"ok": False, "msg": str(e)}
+        return {"ok": False, "msg": _redact_runtime_text(e)}
 
 
 def get_current() -> dict:
     """The main selector group (largest non-GLOBAL Selector) and its current node."""
     try:
-        base, needs_secret = detect_controller(os.environ.get("MIHOMO_SECRET", ""), None)
-        if needs_secret:
-            return {"ok": False, "msg": "需要 Secret"}
-        api = MihomoAPI(base, secret=os.environ.get("MIHOMO_SECRET", ""))
+        api = connect_controller()
         proxies = api.get("/proxies").get("proxies", {})
         graph = build_selectable_graph(proxies)
         cands = [g for g in graph
@@ -478,7 +476,7 @@ def get_current() -> dict:
         return {"ok": True, "group": group,
                 "now": str(proxies.get(group, {}).get("now", ""))}
     except Exception as e:
-        return {"ok": False, "msg": str(e)}
+        return {"ok": False, "msg": _redact_runtime_text(e)}
 
 
 def _basic_ip_lookup(ip: str) -> dict:
@@ -606,7 +604,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, obj, code: int = 200) -> None:
-        self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+        self._send(code, json.dumps(speedbench_controller.redact_payload(obj), ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
 
     def _read_body(self) -> dict:

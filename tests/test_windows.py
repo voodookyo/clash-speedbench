@@ -418,6 +418,7 @@ class BenchmarkPopenFlagsTest(WebStateCase):
                 mock.patch.object(web.subprocess, "Popen",
                                   return_value=proc) as m_popen, \
                 mock.patch.object(web, "sync_db"), \
+                mock.patch.object(web, "connect_controller"), \
                 mock.patch.object(subprocess, "CREATE_NO_WINDOW",
                                   self.FAKE_NO_WINDOW, create=True), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -517,7 +518,7 @@ class SigbreakRegistrationTest(unittest.TestCase):
                 mock.patch.object(signal, "SIGBREAK", self.FAKE_SIGBREAK,
                                   create=True), \
                 mock.patch.object(sys, "argv", ["clash_speedbench.py", "--yes"]), \
-                mock.patch.object(csb, "detect_controller",
+                mock.patch.object(csb, "connect_controller",
                                   side_effect=csb.ApiError("停止于 controller 探测")), \
                 contextlib.redirect_stderr(io.StringIO()):
             return csb.main()
@@ -526,7 +527,7 @@ class SigbreakRegistrationTest(unittest.TestCase):
         old_handler = signal.getsignal(self.FAKE_SIGBREAK)
         try:
             rc = self.run_main("win32")
-            self.assertEqual(rc, 1)  # detect_controller 失败路径，注册已发生
+            self.assertEqual(rc, 1)  # connect_controller 失败路径，注册已发生
             handler = signal.getsignal(self.FAKE_SIGBREAK)
             self.assertTrue(callable(handler))
             self.assertNotIn(handler, (signal.SIG_DFL, signal.SIG_IGN,
@@ -758,7 +759,7 @@ class TrayModuleTest(unittest.TestCase):
         但 macOS App 或 Windows zip 在用户机器上启动即失败。因此这里
         同时钉住 macOS copy/完整性校验、Windows Copy-Item 和 CI AST 清单。
         """
-        modules = ("speedbench_ip_intel.py", "speedbench_leak.py")
+        modules = ("speedbench_ip_intel.py", "speedbench_leak.py", "speedbench_controller.py")
         release = (self.ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8")
         build = (self.ROOT / "build_app.sh").read_text(encoding="utf-8")

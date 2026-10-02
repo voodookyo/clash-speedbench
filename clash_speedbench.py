@@ -42,6 +42,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import speedbench_controller as controller_config
+
 from speedbench_ip_intel import (
     IpIntelCache,
     IpIntelligence,
@@ -307,6 +309,7 @@ class WinPipeHTTPConnection(http.client.HTTPConnection):
 class MihomoAPI:
     def __init__(self, base: str, secret: str = "", timeout: float = 5.0):
         base = base.rstrip("/")
+        self.controller_base = base
         self.unix_path: Optional[str] = None
         self.pipe_name: Optional[str] = None
         if base.startswith("unix://"):
@@ -319,6 +322,9 @@ class MihomoAPI:
         else:
             self.base = base
         self.secret = secret
+        if not controller_config.valid_secret(secret):
+            raise ApiError("Controller Secret 含非法字符，请检查密钥")
+        controller_config.remember_secret(secret)
         self.timeout = timeout
 
     def request(self, method: str, path: str, data: Optional[dict] = None) -> Any:
@@ -349,19 +355,22 @@ class MihomoAPI:
             resp = conn.getresponse()
             raw = resp.read()
         except (OSError, http.client.HTTPException) as e:
-            raise ApiError(f"{method} {path}: {e}") from e
+            raise ApiError(controller_config.redact_text(f"{method} {path}: {e}", (self.secret,))) from None
         finally:
             conn.close()
 
         if resp.status in (401, 403):
             raise Unauthorized(f"Controller returned HTTP {resp.status}")
         if resp.status >= 400:
-            detail = raw.decode("utf-8", "replace")[:500]
+            detail = controller_config.redact_text(raw.decode("utf-8", "replace"), (self.secret,))[:500]
             raise ApiError(f"{method} {path}: HTTP {resp.status}: {detail}")
         if not raw:
             return None
         if raw[:1] in (b"{", b"["):
-            return json.loads(raw.decode("utf-8"))
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                raise ApiError(f"{method} {path}: Controller 返回了无效 JSON") from None
         return raw.decode("utf-8", "replace")
 
     def get(self, path: str) -> Any:
@@ -564,9 +573,85 @@ def get_secret_if_needed(base: str, secret: str, needs_secret: bool) -> str:
         return secret
     if secret:
         return secret
+    if sys.stdin is None or not sys.stdin.isatty():
+        raise ApiError("Controller 需要访问密钥；请检查本机 Clash Verge 配置或设置 MIHOMO_SECRET")
     print(f"\n检测到 {base}，但 API 需要访问密钥。")
     print("可在 Clash Verge Rev → Clash 设置 → 外部控制 中查看/设置访问密钥。")
     return getpass.getpass("请输入 External Controller Secret（输入时不显示）: ").strip()
+
+
+def connect_controller(secret: Optional[str] = None, explicit: Optional[str] = None,
+                       interactive: bool = False) -> MihomoAPI:
+    """Resolve endpoint/key together and verify before any business operation.
+
+    None means no command-line override. An explicitly empty argument or
+    environment variable deliberately disables auto credentials. Refresh is
+    bounded and only applies to auto configuration, never to API writes.
+    """
+    manual = secret if secret is not None else os.environ.get("MIHOMO_SECRET")
+    if manual is not None and not controller_config.valid_secret(manual):
+        raise ApiError("Controller Secret 含非法字符，请检查 --secret / MIHOMO_SECRET")
+    if manual is not None:
+        controller_config.remember_secret(manual)
+    explicit_base = controller_config.canonical_explicit(explicit) if explicit else None
+    unauthorized = None
+    warnings = []
+    attempted = []
+    for refresh in range(2):
+        discovered, warnings = controller_config.discover_targets()
+        targets = []
+        if explicit_base:
+            bound = [t for t in discovered if t.base == explicit_base]
+            if bound:
+                targets = bound
+            else:
+                targets = [controller_config.ControllerTarget(explicit_base)]
+        else:
+            targets = list(discovered)
+            declared = {t.base for t in targets}
+            targets.extend(controller_config.ControllerTarget(base) for base in DEFAULT_CONTROLLERS
+                           if base not in declared)
+        seen = set()
+        auto_failed = False
+        for target in targets:
+            actual_secret = manual if manual is not None else target.secret
+            identity = (target.base, actual_secret)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if target.base.startswith("unix://") and not os.path.exists(target.base[7:]):
+                continue
+            attempted.append(target.base)
+            api = MihomoAPI(target.base, secret=actual_secret)
+            api.controller_source = "manual" if manual is not None else target.source
+            try:
+                api.get("/version")
+                return api
+            except Unauthorized:
+                if unauthorized is None:
+                    unauthorized = api
+                if manual is None and target.source == "verge_config":
+                    auto_failed = True
+            except ApiError:
+                continue
+        if refresh or not auto_failed:
+            break
+    if unauthorized is not None:
+        if manual is None and interactive and sys.stdin is not None and sys.stdin.isatty():
+            entered = getpass.getpass("请输入 External Controller Secret（输入时不显示）: ")
+            api = MihomoAPI(unauthorized.controller_base, secret=entered.strip())
+            try:
+                api.get("/version")
+                return api
+            except ApiError:
+                raise ApiError("Controller 认证失败，请检查输入的访问密钥") from None
+        if manual is not None:
+            raise ApiError("Controller 认证失败：请检查 --secret / MIHOMO_SECRET；手动设置优先于自动配置")
+        raise ApiError("Controller 需要有效访问密钥；请检查 Clash Verge 外部控制设置、本机运行配置或设置 MIHOMO_SECRET")
+    detail = "；".join(warnings)
+    candidates = controller_config.redact_text(", ".join(dict.fromkeys(attempted)))
+    raise ApiError("找不到 Mihomo External Controller。已尝试: " + candidates
+                   + "\n请确认 Clash Verge 正在运行并开启外部控制。" + detail)
 
 
 def leaf_nodes(proxies: Dict[str, dict]) -> Dict[str, dict]:
@@ -1738,8 +1823,10 @@ def main() -> int:
     parser.add_argument("--controller",
                         help="External Controller，例如 http://127.0.0.1:9097、"
                              "unix:///tmp/verge/verge-mihomo.sock 或 pipe://verge-mihomo（Windows）")
-    parser.add_argument("--secret", default=os.environ.get("MIHOMO_SECRET", ""),
-                        help="API secret；建议用环境变量 MIHOMO_SECRET，避免写进 shell history")
+    parser.add_argument("--secret", default=None,
+                        help="API secret；默认自动读取本机 Verge，MIHOMO_SECRET 可覆盖；避免写入命令行")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="认证失败直接退出，不等待控制台密码输入（Web 面板使用）")
     parser.add_argument("--include", help="只测试名称匹配此正则的节点，例如 '香港|HK'")
     parser.add_argument("--exclude", default=r"(?i)(剩余|流量|到期|官网|套餐|公告|倍率|traffic|expire)",
                         help="排除名称匹配此正则的节点")
@@ -1826,9 +1913,7 @@ def main() -> int:
     clear_cancel_request()
 
     try:
-        base, needs_secret = detect_controller(args.secret, args.controller)
-        secret = get_secret_if_needed(base, args.secret, needs_secret)
-        api = MihomoAPI(base, secret=secret)
+        api = connect_controller(args.secret, args.controller, interactive=not args.non_interactive)
         version = api.get("/version")
         config = api.get("/configs")
         proxy_data = api.get("/proxies")
@@ -1943,7 +2028,7 @@ def main() -> int:
 
     print("Clash SpeedBench")
     print(f"Mihomo: {version.get('version', version)}")
-    print(f"Controller: {base}")
+    print(f"Controller: {controller_config.redact_text(api.controller_base)}")
     print(f"Mixed port: {mixed_port}")
     print(f"Root group: {root}")
     print(f"候选节点: {len(candidates)}")
