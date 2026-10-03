@@ -43,6 +43,7 @@ fallback.
 from __future__ import annotations
 
 import json
+import math
 import ipaddress
 import os
 import re
@@ -54,7 +55,7 @@ import sys
 import tempfile
 import threading
 from speedbench_sources import apply_origin
-from speedbench_progress import phase, publish_result
+from speedbench_progress import phase, publish_result, measure
 import time
 import copy
 import queue
@@ -1126,13 +1127,26 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
     ip: Optional[IpInfo] = None
     exit_ipv4: Optional[str] = None
     exit_ipv6: Optional[str] = None
+    partial = Result(name=name,provider='',proto=proto,latency_ms=latency,jitter_ms=jitter,
+                     speeds_mbps=[],median_mbps=None,best_mbps=None,status='probe-only')
+    apply_origin(partial,getattr(args,'source_origins',{}).get(name))
+    partial.exit_status = dict(ipv4='not_requested' if args.no_ip else 'pending',
+                               ipv6='not_requested' if args.no_ip else 'pending')
+    if probe_stats is not None:
+        _apply_probe_stats(partial,probe_stats)
+    def early_exit(family,address,status):
+        if family=='legacy':
+            partial.exit_status['basic'] = status
+        else:
+            setattr(partial,'exit_'+family,address)
+            partial.exit_status[family] = status
+        publish_result(args,'node_exit',partial,phase_name='probing')
     if not args.no_ip:
         try:
             worker.select(name)
             time.sleep(args.settle)
-            exit_ipv4, exit_ipv6, data = fetch_exit_ips(
-                worker.proxy_url, args.ip_timeout
-            )
+            extra = dict(on_result=early_exit,progress_args=args) if getattr(args,'progress',None) is not None else {}
+            exit_ipv4, exit_ipv6, data = fetch_exit_ips(worker.proxy_url,args.ip_timeout,**extra)
             if data:
                 ip = classify_ip(data)
         except Exception:
@@ -1141,6 +1155,7 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
                     speeds_mbps=[], median_mbps=None, best_mbps=None,
                     status="ok", ip=ip, jitter_ms=jitter,
                     exit_ipv4=exit_ipv4, exit_ipv6=exit_ipv6)
+    result.exit_status = partial.exit_status if getattr(args,'progress',None) is not None else None
     if probe_stats is not None:
         _apply_probe_stats(result, probe_stats)
     return result
@@ -1158,32 +1173,59 @@ def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
     # --mb 未显式指定时先 ~1MB 预热估速，再自适应样本大小
     mb = args.mb
     max_time = args.max_time
+    r.download_bytes = 0
+    counter_lock = threading.Lock()
+    def add_sample(counts,speed,size):
+        with counter_lock:
+            counts['attempts'] += 1
+            counts['successes'] += int(speed is not None)
+            if isinstance(size,(int,float)) and math.isfinite(size) and size>=0:
+                known = round(size*1_000_000)
+                r.download_bytes += known
+                counts['bytes'] += known
     if mb is None:
-        rough = warmup_speed(worker.proxy_url, min(3.0, args.max_time))
+        with measure(args,'warmup') as counts:
+            if getattr(args,'progress',None) is not None:
+                rough = warmup_speed(worker.proxy_url,min(3.0,args.max_time),
+                                     on_sample=lambda speed,size:add_sample(counts,speed,size))
+            else:
+                rough = warmup_speed(worker.proxy_url, min(3.0, args.max_time))
         mb, max_time = adaptive_sample(rough, args.max_time)
     r.sample_mb = mb
 
     speeds: List[float] = []
     statuses: List[str] = []
     for round_i in range(args.rounds):
+        if cancel_requested():
+            raise KeyboardInterrupt
         byte_count = mb * 1_000_000
         url = (DEFAULT_DOWNLOAD_URL.format(bytes=byte_count)
                + f"&measId={int(time.time()*1000)}-p2-{round_i}")
-        speed, status, c_ms, _sz = curl_speed(
-            proxy_url=worker.proxy_url,
-            download_url=url,
-            max_time=max_time,
-            connect_timeout=min(3.0, max_time),
-        )
+        with measure(args,'download') as counts:
+            speed, status, c_ms, _sz = curl_speed(
+                proxy_url=worker.proxy_url,
+                download_url=url,
+                max_time=max_time,
+                connect_timeout=min(3.0, max_time),
+            )
+            add_sample(counts,speed,_sz)
         statuses.append(status)
         if r.connect_ms is None and c_ms is not None:
             r.connect_ms = c_ms
         if speed is not None:
             speeds.append(speed)
+        # Keep each completed round in the shared result immediately. An
+        # interrupted later round must not discard prior real samples.
+        r.speeds_mbps = list(speeds)
+        r.median_mbps = statistics.median(speeds) if speeds else None
+        r.best_mbps = max(speeds) if speeds else None
+        r.status = 'ok' if speeds else ';'.join(statuses)[:160]
 
     if getattr(args, "multi", False):
-        r.multi_mbps = multi_stream_speed(worker.proxy_url, mb * 1_000_000,
-                                          max_time, min(3.0, max_time))
+        with measure(args,'download') as counts:
+            extra = {'on_sample':lambda speed,size:add_sample(counts,speed,size)} if getattr(args,'progress',None) is not None else {}
+            r.multi_mbps = multi_stream_speed(worker.proxy_url, mb * 1_000_000,
+                                              max_time, min(3.0, max_time),**extra)
 
     r.speeds_mbps = speeds
     r.median_mbps = statistics.median(speeds) if speeds else None
@@ -1297,7 +1339,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     hosts = None
     if config is None or config.mode == 'legacy':
         print("正在解析测试域名与节点服务器域名（DoH）…")
-        hosts = build_hosts(with_dependencies(selected, all_proxies))
+        with measure(args,'dns'):
+            hosts = build_hosts(with_dependencies(selected, all_proxies))
     started = time.time()
     total = len(selected)
 
@@ -1322,12 +1365,15 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         try:
             try:
                 callback = {'on_result':publish_probe} if getattr(args,'progress',None) is not None else {}
-                latency_map = probe_latency_pool(
-                    main_api, [str(p.get("name")) for p in selected],
-                    args.delay_timeout,
-                    probe_count=_probe_count_from_args(args),
-                    **callback,
-                )
+                with measure(args,'delay') as counts:
+                    latency_map = probe_latency_pool(
+                        main_api, [str(p.get("name")) for p in selected],
+                        args.delay_timeout,
+                        probe_count=_probe_count_from_args(args),
+                        **callback,
+                    )
+                    counts['attempts'] = sum(s.attempts for s in latency_map.values() if isinstance(s,ProbeStats))
+                    counts['successes'] = sum(s.successes for s in latency_map.values() if isinstance(s,ProbeStats))
             except TypeError:
                 # Preserve compatibility with older injected pool functions.
                 latency_map = probe_latency_pool(
@@ -1401,7 +1447,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     dns_names = pending_names | {r.name for r in initial_chosen}
     if hosts is None:
         print("正在解析入选节点及依赖域名（DoH）…")
-        hosts = build_hosts(with_dependencies([p for p in selected if p.get('name') in dns_names], all_proxies))
+        with measure(args,'dns'):
+            hosts = build_hosts(with_dependencies([p for p in selected if p.get('name') in dns_names], all_proxies))
     if ip_pending:
         worker_count = max(1, min(args.workers, len(ip_pending)))
         print(f"Phase 1 粗筛 · IP 画像: 启动 {worker_count} 个并发 worker"
@@ -1471,7 +1518,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                 # stop_live_workers().
                 live_workers.append(worker)
             try:
-                worker.start()
+                with measure(args,'worker_start'):
+                    worker.start()
                 for p in claim_nodes(shard):
                     if cancelled():  # 节点间检查取消标志，尽快收队
                         return
@@ -1509,7 +1557,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                     print(f"Phase 1 粗筛 [{idx:>3}/{ip_total}] {name} | "
                           f"{fmt_ms(r.latency_ms)}{jitter_brief} ms{ip_txt}")
             finally:
-                worker.stop()
+                with measure(args,'cleanup'):
+                    worker.stop()
 
         def guarded(shard: List[dict]) -> None:
             try:
@@ -1597,7 +1646,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
             # Phase 2 单 worker 同样并入 dialer-proxy 依赖闭包
             worker2 = Worker(mihomo_bin, with_dependencies(chosen_proxies, all_proxies),
                              hosts, iface)
-            worker2.start()
+            with measure(args,'worker_start'):
+                worker2.start()
         except Exception as e:
             print(f"⚠️ Phase 2 worker 启动失败，保留 Phase 1 粗筛结果: {e}",
                   file=sys.stderr)
@@ -1636,8 +1686,10 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
             except KeyboardInterrupt:
                 # 保留已完成的精测结果，继续走报告
                 print("\n\n收到 Ctrl+C，停止精测（保留已完成结果，正在清理 worker）……")
+                args.cancelled = True
             finally:
-                worker2.stop()
+                with measure(args,'cleanup'):
+                    worker2.stop()
 
     # 汇总打分/标签：Phase 2 节点已算分；连通但未精测的标「未精测」而非「不通」
     measured = {r.name for r in chosen}
@@ -1646,6 +1698,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
             r.measurement_scope = dict(mode=config.mode,
                 probe='completed' if r.probe_successes else 'failed',
                 bandwidth=('completed' if r.median_mbps is not None else
+                           'cancelled' if getattr(args,'cancelled',False) and r.name in {c.name for c in chosen} else
                            'failed' if r.sample_mb is not None else
                            'not_selected' if config.bandwidth else 'not_requested'),
                 exit=('not_requested' if args.no_ip else
@@ -1662,7 +1715,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     if intel_enricher is None:
         intel_enricher = start_intelligence_enrichment(results,args)
     phase(args,'enriching')
-    finish_intelligence_enrichment(intel_enricher, results)
+    with measure(args,'provider'):
+        finish_intelligence_enrichment(intel_enricher, results)
     for r in results:
         publish_result(args,'node_intelligence',r,phase_name='enriching')
 

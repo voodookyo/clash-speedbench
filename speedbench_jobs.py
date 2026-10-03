@@ -5,6 +5,7 @@ yet an SSE transport or a cancellation mechanism; those must share this state
 when connected to the benchmark runner, rather than infer progress from logs.
 """
 import json
+import math
 import secrets
 import threading
 import time
@@ -34,6 +35,25 @@ RESULT_SCALARS = ('name','provider','node_id','proto','latency_ms','jitter_ms','
 SCOPE_FIELDS = ('mode','probe','bandwidth','exit','intel')
 MAX_PAYLOAD = 65536
 MAX_RESULTS = 10000
+METRIC_PHASES = ('connection','discovery','dns','worker_start','delay','exit_v4','exit_v6',
+                 'basic_intel','provider','warmup','download','summary','restore','cleanup','probe')
+
+
+def safe_metrics(value):
+    public = {}
+    if not isinstance(value,dict):
+        return public
+    for phase,metric in value.items():
+        if phase not in METRIC_PHASES or not isinstance(metric,dict):
+            continue
+        def count(key):
+            v = metric.get(key,0)
+            return v if isinstance(v,int) and not isinstance(v,bool) and 0<=v<2**63 else 0
+        d = metric.get('duration_ms',0)
+        d = d if isinstance(d,(int,float)) and not isinstance(d,bool) and 0<=d<=1e15 and math.isfinite(d) else 0
+        public[phase] = dict(duration_ms=d,attempts=count('attempts'),
+                            successes=min(count('successes'),count('attempts')),bytes=count('bytes'))
+    return public
 IP_FIELDS = ('exit_ip','country','country_code','region','city','isp','org','asn','asname','kind',
              'proxy','hosting','mobile','ok')
 INTEL_FIELDS = ('ip','ip_version','country','asn','as_name','isp','organization','hosting','proxy',
@@ -74,6 +94,9 @@ def _result(value):
     scope = value.get('measurement_scope')
     if isinstance(scope,dict):
         public['measurement_scope'] = {k:scope[k] for k in SCOPE_FIELDS if isinstance(scope.get(k),str)}
+    if isinstance(value.get('exit_status'),dict):
+        public['exit_status'] = {k:v for k,v in value['exit_status'].items()
+            if k in ('ipv4','ipv6','basic') and v in ('pending','completed','failed','not_requested')}
     if isinstance(value.get('samples_mbps'),list):
         public['samples_mbps'] = [v for v in value['samples_mbps'][:5] if isinstance(v,(int,float))]
     if isinstance(value.get('ip'),dict):
@@ -155,7 +178,8 @@ class JobStore:
             job_id = 'job_'+secrets.token_hex(16)
             self.jobs[job_id] = dict(job_id=job_id,status='queued',config=config.public(),
                 started_at=_timestamp(),finished_at=None,seq=0,partial=False,
-                results={},results_truncated=False,events=deque(maxlen=self.event_limit))
+                results={},results_truncated=False,metrics={},elapsed_ms=0,
+                _started_clock=time.monotonic(),events=deque(maxlen=self.event_limit))
             self.active = job_id
             self._append(self.jobs[job_id],'job_started','', '', {})
             return job_id
@@ -177,6 +201,7 @@ class JobStore:
             job['status'] = status
             if status in TERMINAL:
                 job['finished_at'] = _timestamp()
+                job['elapsed_ms'] = max(0,time.monotonic()-job['_started_clock'])*1000
                 job['partial'] = status != 'completed'
                 if self.active == job_id:
                     self.active = None
@@ -198,10 +223,16 @@ class JobStore:
                   and not isinstance(payload[k],bool) and 0 <= payload[k] <= MAX_RESULTS}
         if 'result' in payload:
             public['result'] = _result(payload['result'])
+        if event_type=='phase_finished' and 'metrics' in payload:
+            public['metrics'] = safe_metrics(payload['metrics'])
         with self.lock:
             job = self._job(job_id)
             if job['status'] in TERMINAL:
                 return False
+            for phase,metric in public.get('metrics',{}).items():
+                target = job['metrics'].setdefault(phase,dict(duration_ms=0,attempts=0,successes=0,bytes=0))
+                for key,value in metric.items():
+                    target[key] += value
             if node_id and 'result' in public:
                 if node_id in job['results'] or len(job['results']) < MAX_RESULTS:
                     job['results'].setdefault(node_id,{}).update(public['result'])
@@ -213,7 +244,9 @@ class JobStore:
     def _snapshot(self, job):
         # Snapshot can be larger than an individual bounded event. It still
         # has a fixed MAX_RESULTS cap and only contains whitelisted records.
-        public = {k:v for k,v in job.items() if k not in ('results','events')}
+        public = {k:v for k,v in job.items() if k not in ('results','events','_started_clock')}
+        if job['status'] not in TERMINAL:
+            public['elapsed_ms'] = max(0,time.monotonic()-job['_started_clock'])*1000
         public['version'] = 1
         public['results'] = list(job['results'].values())
         return json.loads(json.dumps(public,ensure_ascii=False,allow_nan=False))

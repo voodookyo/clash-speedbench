@@ -188,6 +188,8 @@ CREATE TABLE IF NOT EXISTS task_metrics (
 
 # 旧库就地升级时要补的列（新库的 SCHEMA 已包含，_ensure_columns 对其为 no-op）
 _EXTRA_COLUMNS = {
+    'runs': [('job_id','TEXT')],
+    'task_runs': [('elapsed_ms','REAL')],
     "node_results": [
         ("node_key", "TEXT"), ("exit_ipv4", "TEXT"), ("exit_ipv6", "TEXT"),
         ("fail_reason", "TEXT"),
@@ -237,6 +239,7 @@ def _open(db_path) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     _ensure_columns(conn)
     conn.execute('CREATE INDEX IF NOT EXISTS idx_node_results_identity ON node_results(node_id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_runs_job ON runs(job_id)')
     return conn
 
 
@@ -340,14 +343,16 @@ def save_task(db_path, snapshot):
         if old and old[0] in _TASK_TERMINAL:
             return False
         conn.execute('''INSERT INTO task_runs
-            (job_id,mode,target_profile,status,started_at,finished_at,config_json,partial,results_json)
-            VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
+            (job_id,mode,target_profile,status,started_at,finished_at,config_json,partial,results_json,elapsed_ms,run_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,(SELECT id FROM runs WHERE job_id=? ORDER BY id DESC LIMIT 1)) ON CONFLICT(job_id) DO UPDATE SET
             status=excluded.status, finished_at=excluded.finished_at,
-            partial=excluded.partial, results_json=excluded.results_json''',
+            partial=excluded.partial, results_json=excluded.results_json,
+            elapsed_ms=excluded.elapsed_ms,run_id=excluded.run_id''',
             (job_id, config.get('mode','legacy'),config.get('target_profile','balanced'),
              status,str(snapshot.get('started_at',''))[:64],
              str(snapshot['finished_at'])[:64] if snapshot.get('finished_at') else None,
-             _safe_json(config,'{}'),int(status!='completed'),_safe_json(results,'[]')))
+             _safe_json(config,'{}'),int(status!='completed'),_safe_json(results,'[]'),
+             max(0,min(_db_number(snapshot.get('elapsed_ms')) or 0,1e15)),job_id))
         for phase, metric in snapshot.get('metrics',{}).items():
             if phase not in _TASK_PHASES or not isinstance(metric,dict):
                 continue
@@ -372,7 +377,7 @@ def save_task(db_path, snapshot):
 def _task_row(row):
     return dict(version=1,job_id=row[0],mode=row[1],target_profile=row[2],status=row[3],
                 started_at=row[4],finished_at=row[5],config=json.loads(row[6]),
-                run_id=row[7],partial=bool(row[8]))
+                run_id=row[7],partial=bool(row[8]),elapsed_ms=row[10])
 
 
 def task_history(db_path, limit=100):
@@ -782,6 +787,9 @@ def import_jsonl(db_path, jsonl_path) -> int:
                 if cur.rowcount == 0:
                     continue  # 并发下 ts 已被其他连接写入：跳过（仍幂等）
                 run_id = cur.lastrowid
+                job_id = rec.get('task',{}).get('job_id') if isinstance(rec.get('task'),dict) else None
+                if isinstance(job_id,str) and re.fullmatch(r'job_[0-9a-f]{32}',job_id):
+                    conn.execute('UPDATE runs SET job_id=? WHERE id=?',(job_id,run_id))
                 for r in results:
                     if isinstance(r, dict):
                         _insert_result(conn, run_id, r)

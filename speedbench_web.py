@@ -759,7 +759,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4:
                 self._json(JOBS.snapshot(job_id))
                 return
-            cursor = qs.get('since_seq',[self.headers.get('Last-Event-ID','0')])[0]
+            cursor = self.headers.get('Last-Event-ID') or qs.get('since_seq',['0'])[0]
             if not re.fullmatch(r'[0-9]{1,20}',cursor):
                 raise JobError('事件游标无效')
             since = int(cursor)

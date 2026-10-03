@@ -36,7 +36,7 @@ import sys
 import time
 import unicodedata
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -46,7 +46,7 @@ import speedbench_controller as controller_config
 import speedbench_sources as source_catalog
 import speedbench_tasks
 from speedbench_process import run_cancellable
-from speedbench_progress import ProgressEmitter, phase, publish_result
+from speedbench_progress import ProgressEmitter, phase, publish_result, measure
 
 from speedbench_ip_intel import (
     IpIntelCache,
@@ -552,6 +552,8 @@ class Result:
     dual_stack_inconsistent: bool = False
     origin: Optional[dict] = None          # safe, versioned source/identity fields
     measurement_scope: Optional[dict] = None
+    download_bytes: Optional[int] = None  # observed curl bytes, not requested sample size
+    exit_status: Optional[dict] = None
 
 
 def detect_controller(secret: str, explicit: Optional[str]) -> Tuple[str, bool]:
@@ -850,12 +852,14 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
 WARMUP_BYTES = 1_000_000  # ~1MB 预热请求，用于估粗速度
 
 
-def warmup_speed(proxy_url: str, connect_timeout: float) -> Optional[float]:
+def warmup_speed(proxy_url: str, connect_timeout: float, on_sample=None) -> Optional[float]:
     """~1MB 轻量下载估粗速度（Mbps），供自适应样本大小参考；失败返回 None。"""
     url = (DEFAULT_DOWNLOAD_URL.format(bytes=WARMUP_BYTES)
            + f"&measId=warmup-{int(time.time()*1000)}")
-    mbps, _, _, _ = curl_speed(proxy_url, url, max_time=5.0,
+    mbps, _, _, size = curl_speed(proxy_url, url, max_time=5.0,
                                connect_timeout=connect_timeout)
+    if on_sample is not None:
+        on_sample(mbps,size)
     return mbps
 
 
@@ -879,12 +883,14 @@ def adaptive_sample(rough_mbps: Optional[float],
 
 
 def multi_stream_speed(proxy_url: str, byte_count: int, max_time: float,
-                       connect_timeout: float, streams: int = 4) -> Optional[float]:
+                       connect_timeout: float, streams: int = 4, on_sample=None) -> Optional[float]:
     """同一节点 streams 路并发 curl，合计带宽 Mbps（峰值参考）；全部失败返回 None。"""
     def one(i: int) -> Optional[float]:
         url = (DEFAULT_DOWNLOAD_URL.format(bytes=byte_count)
                + f"&measId=multi-{int(time.time()*1000)}-{i}")
-        mbps, _, _, _ = curl_speed(proxy_url, url, max_time, connect_timeout)
+        mbps, _, _, size = curl_speed(proxy_url, url, max_time, connect_timeout)
+        if on_sample is not None:
+            on_sample(mbps,size)
         return mbps
 
     with ThreadPoolExecutor(max_workers=streams) as pool:
@@ -933,6 +939,8 @@ def probe_latency(api: MihomoAPI, name: str, timeout_ms: int,
     vals: List[float] = []
     failures = 0
     for _ in range(attempts):
+        if cancel_requested():
+            raise KeyboardInterrupt
         try:
             d = api.proxy_delay(name, DEFAULT_DELAY_URL, timeout_ms)
         except Exception:
@@ -1065,7 +1073,7 @@ def _coerce_exit_family(value: Any, version: int) -> Optional[str]:
     return str(parsed) if parsed.version == version else None
 
 
-def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
+def fetch_exit_ips(proxy_url: str, timeout: float, on_result=None, progress_args=None) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
     """Return ``(IPv4, IPv6, legacy ip-api payload)`` for one tested node.
 
     The independent exit requests run together so a slow IPv6-only endpoint
@@ -1077,6 +1085,14 @@ def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optio
     ip-api leaves both ipify probes active and returns a ``None`` legacy value.
     """
     ip_api_enabled = load_provider_config().ip_api_enabled
+    values = {}
+    def request(name,function,*params):
+        metric_name = dict(ipv4='exit_v4',ipv6='exit_v6',legacy='basic_intel')[name]
+        with measure(progress_args,metric_name) as counts:
+            counts['attempts'] = 1
+            value = function(*params)
+            counts['successes'] = int(value is not None)
+            return value
     # Keep the legacy ip-api self lookup alongside both ipify calls only when
     # enabled: it remains the documented IPv4 fallback, while a slow/failed
     # source cannot multiply the per-node timeout.  Each worker is independent
@@ -1084,21 +1100,30 @@ def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optio
     # node measurement.
     with ThreadPoolExecutor(max_workers=3 if ip_api_enabled else 2) as pool:
         futures = {
-            "ipv4": pool.submit(fetch_exit_ip, proxy_url, timeout, False),
-            "ipv6": pool.submit(fetch_exit_ip, proxy_url, timeout, True),
+            "ipv4": pool.submit(request,'ipv4',fetch_exit_ip, proxy_url, timeout, False),
+            "ipv6": pool.submit(request,'ipv6',fetch_exit_ip, proxy_url, timeout, True),
         }
         if ip_api_enabled:
-            futures["legacy"] = pool.submit(fetch_ip_info, proxy_url, timeout)
+            futures["legacy"] = pool.submit(request,'legacy',fetch_ip_info, proxy_url, timeout)
 
-        def read(name: str):
+        names = {future:name for name,future in futures.items()}
+        for future in as_completed(names):
+            name = names[future]
             try:
-                return futures[name].result()
+                value = future.result()
             except Exception:
-                return None
+                value = None
+            if name != 'legacy':
+                value = _coerce_exit_family(value,4 if name=='ipv4' else 6)
+            elif not isinstance(value,dict):
+                value = None
+            values[name] = value
+            if on_result is not None:
+                on_result(name,value,'completed' if value else 'failed')
 
-    ipv4 = _coerce_exit_family(read("ipv4"), 4)
-    legacy = read("legacy") if ip_api_enabled else None
-    ipv6 = _coerce_exit_family(read("ipv6"), 6)
+    ipv4 = values.get('ipv4')
+    legacy = values.get('legacy')
+    ipv6 = values.get('ipv6')
 
     # Keep the fallback after all requests are joined.  Do not trust an
     # arbitrary ip-api query value: validate that it really is IPv4 so a
@@ -1109,6 +1134,8 @@ def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optio
             parsed = ipaddress.ip_address(str(candidate).strip())
             if parsed.version == 4:
                 ipv4 = str(parsed)
+                if on_result is not None:
+                    on_result('ipv4',ipv4,'completed')
         except (TypeError, ValueError):
             pass
     return ipv4, ipv6, legacy
@@ -1482,7 +1509,9 @@ def star_str(score: float) -> str:
 def make_tags(r: Result) -> str:
     tags = []
     if r.median_mbps is None:
-        tags.append("不通")
+        scope = (r.measurement_scope or {}).get('bandwidth')
+        tags.append('未精测' if scope=='not_selected' else '未请求带宽' if scope=='not_requested' else
+                    '已取消' if scope=='cancelled' else "不通")
     else:
         if r.median_mbps < 5:
             tags.append("龟速")
@@ -1699,6 +1728,8 @@ def result_to_dict(r: Result) -> dict:
         "provider": r.provider,
         **source_catalog.result_origin(r.origin),
         **({"measurement_scope": r.measurement_scope} if r.measurement_scope else {}),
+        **({'download_bytes':r.download_bytes} if r.download_bytes is not None else {}),
+        **({'exit_status':r.exit_status} if r.exit_status is not None else {}),
         "node_key": r.node_key,
         "proto": r.proto,
         "latency_ms": r.latency_ms,
@@ -1740,7 +1771,7 @@ def result_to_dict(r: Result) -> dict:
 
 
 def append_history(results: List[Result], path: Path, mb: Optional[int], rounds: int,
-                   csv_path: Optional[Path]) -> None:
+                   csv_path: Optional[Path], task=None) -> None:
     record = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "mb": mb,
@@ -1748,6 +1779,12 @@ def append_history(results: List[Result], path: Path, mb: Optional[int], rounds:
         "csv": str(csv_path) if csv_path else "",
         "results": [result_to_dict(r) for r in rank_results(results)],
     }
+    if task:
+        # Opt-in task metadata; old CLI/history consumers keep their exact
+        # record shape. No paths, credentials, raw stdout or arbitrary config.
+        record['task'] = {k:v for k,v in task.items() if k in
+                          ('job_id','mode','target_profile','partial') and isinstance(v,(str,bool))}
+        record['ts'] = datetime.now().isoformat(timespec='microseconds')
     try:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -1817,8 +1854,16 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
     if any("未精测" in (r.tags or "") for r in results):
         print("注：「未精测」节点仅完成 Phase 1 粗筛（延迟/连通性/IP 画像），未参与带宽精测。")
     if not args.no_history:
-        append_history(results, Path(args.history), args.mb, args.rounds, out)
-    if args.auto_switch:
+        task = None
+        if getattr(args,'progress',None) is not None or getattr(args,'mode',None):
+            task = dict(mode=getattr(args,'mode',None) or 'legacy',
+                        target_profile=getattr(args,'target_profile','balanced'),
+                        partial=bool(getattr(args,'cancelled',False) or cancel_requested()))
+            if getattr(args,'progress',None) is not None:
+                task['job_id'] = args.progress.job_id
+        with measure(args,'summary'):
+            append_history(results, Path(args.history), args.mb, args.rounds, out,task=task)
+    if args.auto_switch and not getattr(args,'cancelled',False) and not cancel_requested():
         graph = build_selectable_graph(proxies)
         auto_switch_best(api, proxies, graph, args.root_group, results, args.switch_group)
     return 0
@@ -1965,19 +2010,23 @@ def main() -> int:
     phase(args,'preparing')
 
     try:
-        api = connect_controller(args.secret, args.controller, interactive=not args.non_interactive)
-        version = api.get("/version")
-        config = api.get("/configs")
-        proxy_data = api.get("/proxies")
+        with measure(args,'connection') as counts:
+            counts['attempts'] = 1
+            api = connect_controller(args.secret, args.controller, interactive=not args.non_interactive)
+            version = api.get("/version")
+            config = api.get("/configs")
+            proxy_data = api.get("/proxies")
+            counts['successes'] = 1
     except (ApiError, Unauthorized) as e:
         print(f"错误：{e}", file=sys.stderr)
         return 1
 
     proxies: Dict[str, dict] = proxy_data.get("proxies", {})
     leaves = leaf_nodes(proxies)
-    catalog = source_catalog.discover_catalog(
-        api, os.environ.get('SPEEDBENCH_HOME') or str(Path(args.history).resolve().parent),
-        config_file=args.config_file, snapshot=proxies)
+    with measure(args,'discovery'):
+        catalog = source_catalog.discover_catalog(
+            api, os.environ.get('SPEEDBENCH_HOME') or str(Path(args.history).resolve().parent),
+            config_file=args.config_file, snapshot=proxies)
     args.source_origins = {n['runtime_name']: n for n in catalog['nodes']}
     if args.subscription_id or args.node_id:
         known_sources = {s['subscription_id'] for s in catalog['sources'] if s['loaded']}

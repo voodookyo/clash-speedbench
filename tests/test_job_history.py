@@ -33,6 +33,17 @@ class JobHistoryTest(unittest.TestCase):
         self.assertEqual(len(db.task_history(self.database)),1)
         self.assertEqual(db.task_snapshot(self.database,self.job)['results'],[])
 
+    def test_task_links_only_its_own_compatible_raw_record_and_keeps_elapsed(self):
+        jsonl = self.database.with_suffix('.jsonl')
+        jsonl.write_text(json.dumps(dict(ts='2026-01-01T01:01:01',results=[],task={'job_id':self.job}))+'\n',encoding='utf-8')
+        db.import_jsonl(self.database,jsonl)
+        snapshot = self.store.snapshot(self.job)
+        snapshot['elapsed_ms'] = 1234
+        db.save_task(self.database,snapshot)
+        task = db.task_snapshot(self.database,self.job)
+        self.assertEqual(task['run_id'],1)
+        self.assertEqual(task['elapsed_ms'],1234)
+
     def test_terminal_status_cannot_be_regressed_by_delayed_checkpoint(self):
         queued = self.store.snapshot(self.job)
         self.store.transition(self.job,'failed')

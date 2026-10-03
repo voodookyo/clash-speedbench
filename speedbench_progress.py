@@ -5,7 +5,9 @@ import os
 import re
 import sys
 import threading
-from speedbench_jobs import EVENT_TYPES, PHASES, MAX_PAYLOAD, _result
+import time
+from contextlib import contextmanager
+from speedbench_jobs import EVENT_TYPES, PHASES, MAX_PAYLOAD, _result, safe_metrics
 
 PREFIX = '@speedbench-event '
 
@@ -31,6 +33,8 @@ class ProgressEmitter:
         safe = {k:payload[k] for k in ('completed','total') if isinstance(payload.get(k),int)}
         if 'result' in payload:
             safe['result'] = _result(payload['result'])
+        if event_type=='phase_finished' and 'metrics' in payload:
+            safe['metrics'] = safe_metrics(payload['metrics'])
         with self.lock:
             self.seq += 1
             record = dict(version=1,job_id=self.job_id,source_seq=self.seq,type=event_type,
@@ -59,6 +63,25 @@ def phase(args,name):
     emitter = getattr(args,'progress',None)
     if emitter is not None:
         emitter.emit('phase_started',name)
+
+
+@contextmanager
+def measure(args,name):
+    """Concurrent spans are accumulated service time, not additive wall time.
+
+    Callers supply observed curl bytes; request budgets never count as traffic.
+    If an in-flight command is forcibly interrupted its unreported bytes are
+    unknown, not guessed. Parent elapsed_ms separately measures complete wait.
+    """
+    counts = dict(attempts=0,successes=0,bytes=0)
+    started = time.monotonic()
+    try:
+        yield counts
+    finally:
+        emitter = getattr(args,'progress',None)
+        if emitter is not None:
+            counts['duration_ms'] = max(0,time.monotonic()-started)*1000
+            emitter.emit('phase_finished',payload={'metrics':{name:counts}})
 
 
 def publish_result(args,event_type,result,*,phase_name='',completed=None,total=None):
