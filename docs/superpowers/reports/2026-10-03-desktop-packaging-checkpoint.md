@@ -17,14 +17,15 @@
 - 3ff2443／8548d62：直接 CLI 与私有委派子任务目录所有权、EOF 取消、正常完成管道退出及缓存写入者回收。
 - 8755c87：CLI 取消／异常部分结果留存、报告失败不掩盖原退出码、包内 JSONL／SQLite／任务状态独立验收。
 - 52092d0：串行阶段计时与所有已报告下载样本计数、取消尝试计数、主实例已完成探测计数留存。
-- 最新产物固定源码：`52092d071b1c561e3d5c9b6af0d73c3c65e448ec`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345、8548d62、8755c87 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
+- a416425：逐次 probe 留存、独立 main／worker／serial 元数据、取消停止未开始的队列、共享详情说明和包内取消任务验收。
+- 最新产物固定源码：`a4164256d7b861145c3fa8219527c26d8af50503`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345、8548d62、8755c87、52092d0 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
 - 桌面版本 `1.1.0-alpha.1`，运行时 CPython `3.14.8`，平台 `windows-x86_64`。核心稳定版入口与 legacy 测速默认未改为桌面 alpha。
-- 当前包目录 `dist/desktop-artifacts/52092d071b1c/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告提交不改变此包的冻结源码。
+- 当前包目录 `dist/desktop-artifacts/a4164256d7b8/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告提交不改变此包的冻结源码。
 
 | 文件 | 字节 | SHA-256 |
 |---|---:|---|
-| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12763358 | ce59801f23c7cc852512aae81db1ec22988d683045fe1fa34f954bd191bb7dd0 |
-| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15743627 | d939b30348482ec6d2604b511a6ebad6be8a27c2f7a53c4a382ad5f4bca1f600 |
+| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12767573 | 2f3d3fef15f836c4ebf0a86fddecd5aa80e9db98b1ae49c095553616ee1b77ee |
+| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15746830 | 6e591950387906e5dad321a594acf15287b577d41e2aa8bcb55e449a8f4bec94 |
 
 SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核对。包 **unsigned**，自动更新禁用；WebView2 是系统组件，不是单文件免运行时承诺。
 
@@ -135,6 +136,17 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 - 文件：clash_speedbench.py、speedbench_progress.py、speedbench_workers.py、tests/test_measurement_accounting.py、desktop/verify_windows_package.py、README、desktop/README、本报告与实施清单。未 push／tag／Release、安装覆盖，未使用用户网络或真实第三方 API。
 
 这不是 B5／B7 的完整出口：单个多次 probe 中途取消的已完成样本、provider/cache 计数和五个性能里程碑还须补齐；原生传输与全阶段取消资源预算、相同覆盖真实测速对照仍待实现／验收。标准 CLI 的阶段指标不另写入旧 legacy raw；Web／桌面任务事件沿既有 task_metrics 入库。并发累计 span 不可直接相加为总等待时间。
+
+### 逐次应用层探测留存与取消队列
+
+- a416425：每次返回后冻结 completed 样本；主实例、worker 兜底、串行三条路径分别保留 `probe_sources`。已调用次数与完成样本分母不同，未返回的取消请求不补造成功／失败。主字段采用当前有效路径，不能把主实例 100% 失败与 worker 50% 失败简单合并；所有原有效延迟、jitter、探测次数和测速方法保留。
+- 失败先行覆盖：串行 CLI 组内中断、主实例池部分节点、worker 兜底中断／完成、通道关闭、未开始取消、非有限返回、子线程取消和 queued nodes。停止标志在失败线程重新领取队列前设定，取消后不启动排队节点或下一 sample，但在途 controller 请求仍等待返回／超时后 join。一次 callback TypeError 不得导致再次实际探测。冻结 runtime name 作为本任务 legacy 行键，修复 Shadowsocks／ss 拼写造成重复行，不改 stable ID 或切换权限。
+- 14 项新 probe 回归＋2 项详情 JS 回归；71 项专项通过（1.191s）。Windows Python3.14.7、3.9.25、3.12.10 全量各 **845 tests，OK (skipped=7)**，耗时 40.265／42.067／42.481s，三轮并行，不能作为测速性能比较。日志在 ignored `dist/probe-partial-python{314,39,312}-tests.log`。`node --check web/app.js`、`git diff --check` 通过。Rust 7 项通过，test 2.21s。
+- 前端验收目标：`#/nodes` → 点击 fixture 节点名称单元格 → 展开独立路径 → 刷新后再次展开。Browser plugin/browser skill 未列出，使用已提供 CUA IAB `tab.playwright`／DOM／console／viewport／screenshot，不安装依赖；fixture API 全为合成数据，不读取真实历史／controller／provider。URL 127.0.0.1:10652、标题、非空、无框架 overlay、error/warn=[]、完整／部分／已调用／完成分母与非 ICMP 说明均通过。1280×1000 和 390×844 检查后恢复 viewport 并关闭临时 tab/server；窄表格仍需横向／纵向滚动，不能称完整移动适配通过。IAB full-page 截图出现错误布局，DOM rect 与 viewport 截图正常，本次仅采用 viewport 截图证据，不据此修改产品 CSS。
+- 截图未入仓库／包：`C:/Users/VoodooKyo/AppData/Local/Temp/speedbench-probe-qa-20261003/desktop.jpg` 与 `narrow.jpg`。临时 fixture 仅 ignored dist 脚本，不进资源清单；没有启动真实测速或外部 DNS／STUN。
+- 冻结 clean a416425，70 项资源／CPython3.14.8，locked/offline NSIS／ZIP unsigned 构建与独立解包验收通过。实际包内后端→CLI 使用真实 probe primitive＋fake controller 值（20、None、中断），退出130，追加 cancelled/partial JSONL，SQLite raw 精确保留，任务只一行，完成2／失败1／loss50%、started3 与 delay metrics 3 attempts／1 success 一致，lease 最终可重新取得。此前 failed download 的250000字节／1attempt／1success fixture 与完整性／Origin／重启／私有所有权／worker 隔离继续通过。两包 Get-FileHash 与 provenance 独立一致。
+
+没有 schema／依赖新增、IP 评分／缓存策略改动、push 或覆盖 Downloads。剩余 provider/cache 计数／五性能里程碑、全传输硬预算、同覆盖真实性能、C/D 完整矩阵／迁移／原生 GUI／macOS/Linux 仍待完成；目标 active，B5/B7、C/D 不全勾选。
 
 ## 仍未完成
 
