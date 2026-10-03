@@ -16,14 +16,15 @@
 - 1243345：登记 worker 并发清理、显式目录生命周期，持续失败不能被动态 shard 吞掉；CLI 专用退出码／后端 failed 和后续任务阻断。
 - 3ff2443／8548d62：直接 CLI 与私有委派子任务目录所有权、EOF 取消、正常完成管道退出及缓存写入者回收。
 - 8755c87：CLI 取消／异常部分结果留存、报告失败不掩盖原退出码、包内 JSONL／SQLite／任务状态独立验收。
-- 最新产物固定源码：`8755c87ba6e67ebc342c97442fa6ba775cb40390`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345、8548d62 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
+- 52092d0：串行阶段计时与所有已报告下载样本计数、取消尝试计数、主实例已完成探测计数留存。
+- 最新产物固定源码：`52092d071b1c561e3d5c9b6af0d73c3c65e448ec`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345、8548d62、8755c87 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
 - 桌面版本 `1.1.0-alpha.1`，运行时 CPython `3.14.8`，平台 `windows-x86_64`。核心稳定版入口与 legacy 测速默认未改为桌面 alpha。
-- 当前包目录 `dist/desktop-artifacts/8755c87ba6e6/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告提交不改变此包的冻结源码。
+- 当前包目录 `dist/desktop-artifacts/52092d071b1c/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告提交不改变此包的冻结源码。
 
 | 文件 | 字节 | SHA-256 |
 |---|---:|---|
-| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12760253 | 6df35de11fc60d0a827db983ecb1cc285a8362dd59601ffdc02d59c682de79db |
-| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15742613 | 59f786b028d34155993057785789ae5292d50d7263b5730483e3ee915639079f |
+| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12763358 | ce59801f23c7cc852512aae81db1ec22988d683045fe1fa34f954bd191bb7dd0 |
+| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15743627 | d939b30348482ec6d2604b511a6ebad6be8a27c2f7a53c4a382ad5f4bca1f600 |
 
 SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核对。包 **unsigned**，自动更新禁用；WebView2 是系统组件，不是单文件免运行时承诺。
 
@@ -122,6 +123,18 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 - 修改文件：clash_speedbench.py、speedbench_progress.py、speedbench_workers.py、speedbench_web.py；test_cli_partial_history、test_cli_ownership、test_ip_intel_integration、test_job_api、test_progress_stream；desktop/verify_windows_package.py、README、desktop/README 和本报告／实施清单。未 push/tag/Release、覆盖用户安装或修改真实 Verge。
 
 这是失败留存子功能验收，不是完整原子磁盘提交／全生命周期硬取消预算保证。强制 kill、磁盘不可写或连续再次中断仍可能无法落盘；已提交行不追溯改为后来中断状态。B5/B7 与 C/D 仍不整体勾选。
+
+### 串行／worker 测量观测计数与阶段覆盖
+
+- 52092d0：DownloadCounter 只负责同节点的已调用请求尝试、返回成功和 curl 已报告字节，使用锁保护多流 callbacks。开始下载即冻结 partial 快照；warmup 中断不误标未选精测。单流／warmup／多流均沿原函数／顺序执行，直接 CLI 也计算所有已报告样本字节；中断流的未知字节不以预算补齐。没有跨节点并发下载、采样大小／时限／测速源／评分更改。
+- 串行路径补 delay、warmup、download、restore、provider wait；summary span 覆盖整个成功或部分报告（包括 CSV／JSONL 和错误），不是只计算 append_history。worker fallback probe 单独计数，main delay 已完成节点的统计逐次累计，随后池取消不清空为零。字段仍为既有白名单的 duration_ms/attempts/successes/bytes，没有 schema 或依赖新增。
+- 失败先行：串行缺少 spans、取消的第二轮漏 attempt、无进度通道的 CLI 漏 warmup／multi 字节、多流中断丢已完成流、warmup 中断无 partial、池中断清空已完成探测统计，均用 fake curl/controller 与临时数据复现并修复。新增 test_measurement_accounting 11 项，82 项专项通过；同节点多流通过 barrier 证明四条都开始后再打断一条，不用调度巧合宣称全部尝试。
+- 初次 3.9／3.12 全量暴露新夹具对快速失败报告强求真实耗时 >0：较粗 monotonic 时钟可以合法测出 0。夹具只替换 progress 模块的时钟，以确定性正向步进验证 finally span；没有给生产耗时加虚假最小值，包验证检查存在且非负。
+- 最终 `python -m unittest discover -s tests -v`：Windows Python3.14.7 829 tests／34.304s、3.9.25 829／33.816s、3.12 829／33.864s，均 OK (skipped=7)。日志在 ignored `dist/accounting-python*-tests.log`，三版并行，不是同覆盖性能对照。git diff --check、验收脚本 py_compile 通过；Rust locked/offline 7 tests／2.30s。
+- 冻结 clean 52092d0，70 项资源／包内 Python3.14.8；Windows unsigned NSIS／ZIP locked/offline 构建、独立解包验收通过。真实包内后端→CLI failed fixture 除原 raw／partial task，还检查 250000 已报告下载字节、1 attempt／1 success、summary metric 持久化到 SQLite。原有完整性／篡改／Origin／重启／偏好／worker 隔离／CLI 所有权均通过。独立 Get-FileHash 与 provenance 一致。
+- 文件：clash_speedbench.py、speedbench_progress.py、speedbench_workers.py、tests/test_measurement_accounting.py、desktop/verify_windows_package.py、README、desktop/README、本报告与实施清单。未 push／tag／Release、安装覆盖，未使用用户网络或真实第三方 API。
+
+这不是 B5／B7 的完整出口：单个多次 probe 中途取消的已完成样本、provider/cache 计数和五个性能里程碑还须补齐；原生传输与全阶段取消资源预算、相同覆盖真实测速对照仍待实现／验收。标准 CLI 的阶段指标不另写入旧 legacy raw；Web／桌面任务事件沿既有 task_metrics 入库。并发累计 span 不可直接相加为总等待时间。
 
 ## 仍未完成
 
