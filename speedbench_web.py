@@ -31,7 +31,7 @@ sys.path.insert(0, str(HERE))
 
 from clash_speedbench import (  # noqa: E402
     build_selectable_graph,
-    connect_controller,
+    connect_controller as core_connect_controller,
     pick_switch_group,
 )
 import speedbench_db  # noqa: E402
@@ -46,6 +46,7 @@ from speedbench_progress import PREFIX, parse_record
 from speedbench_owner import BackendLease, LeaseError
 from speedbench_preferences import Preferences, PreferenceError
 import speedbench_releases
+from speedbench_config import ENV as ROOT_ENV, RootChoice, validate_root, ConfigRootError
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
@@ -60,6 +61,7 @@ CANCEL_FILE = DATA_HOME / "cancel-request"
 # 只认列出的静态文件、不做任何路径拼接，其余一律 404。
 WEB_DIR = HERE / "web"
 STATIC_FILES = {
+    '/static/config-root.js': ('config-root.js','application/javascript; charset=utf-8'),
     '/static/releases.js': ('releases.js','application/javascript; charset=utf-8'),
     '/static/preferences.js': ('preferences.js','application/javascript; charset=utf-8'),
     '/static/view.js': ('view.js','application/javascript; charset=utf-8'),
@@ -98,6 +100,14 @@ DESKTOP_ACTIONS = None
 DESKTOP_SHUTDOWN = None
 DESKTOP_EXITING = None
 RELEASE_CHECKER = speedbench_releases.ReleaseChecker()
+CONFIG_ROOT = RootChoice(os.environ.get(ROOT_ENV,''))
+
+
+def connect_controller(*args,**kwargs):
+    root,_revision=CONFIG_ROOT.snapshot()
+    if root or ROOT_ENV in os.environ:
+        kwargs.setdefault('config_root',root)
+    return core_connect_controller(*args,**kwargs)
 
 
 def _release_version():
@@ -236,6 +246,10 @@ def _provider_env_snapshot() -> dict:
 def _redact_runtime_text(value: object) -> str:
     """Redact in-memory provider credentials before a line reaches STATE."""
     text = speedbench_controller.redact_text(value)
+    root,_revision=CONFIG_ROOT.snapshot()
+    if isinstance(root,str) and root:
+        for private in (root,root.replace('\\','/'),json.dumps(root,ensure_ascii=False)[1:-1]):
+            text=text.replace(private,'[自定义配置目录]')
     try:
         config = _provider_config()
         for secret in (config.ipinfo_token, config.ipqs_key,
@@ -442,7 +456,11 @@ def run_benchmark(params: dict) -> None:
             checkpoint()
         # No hidden getpass prompt or benchmark spawn when authentication fails.
         # The child resolves fresh local config itself; no auto key in argv/env.
-        connect_controller()
+        root=params.get('_config_root')
+        if root is None:
+            connect_controller()
+        else:
+            connect_controller(config_root=root)
         if job_id:
             with STATE_LOCK:
                 requested = STATE.get('cancel_requested',False)
@@ -460,6 +478,9 @@ def run_benchmark(params: dict) -> None:
                 popen_kwargs["creationflags"] = flags
         # 把哨兵文件路径传给子进程（clash_speedbench.py 的 cancel_requested）
         env = _provider_env_snapshot()
+        if root is not None:
+            env.pop(ROOT_ENV,None)
+            if root:env[ROOT_ENV]=root
         env["SPEEDBENCH_CANCEL_FILE"] = str(CANCEL_FILE)
         if job_id:
             env['SPEEDBENCH_JOB_ID'] = job_id
@@ -574,10 +595,13 @@ def cancel_benchmark() -> dict:
         return {"ok": False, "msg": f"中断失败: {e}"}
 
 
-def get_catalog(api=None, snapshot=None):
+def get_catalog(api=None, snapshot=None, config_root=None):
     try:
-        api = api if api is not None else connect_controller()
-        return speedbench_sources.discover_catalog(api, HISTORY.parent, snapshot=snapshot)
+        root=CONFIG_ROOT.snapshot()[0] if config_root is None else config_root
+        api = api if api is not None else connect_controller(config_root=root)
+        options={'snapshot':snapshot,'config_root':root}
+        if root:options['config_file']=str(Path(root)/'clash-verge.yaml')
+        return speedbench_sources.discover_catalog(api, HISTORY.parent, **options)
     except Exception:
         return dict(version=2, status='controller_unavailable', sources=[], nodes=[])
 
@@ -603,10 +627,11 @@ def _check_source_selection(params):
 
 def do_switch(name: str, node_id: str = '') -> dict:
     try:
-        api = connect_controller()
+        root,revision=CONFIG_ROOT.snapshot()
+        api = connect_controller(config_root=root)
         proxies = api.get("/proxies").get("proxies", {})
         if node_id:
-            catalog = get_catalog(api, snapshot=proxies)
+            catalog = get_catalog(api, snapshot=proxies,config_root=root)
             matches = [n for n in catalog['nodes'] if n['node_id'] == node_id]
             if len(matches) != 1 or matches[0]['runtime_name'] not in proxies:
                 return {'ok': False, 'msg': '节点身份已失效，请刷新目录后重试'}
@@ -616,9 +641,12 @@ def do_switch(name: str, node_id: str = '') -> dict:
         if not group:
             return {"ok": False, "msg": f"找不到包含 {name} 的 Selector 组"}
         current = proxies.get(group, {}).get("now")
-        if current == name:
-            return {"ok": True, "msg": f"{group} 已是 {name}", "group": group, "now": name}
-        api.select(group, name)
+        with STATE_LOCK:
+            if CONFIG_ROOT.snapshot()[1]!=revision:
+                return {'ok':False,'msg':'配置目录已改变，请刷新后重新确认切换'}
+            if current == name:
+                return {"ok": True, "msg": f"{group} 已是 {name}", "group": group, "now": name}
+            api.select(group, name)
         return {"ok": True, "msg": f"已切换 {group} → {name}", "group": group, "now": name}
     except Exception as e:
         return {"ok": False, "msg": _redact_runtime_text(e)}
@@ -914,6 +942,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(get_current())
         elif path == '/api/catalog':
             self._json(get_catalog())
+        elif path == '/api/config-root':
+            if not self._check_post():return
+            self._json(dict(ok=True,**CONFIG_ROOT.public()))
         elif path == '/api/releases':
             if not self._check_post():return
             self._json(speedbench_releases.local_info(_release_version()))
@@ -1056,7 +1087,22 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_post():
             return
         path = urllib.parse.urlparse(self.path).path
-        if path == '/api/releases/check':
+        if path in ('/api/config-root','/api/config-root/preview'):
+            body=self._read_body(strict=True)
+            if not isinstance(body,dict) or set(body)!={'root'}:
+                self._json({'ok':False,'msg':'仅接受 root 目录字段'},400);return
+            try:
+                root=validate_root(body['root'])
+                if path.endswith('/preview'):
+                    self._json(dict(ok=True,path=root or None,mode='custom' if root else 'auto',connection_verified=False));return
+                with STATE_LOCK:
+                    if STATE['running'] or (DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set()):
+                        self._json({'ok':False,'msg':'任务或清理仍在进行，不能更改配置目录'},409);return
+                    choice=CONFIG_ROOT.apply(root)
+                self._json(dict(ok=True,**choice))
+            except ConfigRootError:
+                self._json({'ok':False,'msg':'配置目录无效；请检查本机绝对路径及固定文件布局。原设置未变。'},400)
+        elif path == '/api/releases/check':
             if self._read_body(strict=True) != {}:
                 self._json({'ok':False,'msg':'版本检查不接受参数或凭据'},400);return
             self._json(RELEASE_CHECKER.check(_release_version()))
@@ -1065,6 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({'ok':False,'msg':'客户端正在退出，不能开始新任务'},409);return
             with STATE_LOCK:
                 busy = STATE["running"]
+                root,root_revision=CONFIG_ROOT.snapshot()
             if busy:
                 self._reject("已有测速任务进行中", 409)
                 return
@@ -1082,6 +1129,8 @@ class Handler(BaseHTTPRequestHandler):
             # Reserve ownership before dispatch. Otherwise simultaneous POSTs
             # can both observe idle before either benchmark thread starts.
             with STATE_LOCK:
+                if CONFIG_ROOT.snapshot()[1]!=root_revision:
+                    self._json({'ok':False,'msg':'配置目录已改变，请刷新目录后重试'},409);return
                 if DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set():
                     self._json({'ok':False,'msg':'客户端正在退出，不能开始新任务'},409);return
                 if STATE['running']:
@@ -1101,7 +1150,7 @@ class Handler(BaseHTTPRequestHandler):
                     JOBS.transition(job_id,'failed')
                     self._json({'ok':False,'msg':'任务取消通道不可用'},500)
                     return
-                params = dict(params,_job_id=job_id)
+                params = dict(params,_job_id=job_id,_config_root=root)
                 STATE.update(running=True, started=time.time(), exit_code=None, proc=None, lines=[],
                              job_id=job_id,cancel_requested=False)
             try:

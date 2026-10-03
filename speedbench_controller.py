@@ -19,6 +19,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Tuple
+from speedbench_config import ENV as ROOT_ENV, validate_root
 
 APP_ID = "io.github.clash-verge-rev.clash-verge-rev"
 FIELDS = {"external-controller", "external-controller-pipe", "external-controller-unix", "secret"}
@@ -73,9 +74,12 @@ def redact_payload(value):
 
 
 def config_paths(platform: Optional[str] = None, environ: Optional[Mapping[str, str]] = None,
-                 home: Optional[str] = None) -> List[Path]:
+                 home: Optional[str] = None, config_root: Optional[str] = None) -> List[Path]:
     platform = platform or sys.platform
     env = os.environ if environ is None else environ
+    selected=env.get(ROOT_ENV,'') if config_root is None else config_root
+    if selected:
+        return [Path(validate_root(selected))/'clash-verge.yaml']
     home = os.path.expanduser("~") if home is None else home
     if platform == "win32":
         roaming = env.get("APPDATA")
@@ -235,14 +239,19 @@ def canonical_explicit(value: str) -> str:
     return local if local else value.rstrip("/")
 
 
-def discover_targets(platform: Optional[str] = None) -> Tuple[List[ControllerTarget], List[str]]:
+def discover_targets(platform: Optional[str] = None, config_root: Optional[str] = None) -> Tuple[List[ControllerTarget], List[str]]:
     platform = platform or sys.platform
     targets = []
     warnings = []
-    for runtime in config_paths(platform=platform):
+    paths=(config_paths(platform=platform) if config_root is None else
+           config_paths(platform=platform,config_root=config_root))
+    for runtime in paths:
         chosen = runtime
         try:
             if not runtime.exists():
+                if (os.environ.get(ROOT_ENV) if config_root is None else config_root):
+                    warnings.append('自定义配置目录已失效；不会使用其他目录')
+                    continue
                 chosen = runtime.with_name("config.yaml")
                 if not chosen.exists():
                     continue

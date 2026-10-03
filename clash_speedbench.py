@@ -589,13 +589,17 @@ def get_secret_if_needed(base: str, secret: str, needs_secret: bool) -> str:
 
 
 def connect_controller(secret: Optional[str] = None, explicit: Optional[str] = None,
-                       interactive: bool = False) -> MihomoAPI:
+                       interactive: bool = False, config_root: Optional[str] = None) -> MihomoAPI:
     """Resolve endpoint/key together and verify before any business operation.
 
     None means no command-line override. An explicitly empty argument or
     environment variable deliberately disables auto credentials. Refresh is
     bounded and only applies to auto configuration, never to API writes.
     """
+    from speedbench_config import ENV as root_env, validate_root, ConfigRootError
+    selected=os.environ.get(root_env,'') if config_root is None else config_root
+    try:selected=validate_root(selected)
+    except ConfigRootError:raise ApiError('自定义 Verge 配置目录不可用；请重新选择，未回退到默认目录') from None
     manual = secret if secret is not None else os.environ.get("MIHOMO_SECRET")
     if manual is not None and not controller_config.valid_secret(manual):
         raise ApiError("Controller Secret 含非法字符，请检查 --secret / MIHOMO_SECRET")
@@ -606,10 +610,17 @@ def connect_controller(secret: Optional[str] = None, explicit: Optional[str] = N
     warnings = []
     attempted = []
     for refresh in range(2):
-        discovered, warnings = controller_config.discover_targets()
+        try:
+            discovered, warnings = (controller_config.discover_targets(config_root=selected)
+                                    if config_root is not None or os.environ.get(root_env) else
+                                    controller_config.discover_targets())
+        except ConfigRootError:
+            raise ApiError('自定义 Verge 目录已失效；未连接其他控制器') from None
         targets = []
         if explicit_base:
             bound = [t for t in discovered if t.base == explicit_base]
+            if selected and not bound:
+                raise ApiError('指定控制器与自定义目录不匹配；不会连接其他控制器')
             if bound:
                 targets = bound
             else:
@@ -617,8 +628,9 @@ def connect_controller(secret: Optional[str] = None, explicit: Optional[str] = N
         else:
             targets = list(discovered)
             declared = {t.base for t in targets}
-            targets.extend(controller_config.ControllerTarget(base) for base in DEFAULT_CONTROLLERS
-                           if base not in declared)
+            if not selected:
+                targets.extend(controller_config.ControllerTarget(base) for base in DEFAULT_CONTROLLERS
+                               if base not in declared)
         seen = set()
         auto_failed = False
         for target in targets:
@@ -1961,6 +1973,17 @@ def main() -> int:
     parser.add_argument("--yes", action="store_true",
                         help="不询问确认直接开始")
     args = parser.parse_args()
+    from speedbench_config import ENV as root_env, validate_root, ConfigRootError
+    if os.environ.get(root_env):
+        try:
+            selected_root=validate_root(os.environ[root_env])
+            selected_file=Path(selected_root)/'clash-verge.yaml'
+            if args.config_file and Path(args.config_file).resolve()!=selected_file:
+                raise ConfigRootError('config-file 与自定义 Verge 目录不一致；未开始测速')
+            args.config_file=str(selected_file)
+        except (ConfigRootError,OSError,ValueError):
+            print('自定义 Verge 目录无效或与 --config-file 冲突；未开始测速，也未回退。',file=sys.stderr)
+            return 2
     config_params = {key:value for key,value in vars(args).items()
                      if key in set(speedbench_tasks.LIMITS) | set(speedbench_tasks.BOOLEAN_OPTIONS)
                      | {'mode','target_profile'} and value is not None}

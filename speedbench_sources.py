@@ -246,7 +246,7 @@ def read_catalog(root, *, seed, runtime=None, providers=None):
     return catalog
 
 
-def discover_catalog(api, data_home, *, config_file='', snapshot=None):
+def discover_catalog(api, data_home, *, config_file='', snapshot=None, config_root=None):
     """Resolve only a controller bound to this local generated configuration.
 
     All failures are optional-feature failures. No config body, path or error
@@ -259,7 +259,8 @@ def discover_catalog(api, data_home, *, config_file='', snapshot=None):
         base = getattr(api, 'controller_base', None)
         if not isinstance(base, str):
             return unavailable
-        paths = [Path(config_file)] if config_file else controller.config_paths()
+        paths = ([Path(config_file)] if config_file else controller.config_paths() if config_root is None else
+                 controller.config_paths(config_root=config_root))
         path = next((p for p in paths if p.is_file()), None)
         if path is None:
             return unavailable

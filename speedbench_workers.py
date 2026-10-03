@@ -167,6 +167,10 @@ def find_mihomo_bin() -> Optional[str]:
 
 
 def find_config_file() -> Optional[str]:
+    from speedbench_config import ENV as root_env, validate_root, ConfigRootError
+    if os.environ.get(root_env):
+        try:return str(Path(validate_root(os.environ[root_env]))/'clash-verge.yaml')
+        except ConfigRootError:raise WorkerUnavailable('自定义 Verge 配置目录不可用；未回退到其他配置') from None
     for p in CONFIG_CANDIDATES:
         if os.path.isfile(p):
             return p
