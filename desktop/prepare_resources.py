@@ -150,7 +150,7 @@ def prepare(target):
     manifest=dict(schema=1,app_id='com.voodookyo.clash-speedbench',version='1.1.0-alpha.1',
                   runtime_version=lock['version'],target=target,executable='runtime/'+runtime['executable'],
                   files=files,source_revision=revision.stdout.strip() if revision.returncode==0 else None,
-                  source_dirty=bool(dirty.stdout))
+                  source_dirty=bool(dirty.returncode or dirty.stdout))
     (STAGE/'manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf-8')
     # Reuse the existing standard-library icon renderer. These are build
     # artifacts, not runtime Python dependencies or additional user assets.

@@ -6,6 +6,8 @@ import shutil
 
 try:from .prepare_resources import ROOT, STAGE, digest
 except ImportError:from prepare_resources import ROOT, STAGE, digest
+try:from .package_windows import package_path, build_id
+except ImportError:from package_windows import package_path, build_id
 
 
 def collect(target):
@@ -16,9 +18,12 @@ def collect(target):
               'macos-x86_64':('dmg/*.dmg',),'macos-aarch64':('dmg/*.dmg',),
               'linux-x86_64':('deb/*.deb',),'linux-aarch64':('deb/*.deb',)}
     inputs=[p for pattern in patterns[target] for p in bundle.glob(pattern) if p.is_file()]
-    if target=='windows-x86_64':inputs.extend((ROOT/'dist/desktop/windows-x86_64').glob('*-portable.zip'))
+    if target=='windows-x86_64':
+        portable=package_path(manifest)
+        if not portable.is_file():raise ValueError('Current-source portable package is missing')
+        inputs.append(portable)
     if not inputs:raise ValueError('No native packages found; compilation alone is not packaging')
-    output=ROOT/'dist/desktop-artifacts';output.mkdir(parents=True,exist_ok=True)
+    output=ROOT/'dist/desktop-artifacts'/build_id(manifest);output.mkdir(parents=True,exist_ok=True)
     records=[]
     for source in sorted(inputs):
         destination=output/source.name

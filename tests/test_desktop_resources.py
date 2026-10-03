@@ -8,11 +8,17 @@ from pathlib import Path
 from unittest import mock
 
 from desktop import prepare_resources as resources
-from desktop.package_windows import validate_stage
+from desktop.package_windows import validate_stage, package_path, build_id
 from desktop.license_notices import notices
 
 
 class DesktopResourcesTest(unittest.TestCase):
+    def test_artifact_namespaces_do_not_mix_or_overwrite_different_source_builds(self):
+        first={'source_revision':'a'*40,'version':'1.1.0-alpha.1'}
+        second={**first,'source_revision':'b'*40}
+        self.assertNotEqual(package_path(first),package_path(second))
+        self.assertEqual(package_path(first).name,package_path(second).name)
+        self.assertEqual(build_id({'source_revision':'../private'}),'unversioned')
     def test_locked_license_notices_include_public_licenses_not_private_sibling_files(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);package=root/'crate';package.mkdir()

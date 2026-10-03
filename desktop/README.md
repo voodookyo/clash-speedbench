@@ -63,8 +63,11 @@ the existing six Python 3.9/3.12 jobs; they do not publish Releases.
 Private inherited stdin/stdout bootstrap validates app/version/protocol,
 parent/child PID, instance ID and fresh nonce, then verifies authenticated HTTP
 identity on a random `127.0.0.1` port. Nonce/write token never enter argv, URLs,
-logs, localStorage or response payloads. Provider credentials remain solely in
-Python. The renderer has **no generic shell, filesystem or remote IPC grant**.
+logs or localStorage; public JSON identity does not return either. The shared
+same-origin HTML retains its existing `sb-token` meta tag for authenticated
+POSTs. That local write token is not a provider/controller API Key. Provider
+credentials remain solely in Python. The renderer has **no generic shell,
+filesystem or remote IPC grant**.
 Navigation/new-window restrictions and a CSP apply to the shared UI; only the
 two fixed ipify exit endpoints are allowed as cross-origin browser fetches.
 

@@ -1,7 +1,7 @@
 """Build-only portable package. Never copy an entire working tree/data home."""
-import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -25,13 +25,21 @@ def validate_stage(stage):
     return manifest
 
 
+def build_id(manifest):
+    revision=manifest.get('source_revision')
+    return revision[:12] if isinstance(revision,str) and re.fullmatch(r'[0-9a-f]{40}',revision) else 'unversioned'
+
+
+def package_path(manifest):
+    return ROOT/'dist/desktop/windows-x86_64'/build_id(manifest)/('Clash-SpeedBench-'+manifest['version']+'-windows-x86_64-portable.zip')
+
+
 def package():
     manifest=validate_stage(STAGE)
     exe=ROOT/'desktop/src-tauri/target/release/clash-speedbench-desktop.exe'
     if not exe.is_file():raise ValueError('Build the native release executable first')
-    output=ROOT/'dist/desktop/windows-x86_64';output.mkdir(parents=True,exist_ok=True)
-    name='Clash-SpeedBench-'+manifest['version']+'-windows-x86_64-portable.zip'
-    archive=output/name
+    archive=package_path(manifest);output=archive.parent;output.mkdir(parents=True,exist_ok=True)
+    name=archive.name
     # Refuse to overwrite a previous verified package, including its checksum.
     if archive.exists() or archive.with_suffix('.zip.sha256').exists():
         raise ValueError('Package already exists; retain it and use a fresh build output workspace')

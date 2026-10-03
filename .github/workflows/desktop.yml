@@ -58,6 +58,9 @@ jobs:
       - name: Windows portable package
         if: matrix.runtime == 'windows-x86_64'
         run: python desktop/package_windows.py
+      - name: Windows artifact acceptance without system Python PATH
+        if: matrix.runtime == 'windows-x86_64'
+        run: python desktop/verify_windows_package.py
       - name: Collect verifiable build artifacts
         run: python desktop/collect_artifacts.py --target ${{ matrix.runtime }}
       - uses: actions/upload-artifact@v4
