@@ -629,6 +629,14 @@ function detailHtml(r, colspan){
     cell('IPQS Fraud', intel.ipqs_fraud_score!=null ? esc(intel.ipqs_fraud_score) : '-'),
     cell('Scamalytics Fraud', intel.scamalytics_score!=null ? esc(intel.scamalytics_score) : '-'),
   ].join('');
+  const probeCells=Object.entries({main:'主实例',worker:'worker ',serial:'串行'}).map(([key,label])=>{
+    const data=r.probe_sources?.[key];
+    if(!data || typeof data!=='object') return '';
+    return cell(`${label}应用层探测`,`${esc(data.successes??'-')} 成功 / ${esc(data.failures??'-')} 失败<br>`+
+      `已完成 ${esc(data.attempts??'-')} / 请求 ${esc(data.requested??'-')}，已调用 ${esc(data.started??'-')}<br>`+
+      `${data.status==='completed'?'完整':'部分'} · 完成样本失败率 ${esc(data.loss_pct??'-')}%`);
+  }).join('');
+  const probeNote=probeCells?'<p class="card-sub">失败率仅依据已完成的 HTTP/HTTPS 探测，不含取消中未返回的请求；主实例与 worker 不合并，非 ICMP 丢包率。</p>':'';
   const evidence = (cls.evidence||[]).map(x=>`<li>${esc(x)}</li>`).join('');
   const conflicts = (cls.conflicts||[]).map(x=>`<li>${esc(x)}</li>`).join('');
   const pdata = intel.provider_data || intel.providers || {};
@@ -643,7 +651,7 @@ function detailHtml(r, colspan){
     `<b>Conflicts</b><ul>${conflicts||'<li>-</li>'}</ul>`+
     `<div class="card-sub">Provider 状态：${esc(JSON.stringify(intel.provider_status||{}))}</div>`+
     `<div class="provider-detail-list">${providerBlocks||'<span class="card-sub">暂无 Provider 细节</span>'}</div></div>`;
-  return `<tr class="detail-row"><td colspan="${colspan||8}"><div class="detail-grid">${cells}</div>${intelText}` +
+  return `<tr class="detail-row"><td colspan="${colspan||8}"><div class="detail-grid">${cells}${probeCells}</div>${probeNote}${intelText}` +
          `<div class="detail-actions"><button class="mini trend" data-name="${esc(r.name)}" data-node-id="${esc(r.node_id||'')}">📈 查看 30 天趋势</button></div></td></tr>`;
 }
 

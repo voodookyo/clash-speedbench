@@ -30,6 +30,12 @@ class ResultJournal:
         value=copy.deepcopy(result)
         with self.lock:
             previous=self.rows.get(value.name)
+            sources=dict(getattr(previous,'probe_sources',None) or {},**(getattr(value,'probe_sources',None) or {}))
+            if sources:
+                value.probe_sources=sources
+                # Final/exit rows must carry these independent observations
+                # into reporting too, not just the private failure journal.
+                result.probe_sources=copy.deepcopy(sources)
             if previous is not None and not value.probe_attempts:
                 # Early exit-family events may omit the already completed
                 # main probe stats. Do not lose those independent samples.
@@ -45,6 +51,39 @@ class ResultJournal:
 def retain_result(args,result):
     journal=getattr(args,'_result_journal',None)
     if journal is not None:journal.remember(result)
+
+
+class ProbeObserver:
+    """Incremental completed samples; interrupted calls are not failed samples."""
+    def __init__(self,args,name,proto,provider,source,requested,counts=None,on_update=None):
+        self.args,self.name,self.proto,self.provider=args,name,proto,provider
+        self.source,self.requested=source,requested
+        self.counts,self.on_update=counts,on_update
+        self.started=0;self.last=None;self.observed=False
+
+    def start(self):
+        self.started+=1
+        if self.counts is not None:self.counts['attempts']=self.started
+        if self.on_update is not None:self.on_update(self.name,self.last,self.started)
+
+    def sample(self,stats,complete):
+        self.last=stats;self.observed=True
+        self.started=max(self.started,stats.attempts)
+        if self.counts is not None:self.counts.update(attempts=self.started,successes=stats.successes)
+        if self.on_update is not None:self.on_update(self.name,stats,self.started)
+        if not self.started:return
+        from clash_speedbench import Result,_apply_probe_stats
+        from speedbench_sources import apply_origin
+        row=Result(name=self.name,provider=self.provider,proto=self.proto,
+            latency_ms=stats.latency_ms,jitter_ms=stats.jitter_ms,speeds_mbps=[],
+            median_mbps=None,best_mbps=None,status='probe-only' if stats.successes else
+                'unreachable' if complete else 'probe-pending')
+        _apply_probe_stats(row,stats)
+        row.probe_sources={self.source:dict(stats.to_dict(),started=self.started,
+            requested=self.requested,status='completed' if complete else 'partial')}
+        row.measurement_scope={'probe':'completed' if complete else 'partial'}
+        apply_origin(row,getattr(self.args,'source_origins',{}).get(self.name))
+        publish_result(self.args,'node_probe',row,phase_name='probing')
 
 
 class DownloadCounter:
@@ -162,7 +201,9 @@ def publish_result(args,event_type,result,*,phase_name='',completed=None,total=N
     # deliberately NOT a verified node_id and cannot authorize switching.
     identity = (getattr(result,'origin',None) or {}).get('node_id')
     if not identity:
-        value = json.dumps([result.proto,result.name],ensure_ascii=False).encode('utf-8')
+        # A frozen runtime catalogue has unique names. Controller/worker
+        # protocol spelling (Shadowsocks vs ss) is not a second job identity.
+        value = json.dumps([result.name],ensure_ascii=False).encode('utf-8')
         identity = 'legacy_'+hashlib.sha256(value).hexdigest()[:32]
     from clash_speedbench import result_to_dict
     payload = {'result':result_to_dict(result)}

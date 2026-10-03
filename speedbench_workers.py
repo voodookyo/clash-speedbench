@@ -85,6 +85,7 @@ from clash_speedbench import (
     multi_stream_speed,
     node_key_of,
     probe_latency,
+    observed_probe,
     start_intelligence_enrichment,
     finish_intelligence_enrichment,
     _apply_probe_stats,
@@ -1110,7 +1111,8 @@ class Worker:
 
 
 def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
-                       max_workers: int = 10, probe_count: int = 3, on_result=None
+                       max_workers: int = 10, probe_count: int = 3, on_result=None,
+                       progress_args=None,proto_by_name=None,provider_by_name=None,on_probe_update=None
                        ) -> Dict[str, ProbeStats]:
     """Phase 1 第 1 步：经主实例 /delay API 并发测全部节点延迟，
     返回 {节点名: ProbeStats}；对象可继续解包为旧的 (latency, jitter) pair，
@@ -1125,15 +1127,12 @@ def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
     lock = threading.Lock()
     done = {"n": 0}
     total = len(names)
+    cancelled=threading.Event()
 
-    def one(name: str) -> None:
-        try:
-            raw = probe_latency(api, name, timeout_ms, count=probe_count)
-        except TypeError:
-            # Keep tiny legacy test doubles/callers that only accept three
-            # positional arguments working during the transition.
-            raw = probe_latency(api, name, timeout_ms)
-        stats = _coerce_probe_stats(raw, attempts=probe_count)
+    def measure_one(name: str) -> None:
+        stats=observed_probe(api,name,timeout_ms,progress_args,source='main',count=probe_count,
+            proto=(proto_by_name or {}).get(name,''),provider=(provider_by_name or {}).get(name,''),
+            on_update=on_probe_update,probe_function=probe_latency,cancel=cancelled.is_set)
         lat, jit = stats
         with lock:
             out[name] = stats
@@ -1147,8 +1146,26 @@ def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
         if on_result is not None:
             on_result(name,stats,idx,total)
 
-    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, total))) as pool:
-        list(pool.map(one, names))
+    def one(name):
+        if cancelled.is_set():return
+        try:measure_one(name)
+        except BaseException:
+            # Set inside the failing worker before it can claim queued nodes;
+            # main-thread Ctrl+C takes the identical path below.
+            cancelled.set();raise
+    pool=ThreadPoolExecutor(max_workers=min(max_workers,max(1,total)))
+    pending=[]
+    try:
+        pending=[pool.submit(one,name) for name in names]
+        for future in pending:future.result()
+    except BaseException:
+        cancelled.set()
+        for future in pending:future.cancel()
+        raise
+    finally:
+        # Active HTTP calls still obey their controller timeout; join them
+        # before any worker phase starts. No next sample or queued node runs.
+        pool.shutdown(wait=True,cancel_futures=True)
     return out
 
 
@@ -1161,20 +1178,8 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
     assert worker.api is not None
     probe_stats: Optional[ProbeStats] = None
     if latency is None:
-        with measure(args,'probe') as counts:
-            try:
-                raw = probe_latency(
-                    worker.api, name, args.delay_timeout,
-                    count=_probe_count_from_args(args),
-                )
-            except TypeError:
-                # Keep tiny legacy test doubles/callers that only accept three
-                # positional arguments working during the transition.
-                raw = probe_latency(worker.api, name, args.delay_timeout)
-            probe_stats = _coerce_probe_stats(
-                raw, attempts=_probe_count_from_args(args)
-            )
-            counts.update(attempts=probe_stats.attempts,successes=probe_stats.successes)
+        probe_stats=observed_probe(worker.api,name,args.delay_timeout,args,
+            source='worker',metric='probe',proto=proto,probe_function=probe_latency)
         latency, jitter = probe_stats
     if latency is None:
         result = Result(name=name, provider="", proto=proto, latency_ms=None,
@@ -1424,6 +1429,13 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     published_probe = set()
     delay_counts=None
     delay_metric_lock=threading.Lock()
+    probe_accounting={}
+    def update_probe_counts(name,stats,started):
+        with delay_metric_lock:
+            probe_accounting[name]=(started,stats.successes if stats is not None else 0)
+            if delay_counts is not None:
+                delay_counts.update(attempts=sum(v[0] for v in probe_accounting.values()),
+                                    successes=sum(v[1] for v in probe_accounting.values()))
     def publish_probe(name,stats,idx,count):
         r = Result(name=name,provider=(provider_by_name or {}).get(name,''),proto=proto_by_name.get(name,''),
                    latency_ms=stats.latency_ms,speeds_mbps=[],median_mbps=None,best_mbps=None,
@@ -1432,15 +1444,14 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         apply_origin(r,getattr(args,'source_origins',{}).get(name))
         publish_result(args,'node_probe',r,phase_name='probing',completed=idx,total=count)
         with delay_metric_lock:
-            if delay_counts is not None and name not in published_probe:
-                delay_counts['attempts']+=stats.attempts
-                delay_counts['successes']+=stats.successes
             published_probe.add(name)
+        if name not in probe_accounting:update_probe_counts(name,stats,stats.attempts)
     if main_api is not None:
         print(f"Phase 1 粗筛 · 延迟探测: 经主实例 /delay 并发测 {total} 个节点"
               f"（Clash Verge ping 同口径，不切换节点）…")
         try:
-            callback = {'on_result':publish_probe} if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
+            callback = dict(on_result=publish_probe,progress_args=args,proto_by_name=proto_by_name,
+                provider_by_name=provider_by_name,on_probe_update=update_probe_counts) if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
             with measure(args,'delay') as counts:
                 delay_counts=counts
                 try:

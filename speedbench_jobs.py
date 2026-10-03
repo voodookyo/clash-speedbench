@@ -39,6 +39,30 @@ METRIC_PHASES = ('connection','discovery','dns','worker_start','delay','exit_v4'
                  'basic_intel','provider','warmup','download','summary','restore','cleanup','probe')
 
 
+def safe_probe_sources(value):
+    """Only three bounded independent paths, never arbitrary API metadata."""
+    public={}
+    if not isinstance(value,dict):return public
+    for source in ('main','worker','serial'):
+        data=value.get(source)
+        if not isinstance(data,dict):continue
+        def count(key):
+            v=data.get(key,0)
+            return v if isinstance(v,int) and not isinstance(v,bool) and 0<=v<=100 else 0
+        attempts=count('attempts');successes=min(count('successes'),attempts)
+        started=max(count('started'),attempts);requested=max(count('requested'),started)
+        def number(key):
+            v=data.get(key)
+            return v if isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and 0<=v<=1e9 else None
+        public[source]=dict(attempts=attempts,successes=successes,failures=attempts-successes,
+            started=started,requested=requested,
+            status='completed' if data.get('status')=='completed' and attempts==requested else 'partial',
+            latency_ms=number('latency_ms'),jitter_ms=number('jitter_ms'),
+            success_rate=round(successes/attempts*100,1) if attempts else None,
+            loss_pct=round((attempts-successes)/attempts*100,1) if attempts else None)
+    return public
+
+
 def safe_metrics(value):
     public = {}
     if not isinstance(value,dict):
@@ -91,6 +115,8 @@ def _result(value):
     if not isinstance(value,dict):
         raise JobError('Node event result is unsupported')
     public = _scalars(value,RESULT_SCALARS)
+    sources=safe_probe_sources(value.get('probe_sources'))
+    if sources:public['probe_sources']=sources
     scope = value.get('measurement_scope')
     if isinstance(scope,dict):
         public['measurement_scope'] = {k:scope[k] for k in SCOPE_FIELDS if isinstance(scope.get(k),str)}

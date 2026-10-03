@@ -26,6 +26,7 @@ import http.client
 import ipaddress
 import io
 import json
+import math
 import os
 import re
 import signal
@@ -37,6 +38,7 @@ import time
 import unicodedata
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -46,7 +48,8 @@ import speedbench_controller as controller_config
 import speedbench_sources as source_catalog
 import speedbench_tasks
 from speedbench_process import run_cancellable
-from speedbench_progress import ProgressEmitter, DownloadCounter, phase, publish_result, measure
+from speedbench_progress import ProgressEmitter, DownloadCounter, ProbeObserver, phase, publish_result, measure
+from speedbench_jobs import safe_probe_sources
 
 from speedbench_ip_intel import (
     IpIntelCache,
@@ -555,6 +558,7 @@ class Result:
     measurement_scope: Optional[dict] = None
     download_bytes: Optional[int] = None  # observed curl bytes, not requested sample size
     exit_status: Optional[dict] = None
+    probe_sources: Optional[dict] = None  # independent main/worker/serial observations
 
 
 def detect_controller(secret: str, explicit: Optional[str]) -> Tuple[str, bool]:
@@ -944,7 +948,7 @@ def _coerce_probe_stats(value: Any, attempts: Optional[int] = None) -> ProbeStat
 
 
 def probe_latency(api: MihomoAPI, name: str, timeout_ms: int,
-                  count: int = 3) -> ProbeStats:
+                  count: int = 3, on_sample=None, on_attempt=None,cancel=None) -> ProbeStats:
     """Run independent application-level probes and retain failure counters.
 
     A failed HTTP/HTTPS probe does not stop the remaining attempts.  The
@@ -952,33 +956,56 @@ def probe_latency(api: MihomoAPI, name: str, timeout_ms: int,
     pair, while exposing attempts/successes/failures and percentages for new
     callers.  This is *not* ICMP packet loss measurement.
     """
-    attempts = max(1, int(count))
+    requested = max(1, int(count))
     vals: List[float] = []
     failures = 0
-    for _ in range(attempts):
-        if cancel_requested():
-            raise KeyboardInterrupt
-        try:
-            d = api.proxy_delay(name, DEFAULT_DELAY_URL, timeout_ms)
-        except Exception:
-            d = None
-        if d is None:
-            failures += 1
-            continue
-        try:
-            vals.append(float(d))
-        except (TypeError, ValueError):
-            failures += 1
-    if not vals:
-        return ProbeStats(None, None, attempts, 0, failures)
-    jitter = statistics.stdev(vals) if len(vals) > 1 else 0.0
-    return ProbeStats(
-        int(round(statistics.median(vals))),
-        round(jitter, 1),
-        attempts,
-        len(vals),
-        failures,
-    )
+    def snapshot():
+        return ProbeStats(int(round(statistics.median(vals))) if vals else None,
+            round(statistics.stdev(vals),1) if len(vals)>1 else 0.0 if vals else None,
+            len(vals)+failures,len(vals),failures)
+    try:
+        for index in range(requested):
+            if cancel_requested() or (cancel is not None and cancel()):raise KeyboardInterrupt
+            if on_attempt is not None:on_attempt()
+            try:d=api.proxy_delay(name,DEFAULT_DELAY_URL,timeout_ms)
+            except Exception:d=None
+            try:
+                value=float(d)
+                if isinstance(d,bool) or not math.isfinite(value) or value<0:raise ValueError
+                vals.append(value)
+            except (TypeError,ValueError,OverflowError):failures+=1
+            if on_sample is not None:on_sample(snapshot(),index==requested-1)
+    except KeyboardInterrupt:
+        if on_sample is not None:on_sample(snapshot(),False)
+        raise
+    return snapshot()
+
+
+def observed_probe(api,name,timeout_ms,args,*,source,metric='',proto='',provider='',
+                   count=None,on_update=None,probe_function=None,cancel=None):
+    """Adapt the unchanged probe requests to retention/metrics, no retry after I/O."""
+    requested=_probe_count_from_args(args) if count is None else max(1,int(count))
+    function=probe_latency if probe_function is None else probe_function
+    enabled=(getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None
+             or on_update is not None)
+    with measure(args,metric) if metric else nullcontext(None) as counts:
+        observer=ProbeObserver(args,name,proto,provider,source,requested,counts,on_update) if enabled else None
+        options=dict(count=requested)
+        if cancel is not None:options['cancel']=cancel
+        if observer is not None:options.update(on_sample=observer.sample,on_attempt=observer.start)
+        try:raw=function(api,name,timeout_ms,**options)
+        except TypeError:
+            # A tiny old adapter may reject the observer keywords. Once a real
+            # request began, TypeError is NOT permission to repeat probes.
+            if observer is not None and observer.started:raise
+            if observer is not None:
+                try:raw=function(api,name,timeout_ms,count=requested)
+                except TypeError:raw=function(api,name,timeout_ms)
+            else:raw=function(api,name,timeout_ms)
+        stats=_coerce_probe_stats(raw,attempts=requested)
+        if observer is not None and not observer.observed:observer.sample(stats,True)
+        elif counts is not None and observer is None:counts.update(attempts=stats.attempts,successes=stats.successes)
+        return stats
 
 
 def _apply_probe_stats(result: Result, stats: Any,
@@ -1754,6 +1781,7 @@ def result_to_dict(r: Result) -> dict:
         **({"measurement_scope": r.measurement_scope} if r.measurement_scope else {}),
         **({'download_bytes':r.download_bytes} if r.download_bytes is not None else {}),
         **({'exit_status':r.exit_status} if r.exit_status is not None else {}),
+        **({'probe_sources':safe_probe_sources(r.probe_sources)} if r.probe_sources else {}),
         "node_key": r.node_key,
         "proto": r.proto,
         "latency_ms": r.latency_ms,
@@ -2346,13 +2374,8 @@ def _execute_benchmark(args,task_config):
                 publish_result(args,'node_probe',res,phase_name='probing')
                 continue
 
-            with measure(args,'delay') as counts:
-                probe = probe_latency(
-                    api, name, args.delay_timeout,
-                    count=_probe_count_from_args(args),
-                )
-                stats=_coerce_probe_stats(probe,attempts=_probe_count_from_args(args))
-                counts.update(attempts=stats.attempts,successes=stats.successes)
+            probe=observed_probe(api,name,args.delay_timeout,args,source='serial',metric='delay',
+                proto=str(info.get('type','')),provider=str(info.get('provider-name','')))
             latency, jitter = probe
             partial = Result(name=name,provider=str(info.get('provider-name','')),
                              proto=str(info.get('type','')),latency_ms=latency,speeds_mbps=[],

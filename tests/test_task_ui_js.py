@@ -11,6 +11,27 @@ MODULE = Path(__file__).resolve().parents[1]/'web'/'tasks.js'
 
 @unittest.skipUnless(NODE,'Node unavailable')
 class TaskUiJsTest(unittest.TestCase):
+    def test_probe_details_keep_main_and_worker_separate_and_explain_partial_denominator(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            console.log(JSON.stringify(detailHtml({name:'A',probe_sources:{
+              main:{attempts:3,successes:0,failures:3,started:3,requested:3,status:'completed',loss_pct:100},
+              worker:{attempts:2,successes:1,failures:1,started:3,requested:3,status:'partial',loss_pct:50}}})));})();
+        """)
+        self.assertIn('主实例应用层探测',out);self.assertIn('worker 应用层探测',out)
+        self.assertIn('已完成 2 / 请求 3',out);self.assertIn('已调用 3',out)
+        self.assertIn('部分',out);self.assertIn('非 ICMP',out)
+
+    def test_probe_details_escape_untrusted_values_and_ignore_unknown_paths(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            console.log(JSON.stringify(detailHtml({name:'A',probe_sources:{
+              serial:{attempts:'<img src=x>',successes:1,failures:0,status:'partial'},
+              unknown:{attempts:'CANARY'}}})));})();
+        """)
+        self.assertNotIn('<img src=x>',out);self.assertIn('&lt;img src=x&gt;',out)
+        self.assertNotIn('CANARY',out)
+
     def test_desktop_restores_backend_preferences_without_using_port_local_storage(self):
         identity='node_v2_'+'a'*32
         data={'/api/preferences':{'ok':True,'version':1,'values':{'sb_theme':'dark','sb_profile':'daily','sb_favs_v2':json.dumps([identity]),'sb_mode':'ip'}}}

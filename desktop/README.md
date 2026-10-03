@@ -230,3 +230,21 @@ restore and whole CSV/JSONL summary spans, while worker fallback probes have
 separate counters. Overlapping cumulative spans are not additive elapsed time.
 The packaged failed-task fixture verifies metric persistence alongside raw
 history; this is not a same-coverage real bandwidth performance comparison.
+
+Probes now retain each completed sample, including within an interrupted group.
+Optional JSON `probe_sources` separates main-controller, worker-fallback and
+serial observations. Requested, invoked and completed counts are distinct:
+one success, one failure and a third interrupted call mean two completed
+samples and 50% application-level failure, not three failures/attempts in that
+denominator. Phase-span attempts still count all invoked calls. Expanded shared
+UI details explain this difference; the CSV primary counters keep their existing
+shape. The job-local legacy row key uses the frozen unique runtime name so
+Shadowsocks/ss spelling does not duplicate a row; it is not a stable identity or
+permission to switch. No SQLite schema or runtime dependency is added.
+
+Main probe-pool cancellation stops unstarted nodes and subsequent samples, then
+joins active calls. It does not actively abort every controller transport or
+guarantee a hard total cancellation deadline. The portable-package fixture
+also exercises the actual bundled probe primitive with synthetic values and
+an interrupt, checking cancelled partial JSONL/SQLite/task metrics, raw-history
+preservation and ownership release without contacting Clash or third parties.

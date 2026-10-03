@@ -237,6 +237,72 @@ with BackendLease(history.parent):pass
     if result.returncode!=0:raise ValueError('Bundled CLI partial JSONL/SQLite fixture failed')
 
 
+def verify_cli_probe_partial(root,data):
+    """Actual probe primitive, fake controller values, packaged cancelled task."""
+    partial=data/'partial-probe-fixture';partial.mkdir()
+    child='''
+import sys
+sys.path.insert(0,sys.argv.pop(1))
+import clash_speedbench as core
+class Api:
+    def __init__(self):self.values=iter([20,None,KeyboardInterrupt()])
+    def proxy_delay(self,*args):
+        value=next(self.values)
+        if isinstance(value,BaseException):raise value
+        return value
+def execute(args,config):
+    core.observed_probe(Api(),'fixture partial probe',5000,args,
+        source='serial',metric='delay',proto='ss')
+    raise AssertionError('Fixture interrupt not propagated')
+core._execute_benchmark=execute
+raise SystemExit(core.main())
+'''
+    program='''
+import os,sys,json,sqlite3
+from pathlib import Path
+from contextlib import closing
+import speedbench_web as web
+from speedbench_owner import BackendLease
+from speedbench_tasks import resolve_config
+history=Path(os.environ['SPEEDBENCH_HOME'])/'speedbench-history.jsonl'
+original=b'{"ts":"fixture-original", "results": []}\\n'
+history.write_bytes(original)
+job=web.JOBS.create(resolve_config())
+with BackendLease(history.parent) as lease:
+    web.DATA_OWNER=lease;web.HISTORY=history
+    web.connect_controller=lambda *a,**k:None
+    web.benchmark_command=lambda params:[sys.executable,'-B','-E','-s','-u','-c',sys.argv[1],str(Path(web.SCRIPT).parent),
+        '--yes','--no-ip','--history',str(history),'--output',str(history.parent/'partial.csv')]
+    web.run_benchmark({'_job_id':job})
+    assert web.STATE['exit_code']==130 and not web.STATE['running'] and not web.STATE['cleanup_incomplete']
+    assert lease.instance_id not in str(web.STATE['lines'])
+    assert history.read_bytes().startswith(original)
+    rows=history.read_text(encoding='utf-8').splitlines();assert len(rows)==2
+    record=json.loads(rows[1]);assert record['task']['partial'] and record['task']['status']=='cancelled'
+    result=record['results'][0]
+    assert result['latency_ms']==20 and result['probe_attempts']==2 and result['probe_failures']==1
+    assert result['probe_loss_pct']==50 and result['measurement_scope']['probe']=='partial'
+    assert result['ip_quality_score'] is None
+    expected=result['probe_sources']['serial']
+    assert expected['started']==3 and expected['requested']==3 and expected['attempts']==2
+    assert expected['status']=='partial' and expected['loss_pct']==50
+    task=web.speedbench_db.task_snapshot(web.db_path(),job)
+    assert task['status']=='cancelled' and task['partial'] and len(task['results'])==1
+    assert task['results'][0]['probe_sources']['serial']==expected
+    assert task['metrics']['delay']['attempts']==3 and task['metrics']['delay']['successes']==1
+    assert task['metrics']['summary']['duration_ms']>=0 and task['run_id'] is not None
+    with closing(sqlite3.connect(web.db_path())) as connection:
+        assert [r[0] for r in connection.execute('SELECT raw FROM runs ORDER BY id')]==rows
+web.DATA_OWNER=None
+with BackendLease(history.parent):pass
+'''
+    env=dict(os.environ,SPEEDBENCH_HOME=str(partial),PATH=str(Path(os.environ['SystemRoot'])/'System32'))
+    env.pop('SPEEDBENCH_VERGE_ROOT',None)
+    result=subprocess.run([str(root/'runtime/python.exe'),'-B','-E','-s','-c',program,child],
+        cwd=root/'app',env=env,capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode!=0:raise ValueError('Bundled cancelled probe JSONL/SQLite fixture failed')
+
+
 def verify(package):
     if os.name!='nt':raise ValueError('Windows artifact verification requires Windows')
     package=Path(package).resolve()
@@ -257,13 +323,14 @@ def verify(package):
         verify_worker_cleanup(root,data)
         verify_cli_ownership(root,data)
         verify_cli_partial(root,data)
+        verify_cli_probe_partial(root,data)
         if history.read_bytes()!=raw:raise ValueError('Original fixture raw changed during packaged lifecycle')
         # An attacker-updated side manifest cannot authorize modified source.
         source=root/'app/speedbench_desktop.py';source.write_bytes(source.read_bytes()+b'\n# fixture tamper\n')
         manifest['files']['app/speedbench_desktop.py']=digest(source)
         (root/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
         if native_check()==0:raise ValueError('Mutable side manifest bypassed native integrity anchor')
-    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, failed partial JSONL/SQLite/task retention and observed metrics, original raw retained. Native window/tray acceptance not included.')
+    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, failed download and cancelled per-sample probe JSONL/SQLite/task retention and observed metrics, original raw retained. Native window/tray acceptance not included.')
 
 
 if __name__=='__main__':
