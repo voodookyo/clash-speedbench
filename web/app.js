@@ -25,8 +25,18 @@ async function getJSON(url){
 function esc(s){ return (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 // localStorage 在某些隐私模式下会抛异常，包一层静默降级
-function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
-function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+const SB_DESKTOP = window.SPEEDBENCH_ENV?.client==='webview';
+let desktopPreferences={},preferenceWrites=Promise.resolve();
+function lsGet(k){ if(SB_DESKTOP) return desktopPreferences[k]??null;try{ return localStorage.getItem(k); }catch(e){ return null; } }
+function lsSet(k,v){
+  if(SB_DESKTOP){
+    desktopPreferences[k]=v;
+    // Ordered patches avoid two quick favorite/theme edits racing to disk.
+    preferenceWrites=preferenceWrites.then(()=>post('/api/preferences',{[k]:v})).then(r=>{
+      if(!r.ok) toast('偏好未能保存；本次界面暂时保留，重启后可能丢失',false);
+    }).catch(()=>toast('偏好保存连接失败',false));
+  }else try{ localStorage.setItem(k,v); }catch(e){}
+}
 
 function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
 
@@ -1363,7 +1373,8 @@ async function runLeakAudit(){
       browserExitIp('https://api6.ipify.org?format=json'),
       collectWebRTCCandidates(),
     ]);
-    const payload = Object.assign({}, gathered, {exit_ipv4, exit_ipv6});
+    const payload = Object.assign({}, gathered, {exit_ipv4, exit_ipv6,
+      client_environment: window.SPEEDBENCH_ENV?.client==='webview'?'webview':'browser'});
     lastLeakPayload = payload;
     const evaluation = await post('/api/leak/evaluate', payload);
     lastLeakEvaluation = evaluation;
@@ -1396,7 +1407,7 @@ function renderLeakHistory(data){
   if(!box) return;
   const rows = data && data.audits || [];
   if(!rows.length){ box.textContent = data && data.available===false ? '历史库尚未提供 leak_audits 接口' : '尚无本地保存记录'; return; }
-  box.innerHTML = rows.map(x=>`<div class="history-chip"><b>${esc(x.created_at||x.ts||'-')}</b> · ${esc(x.webrtc_status||'unknown')} · DNS ${esc(x.dns_status||'unknown')}</div>`).join('');
+  box.innerHTML = rows.map(x=>`<div class="history-chip"><b>${esc(x.created_at||x.ts||'-')}</b> · ${esc(x.webrtc_status||'unknown')} · DNS ${esc(x.dns_status||'unknown')} · ${x.details?.client_environment==='webview'?'系统 WebView':x.details?.client_environment==='browser'?'浏览器':'旧记录：环境未标记'}</div>`).join('');
 }
 
 async function loadLeakHistory(){
@@ -1428,7 +1439,24 @@ function clearIpIntelSettings(){
   saveIpIntelSettings();
 }
 
+async function desktopAction(action){
+  try{
+    const request=await post('/api/desktop/actions',{action});
+    if(!request.ok){toast(request.msg||'桌面操作不可用',false);return;}
+    for(let i=0;i<12;i++){
+      await new Promise(resolve=>setTimeout(resolve,500));
+      const response=await fetch('/api/desktop/actions/'+encodeURIComponent(request.request_id),{headers:{'X-SpeedBench-Token':SB_TOKEN}});
+      const result=await response.json();
+      if(result.status==='opened'){toast('已请求系统浏览器打开；请人工查看结果');return;}
+      if(['failed','expired','unavailable'].includes(result.status)){toast('系统浏览器打开失败；请手动访问官方测试站点',false);return;}
+    }
+    toast('打开请求尚未确认；不要将它视为已完成检测',false);
+  }catch(e){toast('桌面操作连接失败',false);}
+}
 function openDnsAudit(url){
+  const action={'https://browserleaks.com/dns':'browserleaks_dns','https://www.dnsleaktest.com/':'dnsleaktest'}[url];
+  if(!action) return; // Never allow subscription/node text to choose a URL.
+  if(SB_DESKTOP){desktopAction(action);return;}
   // noopener/noreferrer is explicit; the target pages are never scraped.
   try{ const child=window.open(url, '_blank', 'noopener,noreferrer'); if(child) child.opener=null; }
   catch(e){}
@@ -1719,6 +1747,15 @@ function applyTheme(){
 function initTaskControls(){
   if(typeof SBTasks==='undefined') return;
   applyTheme();
+  if(SB_DESKTOP){
+    document.getElementById('desktop-settings').hidden=false;
+    document.getElementById('btn-browser-audit').hidden=false;
+    const notifications=document.getElementById('f-notifications');
+    notifications.checked=lsGet('sb_notifications')==='on';
+    notifications.addEventListener('change',()=>lsSet('sb_notifications',notifications.checked?'on':'off'));
+    document.getElementById('btn-browser-audit').addEventListener('click',()=>desktopAction('browser_audit'));
+    document.getElementById('btn-official-releases').addEventListener('click',()=>desktopAction('releases'));
+  }
   const savedMode=lsGet('sb_mode'),savedTarget=lsGet('sb_target');
   if(['quick','standard','deep','ip'].includes(savedMode)) document.getElementById('f-mode').value=savedMode;
   if(['daily','download','balanced','ip','residential'].includes(savedTarget)) document.getElementById('f-target').value=savedTarget;
@@ -1755,7 +1792,21 @@ function initTaskControls(){
 }
 
 /* ==================== 启动 ==================== */
-function boot(){
+async function boot(){
+  if(SB_DESKTOP){
+    try{
+      const response=await fetch('/api/preferences',{headers:{'X-SpeedBench-Token':SB_TOKEN}});
+      const data=await response.json();
+      if(!data.ok) throw new Error('Preferences unavailable');
+      desktopPreferences=data.values||{};
+      currentProfile=PROFILES.includes(lsGet('sb_profile'))?lsGet('sb_profile'):'all';
+      favs=new Set(JSON.parse(lsGet('sb_favs')||'[]'));
+      favIds=new Set(JSON.parse(lsGet('sb_favs_v2')||'[]'));
+      subsDays=+(lsGet('sb_subs_days')||30)||30;
+    }catch(e){toast('无法读取桌面偏好；没有重置原文件',false);}
+  }
+  const environment=document.getElementById('leak-environment');
+  if(environment && window.SPEEDBENCH_ENV?.client==='webview') environment.textContent='执行环境：系统 WebView；本次 WebRTC 结果不代表 Chrome、Edge 或 Firefox。WebView 不支持采集时只能显示无法确认。';
   init();
   route();
   renderTable();      // latestData=null → 骨架屏，loadLatest 完成后替换

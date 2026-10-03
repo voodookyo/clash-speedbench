@@ -43,6 +43,8 @@ import speedbench_sources  # noqa: E402
 import speedbench_tasks  # noqa: E402
 from speedbench_jobs import JobStore, JobError, TERMINAL, _result as safe_job_result
 from speedbench_progress import PREFIX, parse_record
+from speedbench_owner import BackendLease, LeaseError
+from speedbench_preferences import Preferences, PreferenceError
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
@@ -88,6 +90,10 @@ MAX_LINES = 500
 # 每次启动随机生成的写操作令牌：注入页面 <meta>，所有 POST 必须携带，
 # 防止其他网页跨站向本地面板发写请求（CSRF）。
 WEB_TOKEN = secrets.token_hex(16)
+DESKTOP_IDENTITY = None
+DESKTOP_ACTIONS = None
+DESKTOP_SHUTDOWN = None
+DESKTOP_EXITING = None
 
 # 令牌同时写入数据目录（0600 仅本人可读），供本机受信脚本（SwiftBar 菜单栏
 # 插件等）调用写操作 API（如 /api/quit）。每次启动覆盖，面板停掉后自然失效。
@@ -357,6 +363,7 @@ def slim_history() -> list:
 
 def benchmark_command(params):
     cmd = [sys.executable, '-u', str(SCRIPT), '--yes', '--history', str(HISTORY), '--non-interactive']
+    if sys.flags.dont_write_bytecode:cmd.insert(1,'-B')
     if params.get('mode') and params['mode'] != 'legacy':
         cmd += ['--mode',params['mode']]
     if params.get('target_profile'):
@@ -745,6 +752,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header('Content-Security-Policy',
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "connect-src 'self' https://api.ipify.org https://api6.ipify.org; "
+            "img-src 'self' data:; object-src 'none'; frame-src 'none'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+        self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('Referrer-Policy','no-referrer')
         self.end_headers()
         self.wfile.write(body)
 
@@ -891,6 +905,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json(get_current())
         elif path == '/api/catalog':
             self._json(get_catalog())
+        elif path == '/api/desktop/identity':
+            if not self._check_post():return
+            self._json(DESKTOP_IDENTITY or {'ok':False,'msg':'Not a desktop backend'},200 if DESKTOP_IDENTITY else 404)
+        elif path == '/api/preferences':
+            if not self._check_post():return
+            try:self._json({'ok':True,'version':1,'values':Preferences(DATA_HOME).read()})
+            except PreferenceError:self._json({'ok':False,'msg':'无法读取偏好，请保留文件并恢复私有备份'},503)
+        elif path == '/api/desktop/state':
+            if not self._check_post():return
+            if DESKTOP_ACTIONS is None:self._reject('not a desktop backend',404);return
+            self._json({'notifications':DESKTOP_ACTIONS.notifications,'job':JOBS.summary(),'actions':DESKTOP_ACTIONS.drain()})
+        elif re.fullmatch(r'/api/desktop/actions/[0-9a-f]{32}',path):
+            if not self._check_post():return
+            result=DESKTOP_ACTIONS.result(path.rsplit('/',1)[-1]) if DESKTOP_ACTIONS else None
+            self._json(result or {'status':'unavailable'},200 if result else 404)
         elif path == '/api/sources/history':
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             sync_db()
@@ -999,6 +1028,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urllib.parse.urlparse(self.path).path
         if path in ('/api/run','/api/jobs'):
+            if DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set():
+                self._json({'ok':False,'msg':'客户端正在退出，不能开始新任务'},409);return
             with STATE_LOCK:
                 busy = STATE["running"]
             if busy:
@@ -1018,6 +1049,8 @@ class Handler(BaseHTTPRequestHandler):
             # Reserve ownership before dispatch. Otherwise simultaneous POSTs
             # can both observe idle before either benchmark thread starts.
             with STATE_LOCK:
+                if DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set():
+                    self._json({'ok':False,'msg':'客户端正在退出，不能开始新任务'},409);return
                 if STATE['running']:
                     self._reject('已有测速任务进行中',409)
                     return
@@ -1100,11 +1133,31 @@ class Handler(BaseHTTPRequestHandler):
             dns_status = body.get("dns_status") if isinstance(body, dict) else None
             if dns_status not in {"clear", "warning", "unknown"}:
                 dns_status = None
-            saved = _save_leak_audit(speedbench_leak.make_audit_record(
-                evaluation, dns_status=dns_status))
+            audit=speedbench_leak.make_audit_record(evaluation, dns_status=dns_status)
+            environment=body.get('client_environment') if isinstance(body,dict) else None
+            audit['details']['client_environment']=environment if environment in ('browser','webview') else 'unknown'
+            audit['details']['environment_reported_by_client']=True
+            saved = _save_leak_audit(audit)
             result["persistence"] = saved
             self._json(result)
+        elif path == '/api/preferences':
+            body=self._read_body()
+            try:
+                values=Preferences(DATA_HOME).patch(body)
+                if DESKTOP_ACTIONS:DESKTOP_ACTIONS.notifications=values.get('sb_notifications')=='on'
+                self._json({'ok':True})
+            except PreferenceError:self._json({'ok':False,'msg':'偏好无效或无法安全保存'},400)
+        elif path == '/api/desktop/actions':
+            body=self._read_body()
+            if DESKTOP_ACTIONS is None:self._reject('not a desktop backend',404);return
+            try:self._json({'ok':True,'request_id':DESKTOP_ACTIONS.request(body)},202)
+            except ValueError:self._json({'ok':False,'msg':'桌面操作无效或队列已满'},400)
         elif path == "/api/quit":
+            if callable(DESKTOP_SHUTDOWN):
+                if DESKTOP_EXITING is not None:
+                    with STATE_LOCK:DESKTOP_EXITING.set()
+                self._json({'ok':True,'msg':'客户端正在取消任务并清理，完成后退出'})
+                threading.Thread(target=DESKTOP_SHUTDOWN,daemon=True).start();return
             with STATE_LOCK:
                 busy = STATE["running"]
             if busy:
@@ -1131,9 +1184,16 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8950)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
+    try:
+        with BackendLease(DATA_HOME):return serve_web(args)
+    except LeaseError:
+        print('SpeedBench 数据目录已被占用或无法安全锁定；请先关闭使用同一目录的现有面板。')
+        return 2
 
-    url = f"http://127.0.0.1:{args.port}"
+
+def serve_web(args):
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    url = f"http://127.0.0.1:{server.server_port}"
     try:
         n = sync_db()  # 启动时先把 jsonl 历史增量入库（幂等）
         # Binding the singleton local port succeeded before marking old tasks.
@@ -1170,6 +1230,7 @@ def main() -> int:
         print("\n已停止。")
     finally:
         speedbench_tray.stop_tray(tray)  # 摘托盘图标，避免僵尸图标
+        if hasattr(server,'server_close'):server.server_close()
     return 0
 
 

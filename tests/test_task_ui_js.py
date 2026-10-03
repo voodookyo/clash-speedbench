@@ -11,6 +11,21 @@ MODULE = Path(__file__).resolve().parents[1]/'web'/'tasks.js'
 
 @unittest.skipUnless(NODE,'Node unavailable')
 class TaskUiJsTest(unittest.TestCase):
+    def test_desktop_restores_backend_preferences_without_using_port_local_storage(self):
+        identity='node_v2_'+'a'*32
+        data={'/api/preferences':{'ok':True,'version':1,'values':{'sb_theme':'dark','sb_profile':'daily','sb_favs_v2':json.dumps([identity]),'sb_mode':'ip'}}}
+        stub=STUB_JS.replace('__FETCH_MAP__',json.dumps(data))+"\nwindow.SPEEDBENCH_ENV=Object.freeze({client:'webview'});localStorage.setItem('sb_theme','light');"
+        script=stub+'\n'+MODULE.read_text(encoding='utf-8')+'\n'+APP_JS.read_text(encoding='utf-8')+"""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            console.log(JSON.stringify({theme:lsGet('sb_theme'),profile:currentProfile,ids:[...favIds],mode:document.getElementById('f-mode').value,environment:document.getElementById('leak-environment').textContent,desktop:document.getElementById('desktop-settings').hidden}));})();
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'fixture.js';path.write_text(script,encoding='utf-8')
+            result=subprocess.run([NODE,str(path)],capture_output=True,text=True,encoding='utf-8',timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr);out=json.loads(result.stdout)
+        self.assertEqual(out['theme'],'dark');self.assertEqual(out['profile'],'daily')
+        self.assertEqual(out['ids'],[identity]);self.assertEqual(out['mode'],'ip')
+        self.assertIn('不代表 Chrome',out['environment']);self.assertFalse(out['desktop'])
     def run_app(self,driver,data=None):
         stub=STUB_JS.replace('__FETCH_MAP__',json.dumps(data or {}))
         code=stub+'\n'+MODULE.read_text(encoding='utf-8')+'\n'+APP_JS.read_text(encoding='utf-8')+'\n'+driver

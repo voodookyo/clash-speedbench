@@ -722,6 +722,7 @@ class TrayModuleTest(unittest.TestCase):
                 return None
 
         with mock.patch.object(web, "ThreadingHTTPServer", return_value=FakeServer()), \
+                mock.patch.object(web, 'BackendLease'), \
                 mock.patch.object(web, "sync_db", return_value=0), \
                 mock.patch.object(web.speedbench_db, "interrupt_tasks"), \
                 mock.patch.object(web, "write_token_file"), \

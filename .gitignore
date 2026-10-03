@@ -15,3 +15,12 @@ __pycache__/
 web-token
 identity-seed
 .identity-*
+backend-owner.lock
+ui-preferences.json
+.ui-preferences-*
+desktop/target/
+desktop/src-tauri/target/
+desktop/node_modules/
+desktop/src-tauri/resources/
+desktop/src-tauri/gen/
+desktop/src-tauri/generated-icons/

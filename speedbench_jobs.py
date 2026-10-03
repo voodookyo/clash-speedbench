@@ -157,6 +157,15 @@ class JobStore:
             key = self.active or next(reversed(self.jobs),None)
             return self._snapshot(self.jobs[key]) if key else None
 
+    def summary(self):
+        """Compact desktop status; never copy results, logs, names or config."""
+        with self.lock:
+            key=self.active or next(reversed(self.jobs),None)
+            if not key:return None
+            job=self.jobs[key]
+            return {'job_id':key,'status':job['status'],'mode':job['config']['mode'],
+                    'result_count':len(job['results'])}
+
     def wait(self,job_id,since_seq,timeout=2):
         with self.changed:
             job = self._job(job_id)

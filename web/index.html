@@ -186,9 +186,11 @@
       <div class="card leak-hero">
         <div class="card-title">🕵 环境泄漏检测</div>
         <p class="warn">泄漏检测属于当前浏览器、当前 Clash/TUN 和当前活动节点的环境属性，不属于离线测速节点的固有属性。</p>
+        <p id="leak-environment" class="card-sub">执行环境：当前浏览器；不能代表其他浏览器的隐私策略。</p>
         <div class="leak-actions">
           <button id="btn-leak-run">开始 WebRTC 检测</button>
           <button class="mini" id="btn-leak-save" disabled>保存本次结果</button>
+          <button class="mini" id="btn-browser-audit" hidden>在系统浏览器检测（独立环境）</button>
         </div>
         <div id="leak-status" class="leak-status unknown">尚未检测 · 无法确认</div>
         <div id="leak-summary" class="card-sub">浏览器会尝试收集 host、srflx、prflx、relay ICE candidate；隐私策略或 STUN 不可用时不会猜测为安全。</div>
@@ -218,6 +220,7 @@
     <!-- ============ IP Intelligence 设置 ============ -->
     <section id="view-settings" style="display:none">
       <div class="card"><h2>界面与连接</h2><label for="f-theme">主题</label><select id="f-theme"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><p class="muted">基础测速自动连接本机 Clash Verge，不需要第三方 IP 风控 API Key。下方可选 Key 只用于扩展画像。</p><div id="pending-favorites" class="muted"></div></div>
+      <div id="desktop-settings" class="card" hidden><h2>桌面客户端</h2><label class="chk"><input type="checkbox" id="f-notifications"> 任务完成通知（默认关闭；仅发送模式、状态和节点数量）</label><p class="muted">通知是否显示还取决于系统设置。窗口关闭后任务继续，可从托盘重新打开；退出会先取消并清理任务。</p><button class="mini" id="btn-official-releases">官方版本与手动升级</button></div>
       <div class="card settings-card">
         <div class="card-title">IP Intelligence 设置</div>
         <p class="card-sub">Key 只提交给本机 SpeedBench 后端，默认仅驻留内存；不会写入 localStorage、Cookie、JSONL、SQLite、日志或命令行。清空输入可移除本次面板配置。</p>
