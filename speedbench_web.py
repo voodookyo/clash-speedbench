@@ -41,6 +41,8 @@ import speedbench_tray  # noqa: E402
 import speedbench_controller  # noqa: E402
 import speedbench_sources  # noqa: E402
 import speedbench_tasks  # noqa: E402
+from speedbench_jobs import JobStore, JobError, TERMINAL
+from speedbench_progress import PREFIX, parse_record
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
@@ -77,6 +79,7 @@ STATE = {
     "proc": None,
 }
 STATE_LOCK = threading.Lock()
+JOBS = JobStore()
 
 MAX_LINES = 500
 
@@ -391,6 +394,16 @@ def run_benchmark(params: dict) -> None:
     # -u：子进程 stdout 走管道时默认块缓冲，进度行会堵在缓冲区里，
     # 面板看不到实时进度；无缓冲模式让每行立即到达。
     cmd = benchmark_command(params)
+    job_id = params.get('_job_id')
+    source_seq = 0
+    checkpoint_at = 0
+
+    def checkpoint():
+        try:
+            speedbench_db.save_task(db_path(),JOBS.snapshot(job_id))
+        except Exception as error:
+            with STATE_LOCK:
+                STATE['lines'].append('!! 任务检查点保存失败: '+_redact_runtime_text(error))
 
     with STATE_LOCK:
         STATE["running"] = True
@@ -399,9 +412,21 @@ def run_benchmark(params: dict) -> None:
         STATE["exit_code"] = None
 
     try:
+        if job_id:
+            with STATE_LOCK:
+                requested = STATE.get('cancel_requested',False)
+            if requested:
+                return
+            JOBS.transition(job_id,'preparing')
+            checkpoint()
         # No hidden getpass prompt or benchmark spawn when authentication fails.
         # The child resolves fresh local config itself; no auto key in argv/env.
         connect_controller()
+        if job_id:
+            with STATE_LOCK:
+                requested = STATE.get('cancel_requested',False)
+            if requested:
+                return
         # Windows：面板无控制台（pythonw 启动），测速子进程同样没有可依附的
         # 控制台——CTRL_BREAK_EVENT 无处可投，取消改走哨兵文件（见
         # cancel_benchmark / CANCEL_FILE）。CREATE_NO_WINDOW 防止子进程弹窗。
@@ -415,6 +440,9 @@ def run_benchmark(params: dict) -> None:
         # 把哨兵文件路径传给子进程（clash_speedbench.py 的 cancel_requested）
         env = _provider_env_snapshot()
         env["SPEEDBENCH_CANCEL_FILE"] = str(CANCEL_FILE)
+        if job_id:
+            env['SPEEDBENCH_JOB_ID'] = job_id
+            env['SPEEDBENCH_CANCEL_PRIMED'] = '1'
         proc = subprocess.Popen(
             cmd, cwd=str(DATA_HOME), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -423,9 +451,31 @@ def run_benchmark(params: dict) -> None:
         )
         with STATE_LOCK:
             STATE["proc"] = proc
+            requested = bool(job_id and STATE.get('cancel_requested',False))
+        if requested:
+            CANCEL_FILE.write_text('cancel',encoding='utf-8')
         assert proc.stdout is not None
         for line in proc.stdout:
             line = _redact_runtime_text(line.rstrip("\n"))
+            if job_id and line.startswith(PREFIX):
+                record = parse_record(line,job_id)
+                if record and record['source_seq'] > source_seq:
+                    source_seq = record['source_seq']
+                    try:
+                        if record['type'] == 'phase_started':
+                            if JOBS.snapshot(job_id)['status'] != 'cancelling':
+                                JOBS.transition(job_id,record['phase'])
+                        elif record['type'].startswith('node_') or record['type']=='phase_finished':
+                            JOBS.publish(job_id,record['type'],phase=record['phase'],
+                                         node_id=record['node_id'],payload=record['payload'])
+                    except JobError:
+                        # Invalid/out-of-order records cannot change the owner
+                        # or expose raw payloads as human-readable logs.
+                        pass
+                    if record['type']=='phase_started' or time.monotonic()-checkpoint_at>=1:
+                        checkpoint()
+                        checkpoint_at = time.monotonic()
+                continue
             with STATE_LOCK:
                 STATE["lines"].append(line)
                 if len(STATE["lines"]) > MAX_LINES:
@@ -436,15 +486,27 @@ def run_benchmark(params: dict) -> None:
             STATE["lines"].append(f"!! 启动测速失败: {_redact_runtime_text(e)}")
             STATE["exit_code"] = -1
     finally:
-        with STATE_LOCK:
-            STATE["running"] = False
-            STATE["proc"] = None
         # 测速进程已把本轮结果追加进 jsonl，顺手增量入库；失败不影响面板状态
         try:
             sync_db()
         except Exception as e:
             with STATE_LOCK:
                 STATE["lines"].append(f"!! 历史入库失败: {_redact_runtime_text(e)}")
+        if job_id:
+            with STATE_LOCK:
+                cancelled = STATE.get('cancel_requested',False)
+                exit_code = STATE['exit_code']
+            if cancelled:
+                JOBS.transition(job_id,'cancelling')
+                JOBS.transition(job_id,'cancelled')
+            elif exit_code == 0 and JOBS.snapshot(job_id)['status']=='finalizing':
+                JOBS.transition(job_id,'completed')
+            else:
+                JOBS.transition(job_id,'failed')
+            checkpoint()
+        with STATE_LOCK:
+            STATE["running"] = False
+            STATE["proc"] = None
 
 
 def cancel_benchmark() -> dict:
@@ -459,6 +521,16 @@ def cancel_benchmark() -> dict:
     with STATE_LOCK:
         proc = STATE.get("proc")
         running = STATE["running"]
+        job_id = STATE.get('job_id')
+        if running and job_id:
+            STATE['cancel_requested'] = True
+    if running and job_id:
+        try:
+            JOBS.transition(job_id,'cancelling')
+        except JobError:
+            return {'ok':False,'msg':'任务已失效，请刷新'}
+        if proc is None:
+            return {'ok':True,'msg':'已取消等待启动的任务；完成清理后会结束'}
     if not running or proc is None or proc.poll() is not None:
         return {"ok": False, "msg": "当前没有正在进行的测速"}
     try:
@@ -476,7 +548,7 @@ def cancel_benchmark() -> dict:
                 proc.kill()
         with STATE_LOCK:
             STATE["lines"].append("!! 测速已被手动中断")
-        return {"ok": True, "msg": "已中断测速，Clash 配置已恢复"}
+        return {"ok": True, "msg": "已请求中断测速；请以任务终态和恢复记录确认清理结果"}
     except Exception as e:
         return {"ok": False, "msg": f"中断失败: {e}"}
 
@@ -674,6 +746,58 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(speedbench_controller.redact_payload(obj), ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
 
+    def _job_get(self,path,qs):
+        try:
+            if path == '/api/jobs':
+                self._json(dict(version=1,active_job_id=JOBS.active_id(),latest=JOBS.latest()))
+                return
+            parts = path.split('/')
+            if len(parts) not in (4,5) or not re.fullmatch(r'job_[0-9a-f]{32}',parts[3]):
+                self._json({'ok':False,'msg':'任务不存在'},404)
+                return
+            job_id = parts[3]
+            if len(parts)==4:
+                self._json(JOBS.snapshot(job_id))
+                return
+            cursor = qs.get('since_seq',[self.headers.get('Last-Event-ID','0')])[0]
+            if not re.fullmatch(r'[0-9]{1,20}',cursor):
+                raise JobError('事件游标无效')
+            since = int(cursor)
+            if parts[4]=='events':
+                self._json(JOBS.read(job_id,since))
+            elif parts[4]=='stream':
+                # Resolve errors before sending streaming response headers.
+                JOBS.read(job_id,since)
+                self.send_response(200)
+                self.send_header('Content-Type','text/event-stream; charset=utf-8')
+                self.send_header('Cache-Control','no-store')
+                self.send_header('Connection','close')
+                self.end_headers()
+                deadline = time.monotonic()+20
+                try:
+                    while time.monotonic()<deadline:
+                        delta = JOBS.wait(job_id,since,timeout=2)
+                        if delta['resync']:
+                            frames = [('snapshot',delta['seq'],delta['snapshot'])]
+                        else:
+                            frames = [('progress',e['seq'],e) for e in delta['events']]
+                        for kind,seq,value in frames:
+                            body = json.dumps(speedbench_controller.redact_payload(value),ensure_ascii=False,allow_nan=False)
+                            self.wfile.write(f'id: {seq}\nevent: {kind}\ndata: {body}\n\n'.encode('utf-8'))
+                        if not frames:
+                            self.wfile.write(b': heartbeat\n\n')
+                        self.wfile.flush()
+                        since = delta['seq']
+                        if JOBS.snapshot(job_id)['status'] in TERMINAL:
+                            break
+                except (BrokenPipeError,ConnectionResetError,OSError,JobError):
+                    pass
+                self.close_connection = True
+            else:
+                self._json({'ok':False,'msg':'任务接口不存在'},404)
+        except JobError as e:
+            self._json({'ok':False,'msg':str(e)},404 if 'unavailable' in str(e) else 400)
+
     def _read_body(self) -> dict:
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -825,7 +949,17 @@ class Handler(BaseHTTPRequestHandler):
                     "running": STATE["running"],
                     "lines": STATE["lines"][-60:],
                     "exit_code": STATE["exit_code"],
+                    'job_id':STATE.get('job_id'),
+                    'job':JOBS.latest(),
                 })
+        elif path == '/api/jobs' or path.startswith('/api/jobs/'):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._job_get(path,qs)
+        elif path == '/api/tasks':
+            self._json(dict(version=1,tasks=speedbench_db.task_history(db_path())))
+        elif re.fullmatch(r'/api/tasks/job_[0-9a-f]{32}',path):
+            task = speedbench_db.task_snapshot(db_path(),path.rsplit('/',1)[1])
+            self._json(task if task else {'error':'任务不存在'},200 if task else 404)
         elif path == '/api/task-config':
             self._json(dict(version=1, limits=speedbench_tasks.LIMITS,
                             modes={m:speedbench_tasks.resolve_config({'mode':m}).public()
@@ -854,13 +988,15 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_post():
             return
         path = urllib.parse.urlparse(self.path).path
-        if path == "/api/run":
+        if path in ('/api/run','/api/jobs'):
             with STATE_LOCK:
                 busy = STATE["running"]
             if busy:
                 self._reject("已有测速任务进行中", 409)
                 return
             params = self._read_body()
+            if path == '/api/jobs' and isinstance(params,dict):
+                params.setdefault('mode','standard')
             try:
                 params = validate_run_params(params)
             except speedbench_tasks.TaskConfigError as e:
@@ -875,15 +1011,32 @@ class Handler(BaseHTTPRequestHandler):
                 if STATE['running']:
                     self._reject('已有测速任务进行中',409)
                     return
-                STATE.update(running=True, started=time.time(), exit_code=None, proc=None, lines=[])
+                try:
+                    config = speedbench_tasks.resolve_config({k:v for k,v in params.items()
+                        if k not in ('include','auto_switch','subscription_ids','node_ids')})
+                    job_id = JOBS.create(config)
+                    # Clear only this backend's known sentinel before ownership
+                    # is dispatched. The child will never erase a fresh cancel.
+                    CANCEL_FILE.unlink(missing_ok=True)
+                except JobError:
+                    self._reject('已有测速任务进行中',409)
+                    return
+                except OSError:
+                    JOBS.transition(job_id,'failed')
+                    self._json({'ok':False,'msg':'任务取消通道不可用'},500)
+                    return
+                params = dict(params,_job_id=job_id)
+                STATE.update(running=True, started=time.time(), exit_code=None, proc=None, lines=[],
+                             job_id=job_id,cancel_requested=False)
             try:
                 threading.Thread(target=run_benchmark, args=(params,), daemon=True).start()
             except Exception:
                 with STATE_LOCK:
                     STATE.update(running=False,exit_code=-1)
+                JOBS.transition(job_id,'failed')
                 self._json({'ok':False,'msg':'测速任务启动失败'},500)
                 return
-            self._json({"ok": True})
+            self._json({"ok": True,'version':1,'job_id':job_id},202 if path=='/api/jobs' else 200)
         elif path == "/api/switch":
             body = self._read_body()
             if not isinstance(body, dict):
@@ -900,6 +1053,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(do_switch(name, node_id=node_id) if node_id else do_switch(name))
         elif path == "/api/run/cancel":
             self._json(cancel_benchmark())
+        elif re.fullmatch(r'/api/jobs/job_[0-9a-f]{32}/cancel',path):
+            job_id = path.split('/')[3]
+            with STATE_LOCK:
+                matches = STATE.get('job_id') == job_id and STATE['running']
+            if not matches:
+                self._json({'ok':False,'msg':'不是当前活动任务'},409)
+            else:
+                self._json(cancel_benchmark())
         elif path == "/api/ip-intel/settings":
             ok, msg = _set_ip_intel_settings(self._read_body())
             self._json({"ok": ok, "msg": msg}, 200 if ok else 400)
@@ -965,6 +1126,8 @@ def main() -> int:
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     try:
         n = sync_db()  # 启动时先把 jsonl 历史增量入库（幂等）
+        # Binding the singleton local port succeeded before marking old tasks.
+        speedbench_db.interrupt_tasks(db_path())
         if n:
             print(f"历史库：新导入 {n} 轮测速记录 → {db_path().name}")
     except Exception as e:

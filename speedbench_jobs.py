@@ -28,10 +28,29 @@ PHASES = ('','preparing','probing','measuring','enriching','finalizing','cleanup
 RESULT_SCALARS = ('name','provider','node_id','proto','latency_ms','jitter_ms','connect_ms',
                   'median_mbps','multi_mbps','network_score','score','ip_quality_score','ip_grade',
                   'probe_attempts','probe_successes','probe_failures','probe_success_rate','probe_loss_pct',
-                  'exit_ipv4','exit_ipv6','source_status','subscription_name')
+                  'exit_ipv4','exit_ipv6','source_status','subscription_name','sample_mb','best_mbps',
+                  'status','fail_reason','tags','node_key','identity_version','identity_strength',
+                  'dual_stack_inconsistent','stars','download_bytes')
 SCOPE_FIELDS = ('mode','probe','bandwidth','exit','intel')
 MAX_PAYLOAD = 65536
 MAX_RESULTS = 10000
+IP_FIELDS = ('exit_ip','country','country_code','region','city','isp','org','asn','asname','kind',
+             'proxy','hosting','mobile','ok')
+INTEL_FIELDS = ('ip','ip_version','country','asn','as_name','isp','organization','hosting','proxy',
+                'vpn','tor','mobile','residential_proxy','connection_type','ipqs_fraud_score',
+                'ipqs_recent_abuse','ipqs_abuse_velocity','scamalytics_score','scamalytics_risk',
+                'scamalytics_datacenter','scamalytics_blacklisted','ip_quality_score','ip_grade')
+PROVIDER_FIELDS = INTEL_FIELDS + ('country_code','as_type','company_type','asn_type','isp_type',
+                                 'fraud_score','recent_abuse','abuse_velocity','bot_status',
+                                 'datacenter','blacklisted','risk','score','public_proxy',
+                                 'web_proxy','server','residential','org','asname')
+
+
+def _scalars(value, fields):
+    if not isinstance(value,dict):
+        return {}
+    return {k:value[k] for k in fields if k in value and
+            (value[k] is None or isinstance(value[k],(str,int,float,bool)))}
 
 
 class JobError(ValueError):
@@ -51,11 +70,38 @@ def _copy(value):
 def _result(value):
     if not isinstance(value,dict):
         raise JobError('Node event result is unsupported')
-    public = {k:value[k] for k in RESULT_SCALARS if k in value and
-              (value[k] is None or isinstance(value[k],(str,int,float,bool)))}
+    public = _scalars(value,RESULT_SCALARS)
     scope = value.get('measurement_scope')
     if isinstance(scope,dict):
         public['measurement_scope'] = {k:scope[k] for k in SCOPE_FIELDS if isinstance(scope.get(k),str)}
+    if isinstance(value.get('samples_mbps'),list):
+        public['samples_mbps'] = [v for v in value['samples_mbps'][:5] if isinstance(v,(int,float))]
+    if isinstance(value.get('ip'),dict):
+        public['ip'] = _scalars(value['ip'],IP_FIELDS)
+    for key in ('intel_v4','intel_v6'):
+        intel = value.get(key)
+        if intel is None and key in value:
+            public[key] = None
+        elif isinstance(intel,dict):
+            normalized = _scalars(intel,INTEL_FIELDS)
+            classification = intel.get('classification')
+            if isinstance(classification,dict):
+                c = _scalars(classification,('category','confidence'))
+                for field in ('evidence','conflicts'):
+                    if isinstance(classification.get(field),list):
+                        c[field] = [s[:2000] for s in classification[field][:100] if isinstance(s,str)]
+                normalized['classification'] = c
+            statuses = intel.get('provider_status',{})
+            normalized['provider_status'] = _scalars(statuses,('ip-api','ipinfo','ipqs','scamalytics'))
+            data = intel.get('provider_data',{})
+            if isinstance(data,dict):
+                normalized['provider_data'] = {p:_scalars(data[p],PROVIDER_FIELDS)
+                    for p in ('ip-api','ipinfo','ipqs','scamalytics') if isinstance(data.get(p),dict)}
+            public[key] = normalized
+    # Imported lazily to keep the protocol usable without importing measurement
+    # engines; nested subscription metadata has its own explicit whitelist.
+    from speedbench_sources import result_origin
+    public.update(result_origin(value))
     return _copy(public)
 
 
@@ -82,6 +128,18 @@ class JobStore:
     def active_id(self):
         with self.lock:
             return self.active
+
+    def latest(self):
+        with self.lock:
+            key = self.active or next(reversed(self.jobs),None)
+            return self._snapshot(self.jobs[key]) if key else None
+
+    def wait(self,job_id,since_seq,timeout=2):
+        with self.changed:
+            job = self._job(job_id)
+            if job['seq'] == since_seq and job['status'] not in TERMINAL:
+                self.changed.wait(timeout=max(0,min(timeout,20)))
+            return self.read(job_id,since_seq)
 
     def create(self, config):
         if not isinstance(config,TaskConfig):

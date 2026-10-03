@@ -7,7 +7,8 @@ class UpgradePackagingTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         for filename in ('build_app.sh','.github/workflows/release.yml','.github/workflows/test.yml'):
             content = (root/filename).read_text(encoding='utf-8')
-            for module in ('speedbench_identity.py','speedbench_sources.py','speedbench_tasks.py','speedbench_jobs.py'):
+            for module in ('speedbench_identity.py','speedbench_sources.py','speedbench_tasks.py','speedbench_jobs.py',
+                           'speedbench_process.py','speedbench_progress.py'):
                 with self.subTest(filename=filename,module=module):
                     self.assertIn(module,content)
 

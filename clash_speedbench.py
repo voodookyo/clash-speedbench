@@ -45,6 +45,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import speedbench_controller as controller_config
 import speedbench_sources as source_catalog
 import speedbench_tasks
+from speedbench_process import run_cancellable
+from speedbench_progress import ProgressEmitter, phase, publish_result
 
 from speedbench_ip_intel import (
     IpIntelCache,
@@ -754,7 +756,7 @@ def cancel_requested() -> bool:
 
 def clear_cancel_request() -> None:
     """启动时清掉上一轮残留的哨兵文件，否则一开场就会被误判为已取消。"""
-    if not _CANCEL_FILE:
+    if not _CANCEL_FILE or os.environ.get('SPEEDBENCH_CANCEL_PRIMED') == '1':
         return
     try:
         os.unlink(_CANCEL_FILE)
@@ -772,6 +774,10 @@ def _no_window_kwargs() -> dict:
         if flags:
             return {"creationflags": flags}
     return {}
+
+
+def run_external(cmd, **kwargs):
+    return run_cancellable(cmd,cancel=cancel_requested if _CANCEL_FILE else None,**kwargs)
 
 
 def curl_speed(proxy_url: str, download_url: str, max_time: float,
@@ -799,7 +805,7 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
     try:
         # 钉 UTF-8：中文 Windows 的默认 GBK 解码遇到 curl 输出里的非 GBK 字节
         # 会在 subprocess 读取线程里炸 UnicodeDecodeError（真机实测）
-        p = subprocess.run(cmd, text=True, capture_output=True,
+        p = run_external(cmd, text=True, capture_output=True,
                            encoding="utf-8", errors="replace",
                            timeout=max_time + connect_timeout + 5,
                            **_no_window_kwargs())
@@ -985,7 +991,7 @@ def fetch_ip_info(proxy_url: str, timeout: float) -> Optional[dict]:
     try:
         # 钉 UTF-8：ip-api 返回体是 UTF-8 JSON（lang=zh-CN 时含中文地名），
         # 中文 Windows 按 GBK 解码必炸 UnicodeDecodeError（真机实测）
-        p = subprocess.run(cmd, text=True, capture_output=True,
+        p = run_external(cmd, text=True, capture_output=True,
                            encoding="utf-8", errors="replace",
                            timeout=timeout + 5,
                            **_no_window_kwargs())
@@ -1021,7 +1027,7 @@ def fetch_exit_ip(proxy_url: str, timeout: float,
         "--max-time", str(timeout), url,
     ]
     try:
-        p = subprocess.run(
+        p = run_external(
             cmd, text=True, capture_output=True, encoding="utf-8",
             errors="replace", timeout=timeout + 5, **_no_window_kwargs()
         )
@@ -1790,6 +1796,8 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
     origins = getattr(args, 'source_origins', {})
     for result in results:
         source_catalog.apply_origin(result, origins.get(result.name))
+        publish_result(args,'node_intelligence',result,phase_name='enriching')
+    phase(args,'finalizing')
     if not results:
         print("没有产生有效测速结果。")
         return 0
@@ -1920,6 +1928,7 @@ def main() -> int:
         setattr(args,key,getattr(task_config,key))
     args.all = task_config.measure_all
     args.task_config = task_config if args.mode else None
+    args.progress = ProgressEmitter.from_environment()
     if args.mode and args.workers <= 1:
         print('新模式需要隔离 worker；串行模式请暂时不指定 --mode。',file=sys.stderr)
         return 2
@@ -1953,6 +1962,7 @@ def main() -> int:
         signal.signal(signal.SIGBREAK, _on_sigbreak)
 
     clear_cancel_request()
+    phase(args,'preparing')
 
     try:
         api = connect_controller(args.secret, args.controller, interactive=not args.non_interactive)
@@ -2117,6 +2127,8 @@ def main() -> int:
     intel_enricher: Optional[_IntelEnrichment] = None
     saved_groups: Dict[str, Tuple[str, Optional[str]]] = {}
     mode_changed = False
+    phase(args,'probing')
+    phase(args,'measuring')
 
     try:
         # Force global to guarantee curl's traffic uses the tested path.
@@ -2156,6 +2168,13 @@ def main() -> int:
                 count=_probe_count_from_args(args),
             )
             latency, jitter = probe
+            partial = Result(name=name,provider=str(info.get('provider-name','')),
+                             proto=str(info.get('type','')),latency_ms=latency,speeds_mbps=[],
+                             median_mbps=None,best_mbps=None,status='ok' if latency is not None else 'unreachable',
+                             jitter_ms=jitter)
+            _apply_probe_stats(partial,probe,fallback_attempts=_probe_count_from_args(args))
+            source_catalog.apply_origin(partial,args.source_origins.get(name))
+            publish_result(args,'node_probe',partial,phase_name='probing',completed=idx,total=len(candidates))
 
             # 带宽采样：--mb 未显式指定时先 ~1MB 预热估速，再自适应样本大小
             mb = args.mb
@@ -2239,6 +2258,8 @@ def main() -> int:
             results.append(res)
 
             ip_txt = f" | {ip_brief(ip)}" if ip and ip.ok else ""
+            source_catalog.apply_origin(res,args.source_origins.get(name))
+            publish_result(args,'node_measurement',res,phase_name='measuring',completed=idx,total=len(candidates))
             multi_brief = f" / {multi:.0f}" if multi else ""
             print(
                 f"[{idx:>3}/{len(candidates)}] "
@@ -2260,6 +2281,7 @@ def main() -> int:
 
     # Enrichment was submitted while the serial network work was in progress;
     # only now wait for the deduplicated provider jobs and recompute Overall.
+    phase(args,'enriching')
     finish_intelligence_enrichment(intel_enricher, results)
 
     return report(results, args, api, proxies)

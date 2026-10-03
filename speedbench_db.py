@@ -33,7 +33,7 @@ import re
 import sqlite3
 import statistics
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA = """
@@ -161,6 +161,29 @@ CREATE TABLE IF NOT EXISTS node_origins (
     PRIMARY KEY(node_result_id, subscription_id)
 );
 CREATE INDEX IF NOT EXISTS idx_node_origins_subscription ON node_origins(subscription_id);
+CREATE TABLE IF NOT EXISTS task_runs (
+    job_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    target_profile TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    config_json TEXT NOT NULL,
+    run_id INTEGER REFERENCES runs(id),
+    partial INTEGER NOT NULL DEFAULT 1,
+    results_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_task_runs_started ON task_runs(started_at DESC);
+CREATE TABLE IF NOT EXISTS task_metrics (
+    job_id TEXT NOT NULL REFERENCES task_runs(job_id),
+    phase TEXT NOT NULL,
+    duration_ms REAL NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    successes INTEGER NOT NULL DEFAULT 0,
+    bytes INTEGER NOT NULL DEFAULT 0,
+    counters_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(job_id, phase)
+);
 """
 
 # 旧库就地升级时要补的列（新库的 SCHEMA 已包含，_ensure_columns 对其为 no-op）
@@ -285,6 +308,102 @@ def _safe_json(value, default):
                           separators=(",", ":"))
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+_TASK_TERMINAL = ('completed', 'cancelled', 'failed', 'interrupted')
+_TASK_PHASES = ('connection','discovery','dns','worker_start','delay','exit_v4','exit_v6',
+                'basic_intel','provider','warmup','download','summary','restore','cleanup','probe')
+
+
+def save_task(db_path, snapshot):
+    """Idempotent bounded checkpoint; never modifies legacy runs.raw.
+
+    Only trusted public configuration/result fields survive. A delayed active
+    checkpoint cannot turn a persisted terminal task back into a running task.
+    """
+    from contextlib import closing
+    from dataclasses import fields
+    from speedbench_tasks import TaskConfig
+    from speedbench_jobs import _result, TRANSITIONS, MAX_RESULTS
+    job_id = snapshot.get('job_id')
+    status = snapshot.get('status')
+    if not isinstance(job_id,str) or not re.fullmatch(r'job_[0-9a-f]{32}',job_id):
+        raise ValueError('Invalid task identity')
+    if status not in set(TRANSITIONS) | set(_TASK_TERMINAL):
+        raise ValueError('Invalid task status')
+    config = snapshot.get('config',{})
+    config = {f.name:config[f.name] for f in fields(TaskConfig) if f.name in config
+              and (config[f.name] is None or isinstance(config[f.name],(str,int,float,bool)))}
+    results = [_result(r) for r in snapshot.get('results',[])[:MAX_RESULTS]]
+    with closing(_open(db_path)) as conn, conn:
+        old = conn.execute('SELECT status FROM task_runs WHERE job_id=?',(job_id,)).fetchone()
+        if old and old[0] in _TASK_TERMINAL:
+            return False
+        conn.execute('''INSERT INTO task_runs
+            (job_id,mode,target_profile,status,started_at,finished_at,config_json,partial,results_json)
+            VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
+            status=excluded.status, finished_at=excluded.finished_at,
+            partial=excluded.partial, results_json=excluded.results_json''',
+            (job_id, config.get('mode','legacy'),config.get('target_profile','balanced'),
+             status,str(snapshot.get('started_at',''))[:64],
+             str(snapshot['finished_at'])[:64] if snapshot.get('finished_at') else None,
+             _safe_json(config,'{}'),int(status!='completed'),_safe_json(results,'[]')))
+        for phase, metric in snapshot.get('metrics',{}).items():
+            if phase not in _TASK_PHASES or not isinstance(metric,dict):
+                continue
+            def count(key):
+                value = metric.get(key,0)
+                return value if isinstance(value,int) and not isinstance(value,bool) and 0<=value<2**63 else 0
+            duration = _db_number(metric.get('duration_ms',0)) or 0
+            duration = max(0,min(duration,1e15))
+            attempts = count('attempts')
+            counters = metric.get('counters',{})
+            counters = {k:v for k,v in counters.items() if k in
+                        ('cache_hits','cache_misses','worker_count','nodes','api_calls')
+                        and isinstance(v,int) and not isinstance(v,bool) and 0<=v<2**63}
+            conn.execute('''INSERT INTO task_metrics VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(job_id,phase) DO UPDATE SET
+                duration_ms=excluded.duration_ms,attempts=excluded.attempts,
+                successes=excluded.successes,bytes=excluded.bytes,counters_json=excluded.counters_json''',
+                (job_id,phase,duration,attempts,min(attempts,count('successes')),count('bytes'),_safe_json(counters,'{}')))
+    return True
+
+
+def _task_row(row):
+    return dict(version=1,job_id=row[0],mode=row[1],target_profile=row[2],status=row[3],
+                started_at=row[4],finished_at=row[5],config=json.loads(row[6]),
+                run_id=row[7],partial=bool(row[8]))
+
+
+def task_history(db_path, limit=100):
+    from contextlib import closing
+    with closing(_open(db_path)) as conn:
+        return [_task_row(r) for r in conn.execute(
+            'SELECT * FROM task_runs ORDER BY started_at DESC LIMIT ?', (max(1,min(int(limit),1000)),))]
+
+
+def task_snapshot(db_path, job_id):
+    from contextlib import closing
+    with closing(_open(db_path)) as conn:
+        row = conn.execute('SELECT * FROM task_runs WHERE job_id=?',(job_id,)).fetchone()
+        if not row:
+            return None
+        result = _task_row(row)
+        result['results'] = json.loads(row[9])
+        result['metrics'] = {r[0]:dict(duration_ms=r[1],attempts=r[2],successes=r[3],bytes=r[4],
+                                     counters=json.loads(r[5])) for r in conn.execute(
+                                         'SELECT phase,duration_ms,attempts,successes,bytes,counters_json FROM task_metrics WHERE job_id=?',
+                                         (job_id,))}
+        return result
+
+
+def interrupt_tasks(db_path):
+    """Called only by an owning backend on restart; retains partial records."""
+    from contextlib import closing
+    with closing(_open(db_path)) as conn, conn:
+        return conn.execute('''UPDATE task_runs SET status='interrupted',partial=1,finished_at=?
+            WHERE status NOT IN ('completed','cancelled','failed','interrupted')''',
+            (datetime.now(timezone.utc).isoformat(timespec='milliseconds'),)).rowcount
 
 
 def _db_number(value):

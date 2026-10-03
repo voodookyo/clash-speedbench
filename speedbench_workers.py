@@ -54,6 +54,7 @@ import sys
 import tempfile
 import threading
 from speedbench_sources import apply_origin
+from speedbench_progress import phase, publish_result
 import time
 import copy
 import queue
@@ -62,6 +63,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from clash_speedbench import (
+    run_external,
     DEFAULT_DOWNLOAD_URL,
     IpInfo,
     MihomoAPI,
@@ -697,7 +699,7 @@ def _extract_proxies_ruby(config_path: str) -> List[dict]:
         "puts JSON.generate({'proxies' => cfg['proxies'] || []})"
     )
     try:
-        p = subprocess.run([ruby, "-e", script, config_path],
+        p = run_external([ruby, "-e", script, config_path],
                            capture_output=True, text=True, timeout=30,
                            **_no_window_kwargs())
     except subprocess.TimeoutExpired:
@@ -800,7 +802,7 @@ def physical_interface() -> Optional[str]:
         ]
         for c in cmds:
             try:
-                p = subprocess.run(
+                p = run_external(
                     [ps, "-NoProfile", "-Command",
                      "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + c],
                     capture_output=True, timeout=10,
@@ -813,7 +815,7 @@ def physical_interface() -> Optional[str]:
                 pass
         return None
     try:
-        p = subprocess.run(["route", "get", "default"],
+        p = run_external(["route", "get", "default"],
                            capture_output=True, text=True, timeout=5)
         for line in p.stdout.splitlines():
             if "interface:" in line:
@@ -855,7 +857,7 @@ def doh_resolve(domain: str, record_type: str = "A") -> Optional[str]:
         try:
             # 钉 UTF-8：与 fetch_ip_info/curl_speed 保持一致，避免中文 Windows
             # 上 GBK 解码遇到非 GBK 字节在读取线程里炸 UnicodeDecodeError
-            p = subprocess.run(
+            p = run_external(
                 ["curl", "-s", "-m", "6",
                  "--resolve", f"{host}:443:{ip}",
                  "-H", "accept: application/dns-json",
@@ -1049,7 +1051,7 @@ class Worker:
 
 
 def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
-                       max_workers: int = 10, probe_count: int = 3
+                       max_workers: int = 10, probe_count: int = 3, on_result=None
                        ) -> Dict[str, ProbeStats]:
     """Phase 1 第 1 步：经主实例 /delay API 并发测全部节点延迟，
     返回 {节点名: ProbeStats}；对象可继续解包为旧的 (latency, jitter) pair，
@@ -1083,6 +1085,8 @@ def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
                       if stats.loss_pct is not None else "")
         print(f"Phase 1 粗筛 [{idx:>3}/{total}] {name} | "
               f"{fmt_ms(lat)}{jitter_brief} ms（主实例{loss_brief}）")
+        if on_result is not None:
+            on_result(name,stats,idx,total)
 
     with ThreadPoolExecutor(max_workers=min(max_workers, max(1, total))) as pool:
         list(pool.map(one, names))
@@ -1302,15 +1306,27 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     # IP 画像再计第二轮 [N/M]——Web 端只认最后一条 [N/M] 计数（app.js 正则），
     # 表现为进度条涨满后回退再涨，阶段标签始终是「Phase 1 粗筛」，无需改 Web。
     latency_map: Dict[str, ProbeStats] = {}
+    phase(args,'probing')
+    published_probe = set()
+    def publish_probe(name,stats,idx,count):
+        r = Result(name=name,provider=(provider_by_name or {}).get(name,''),proto=proto_by_name.get(name,''),
+                   latency_ms=stats.latency_ms,speeds_mbps=[],median_mbps=None,best_mbps=None,
+                   jitter_ms=stats.jitter_ms,status='ok' if stats.latency_ms is not None else 'unreachable')
+        _apply_probe_stats(r,stats)
+        apply_origin(r,getattr(args,'source_origins',{}).get(name))
+        publish_result(args,'node_probe',r,phase_name='probing',completed=idx,total=count)
+        published_probe.add(name)
     if main_api is not None:
         print(f"Phase 1 粗筛 · 延迟探测: 经主实例 /delay 并发测 {total} 个节点"
               f"（Clash Verge ping 同口径，不切换节点）…")
         try:
             try:
+                callback = {'on_result':publish_probe} if getattr(args,'progress',None) is not None else {}
                 latency_map = probe_latency_pool(
                     main_api, [str(p.get("name")) for p in selected],
                     args.delay_timeout,
                     probe_count=_probe_count_from_args(args),
+                    **callback,
                 )
             except TypeError:
                 # Preserve compatibility with older injected pool functions.
@@ -1325,6 +1341,9 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         print(f"Phase 1 延迟探测完成: {n_ok}/{total} 连通"
               + (f"；主实例失败的 {total - n_ok} 个将在 worker 内兜底重测"
                  if n_ok < total else ""))
+        for i,(name,stats) in enumerate(latency_map.items(),1):
+            if name not in published_probe:
+                publish_probe(name,_coerce_probe_stats(stats,attempts=_probe_count_from_args(args)),i,total)
 
     # ---- Phase 1 第 2 步：worker 池出口 IP 画像 + 延迟兜底 ----
     # 需进 worker 的节点：未跳过 IP 画像时是全部节点；--no-ip 时只剩主实例
@@ -1483,6 +1502,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                         results.append(r)
                         done_counter["n"] += 1
                         idx = done_counter["n"]
+                    apply_origin(r,getattr(args,'source_origins',{}).get(name))
+                    publish_result(args,'node_exit',r,phase_name='probing',completed=idx,total=ip_total)
                     ip_txt = f" | {ip_brief(r.ip)}" if r.ip and r.ip.ok else ""
                     jitter_brief = f"±{r.jitter_ms:.0f}" if r.jitter_ms else ""
                     print(f"Phase 1 粗筛 [{idx:>3}/{ip_total}] {name} | "
@@ -1556,6 +1577,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
 
     # Phase 2 选节点：剔除不通节点后按延迟升序，取 Top N（--all 时取全部连通节点）
     chosen = choose_task_nodes(results,args)
+    if chosen:
+        phase(args,'measuring')
 
     if not chosen:
         print("Phase 2 精测: IP 专项不请求带宽。" if config and not config.bandwidth else
@@ -1600,6 +1623,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                     # final Overall is recomputed after Intelligence joins.
                     r.score = compute_score(r)
                     r.tags = make_tags(r)
+                    publish_result(args,'node_measurement',r,phase_name='measuring',completed=i,total=len(chosen))
                     ip_txt = f" | {ip_brief(r.ip)}" if r.ip and r.ip.ok else ""
                     multi_brief = f" / {r.multi_mbps:.0f}" if r.multi_mbps else ""
                     mb_brief = f"（{r.sample_mb}MB 样本）" if r.sample_mb else ""
@@ -1637,7 +1661,10 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     # work has completed, then derive node-level worst-IP quality and Overall.
     if intel_enricher is None:
         intel_enricher = start_intelligence_enrichment(results,args)
+    phase(args,'enriching')
     finish_intelligence_enrichment(intel_enricher, results)
+    for r in results:
+        publish_result(args,'node_intelligence',r,phase_name='enriching')
 
     sample_desc = f"{args.mb}MB" if args.mb else "自适应10~95MB"
     if getattr(args, "multi", False):
