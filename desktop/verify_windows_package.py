@@ -96,6 +96,37 @@ def bootstrap(root,data,manifest):
             if stream:stream.close()
 
 
+def verify_worker_cleanup(root,data):
+    """Exercise actual bundled cleanup code, using only fixture Python children."""
+    program='''
+import subprocess,sys
+import speedbench_workers as workers
+from clash_speedbench import CLEANUP_FAILED_EXIT
+assert CLEANUP_FAILED_EXIT==3
+group=[];other=None
+def spawn():
+    return subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'],
+        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
+try:
+    other=spawn()
+    for i in range(2):
+        worker=workers.Worker('fixture',[],{},None)
+        worker.dir=workers._WorkerDirectory();group.append(worker);worker.proc=spawn()
+    workers.stop_workers(group)
+    assert all(w.proc.poll() is not None for w in group)
+    assert other.poll() is None
+finally:
+    for process in [w.proc for w in group]+[other]:
+        if process is not None and process.poll() is None:process.kill();process.wait(timeout=3)
+    for worker in group:worker.dir.cleanup()
+'''
+    env=dict(os.environ,SPEEDBENCH_HOME=str(data),PATH=str(Path(os.environ['SystemRoot'])/'System32'))
+    env.pop('SPEEDBENCH_VERGE_ROOT',None)
+    result=subprocess.run([str(root/'runtime/python.exe'),'-B','-E','-s','-c',program],
+        cwd=root/'app',env=env,capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode!=0:raise ValueError('Bundled worker group cleanup fixture failed')
+
+
 def verify(package):
     if os.name!='nt':raise ValueError('Windows artifact verification requires Windows')
     package=Path(package).resolve()
@@ -113,13 +144,14 @@ def verify(package):
         data=temporary/'独立数据 中文 空格 🧪';data.mkdir()
         history=data/'speedbench-history.jsonl';raw=b'{"ts":"fixture-only","results":[]}\n';history.write_bytes(raw)
         bootstrap(root,data,manifest);bootstrap(root,data,manifest)
+        verify_worker_cleanup(root,data)
         if history.read_bytes()!=raw:raise ValueError('Original fixture raw changed during packaged lifecycle')
         # An attacker-updated side manifest cannot authorize modified source.
         source=root/'app/speedbench_desktop.py';source.write_bytes(source.read_bytes()+b'\n# fixture tamper\n')
         manifest['files']['app/speedbench_desktop.py']=digest(source)
         (root/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
         if native_check()==0:raise ValueError('Mutable side manifest bypassed native integrity anchor')
-    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, original raw retained. Native window/tray acceptance not included.')
+    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, original raw retained. Native window/tray acceptance not included.')
 
 
 if __name__=='__main__':

@@ -13,14 +13,15 @@
 - e73eb9b：认证点击触发固定 GitHub 正式 Release 查询、内存 single-flight/TTL、版本比较、失败无法确认；不自动下载/安装/降级，不检查 alpha 更新；包验证覆盖新设置静态模块和本地接口。
 - f0851bf：自定义 Verge 根目录、控制器/来源/worker 一致传递，接受任务冻结私有快照，失效不回退、任务忙碌不允许改目录。
 - f1b055c：共享设置的预览/确认/恢复自动发现、过期响应保护、资源清单/CI/文档和测试。
-- 最新产物固定源码：`f1b055ce2dc9e95d7f859534de34452615a1dc92`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b 包保留，只作对应修订的历史证据，不包含此后的功能。
+- 1243345：登记 worker 并发清理、显式目录生命周期，持续失败不能被动态 shard 吞掉；CLI 专用退出码／后端 failed 和后续任务阻断。
+- 最新产物固定源码：`1243345224e718e5b5b4fba76edd71853e93a345`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c 包保留，只作对应修订的历史证据，不包含此后的功能。
 - 桌面版本 `1.1.0-alpha.1`，运行时 CPython `3.14.8`，平台 `windows-x86_64`。核心稳定版入口与 legacy 测速默认未改为桌面 alpha。
-- 当前包目录 `dist/desktop-artifacts/f1b055ce2dc9/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。报告的后续文档提交不改变此包的冻结源码。
+- 当前包目录 `dist/desktop-artifacts/1243345224e7/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告／独立验收脚本提交不改变此包的冻结源码。
 
 | 文件 | 字节 | SHA-256 |
 |---|---:|---|
-| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12756172 | 682df993d7a4057f7b290eca82d7be2a87f7bc575d3ee6296b42f3439db15f69 |
-| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15733954 | 1c3546afe1ce5c72f76f348cd81d1feecc0f339b16a4e1d64ad1e47a3f21e74a |
+| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12758867 | c953e82cd1f76534238fedc4debdfa745aa3303c0705daebaecbc06945bd7e66 |
+| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15735831 | fa3cb4ae809e69a06c35d5b9c8f49117198d63b9c38f81f95dc77430ad46b88d |
 
 SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核对。包 **unsigned**，自动更新禁用；WebView2 是系统组件，不是单文件免运行时承诺。
 
@@ -82,6 +83,18 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 - `prepare_resources.py --target windows-x86_64` → Tauri locked/offline unsigned NSIS → `package_windows.py` → `verify_windows_package.py` → `collect_artifacts.py --target windows-x86_64` 全部成功；独立 ZIP 解包再运行原生 integrity/tamper、内置 Python/私有握手、Origin、两轮起停/偏好、原 raw 保持，新增认证根目录接口默认 auto/session、非法目录拒绝/不回显以及第三份设置 JS 清单哈希核对。70 项资源，source_dirty=false，两个包 SHA-256 经 Get-FileHash 单独复核与 provenance 一致。
 
 配置选择子功能已本机验收，不表示 C 全页矩阵、D 原生 GUI 或 A–D 完整规格已完成。
+
+### 登记 worker 并发清理与失败传播
+
+中断注册表按句柄去重，最多 16 路 cleanup 并发，join 所有尝试后统一报错，不按进程名杀进程。原每进程 3s terminate＋3s kill 等待重叠，不是完整取消／OS／文件删除的硬 deadline 承诺。Phase 1 结束时统一复核并重试每个登记 worker，动态 shard 不再吞掉持续清理失败并继续 Phase 2。临时配置改为明确所有权目录；失败 reaping 后 GC 不会擅自删除它。CLI 清理失败返回专用 code 3、不显示原始异常、不回退串行；后端即使收到取消也标记 failed，保存已接收的部分结果，并在此 session 拒绝新任务或根目录变更。不能据此称直接 CLI 已自动保存完整部分历史。
+
+- 失败先行证据：旧 TemporaryDirectory 在失败 reap 后 GC 真实删除配置（ResourceWarning／断言失败）；新显式目录通过保留断言。旧 CLI 未处理 cleanup error／后端误标 cancelled 由回归复现；修复后专用退出码、脱敏、partial/failed、后续请求 409 均通过。
+- 新增 9 项回归：16 个 worker 在任一等待完成前全部进入 stop；异常收集／重复登记／空组；GC 保留；真实两进程清理且另一 fixture 进程仍存活；动态清理失败不跑下载；CLI 不串行回退；取消时失败传播／部分结果与后续任务阻断；root 清理失败锁定。没有真实 Mihomo、网络或用户进程参与。
+- 最新三版 Windows 全量均 `781 tests, OK (skipped=7)`：Python 3.14.7 24.395s，3.9.25 24.321s，3.12 23.887s；并行执行，非性能对照证据。专项 114 tests 和后续 49 tests 通过；Rust 7 tests（2.18s）通过。
+- 冻结 1243345 再构建 70 项资源 Windows NSIS／ZIP，locked/offline、unsigned/source_dirty=false；解包原生完整性、内置 Python、Origin、起停、原 raw／设置静态哈希全部通过，SHA-256 独立核对如上。
+- 进一步在解压包的 CPython 3.14.8／app 模块中实际调用 stop_workers，两个登记的隔离 Python 子进程被 reaped，第三个未登记 fixture 进程仍活着；最终仅通过持有句柄回收测试进程。该独立脚本在冻结产物之后增强，不修改包内代码或校验和；不冒称真实原生窗口／Mihomo cancellation 验收。
+
+仍待全生命周期取消预算、直接 CLI 部分历史与所有权协调、真实同覆盖性能和其他平台原生验收。B4/B7、C/D 不能据此全部勾选。
 
 ## 仍未完成
 
