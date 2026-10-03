@@ -6,12 +6,14 @@
 
 ## A：来源与身份
 
-- [ ] A1：新增 tests/test_source_catalog.py、test_node_identity.py，覆盖空 provider、认证不同、改名、多来源、未知、非法路径/语法和密钥 canary。
-- [ ] A2：新增 speedbench_identity.py（私有种子/HMAC），speedbench_sources.py（有界解析/连接定义/目录与映射），不接触真实数据写入。
-- [ ] A3：接入 Result/result_to_dict、CLI 来源/ID 过滤、worker 元数据回填与串行结果；保持旧字段。
-- [ ] A4：speedbench_db 增量表/列、稳定 ID 趋势/订阅汇总、覆盖率；旧 runs.raw 不变。
-- [ ] A5：Web 目录接口/受限参数/ID 切换，更新打包白名单与 AST 检查，兼容旧 API。
-- [ ] A6：本机只读映射核对、Python 3.9/3.12 专项/全量测试、安全 fixture 与迁移验收，写阶段报告并提交。
+- [x] A1：新增 tests/test_source_catalog.py、test_node_identity.py，覆盖空 provider、认证不同、改名、多来源、未知、非法路径/语法和密钥 canary。
+- [x] A2：新增 speedbench_identity.py（私有种子/HMAC），speedbench_sources.py（有界解析/连接定义/目录与映射），不接触真实数据写入。
+- [x] A3：接入 Result/result_to_dict、CLI 来源/ID 过滤、worker 元数据回填与串行结果；保持旧字段。
+- [x] A4：speedbench_db 增量表/列、稳定 ID 趋势/订阅汇总、覆盖率；旧 runs.raw 不变。
+- [x] A5：Web 目录接口/受限参数/ID 切换，更新打包白名单与 AST 检查，兼容旧 API。
+- [x] A6：本机只读映射核对、Python 3.9/3.12 专项/全量测试、安全 fixture 与迁移验收，写阶段报告并提交。
+
+A 的上述核心链路已完成本机验收；不代表整份规格或四阶段全部完成。配置根目录 UI 选择、历史/收藏全量改用稳定 ID 留在 C；macOS/Linux 原生执行仍待 CI/对应环境。
 
 各子步骤先运行新失败测试，再实现；核心命令：`python -m unittest tests.test_source_catalog tests.test_node_identity -v`，随后 `python -m unittest discover -s tests -v`。数据库/API 部分另外添加 test_source_history、test_source_api。
 
@@ -55,3 +57,8 @@
 - 初始全量基线：Windows / Python 3.14.7，539 tests，OK (skipped=5)。不能据此称升级代码通过或其他平台已通过。
 - writing-plans/test-driven-development 技能当前未提供，采用本清单与 unittest 失败先行作为明确替代，不安装未知技能或依赖。
 - 真实用户历史与 Downloads 安装不作测试 fixture。实验仅使用 TemporaryDirectory/ignored dist 路径。
+- A 核心验收：见 ../reports/2026-10-03-origins-and-task-foundations.md。本机 40/40 运行节点来源 verified，worker 定义复核 40/40；A 完成时三种 Windows Python 全量 586 tests，OK (skipped=6)。
+- B1 已实现模式配置/候选纯函数、CLI/Web 共享限制，计时模块已通过 fixture 但尚未接生产计时。历史提示与完整目标排序尚未接入，故整项不勾选。
+- B2 已实现有界 JobStore、单一所有权、seq、snapshot/resync、终态与白名单；尚未接 subprocess、增量 HTTP/SSE 或前端，不勾选。
+- B3 已接新模式动态队列/限定 IP 范围/带宽串行；修复 --no-ip 混合成功遗漏、worker 启动失败丢失主探测数据。新模式全生命周期取消/部分结果保存尚待 B4/B5 验收，不勾选。
+- B4/B5/B6/B7、C/D 没有完成；没有真实耗时提速结论、桌面安装包或 macOS/Linux 成功结论。下一检查点为事件协议接入 runner/HTTP、取消所有权及计时/任务历史。
