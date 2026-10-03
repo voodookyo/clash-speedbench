@@ -217,6 +217,17 @@ class DnsAndReadinessCancellationTest(unittest.TestCase):
 
 
 class IntelligenceCancellationTest(unittest.TestCase):
+    def test_args_cancelled_during_normal_join_also_skips_remaining_provider(self):
+        with tempfile.TemporaryDirectory() as folder:
+            args=SimpleNamespace(history=str(Path(folder)/'h.jsonl'),intel_workers=2)
+            first=intel.IpqsProvider(key='fixture',transport=lambda *a,**k:setattr(args,'cancelled',True) or {'success':True,'fraud_score':4})
+            second=intel.IpInfoProvider(token='fixture',transport=mock.Mock())
+            with mock.patch.object(core,'make_default_providers',return_value=[first,second]):enricher=core._IntelEnrichment(args)
+            try:
+                enricher.submit_ip('192.0.2.1');enricher.finish()
+                second.transport.assert_not_called()
+                self.assertEqual(enricher.values['192.0.2.1'].provider_results['ipqs'].status,'ok')
+            finally:enricher.close()
     def test_query_many_precancelled_makes_no_provider_call_or_fake_result(self):
         with tempfile.TemporaryDirectory() as folder:
             cache=intel.IpIntelCache(Path(folder)/'h.db');provider=mock.Mock(name='provider');provider.name='ipqs'

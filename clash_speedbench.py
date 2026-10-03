@@ -1487,7 +1487,8 @@ class _IntelEnrichment:
     def _query_one(self, ip: str) -> IpIntelligence:
         self._observe('intel_cache',dict(counters={'unique_ips':1}))
         provider_results = self.cache.query_many(
-            ip, self.providers, max_workers=1,cancel=lambda:self._cancelled.is_set() or cancel_requested()
+            ip, self.providers, max_workers=1,cancel=lambda:self._cancelled.is_set() or
+                bool(getattr(self.args,'cancelled',False)) or cancel_requested()
         )
         return aggregate_ip_intelligence(ip, provider_results)
 
