@@ -42,8 +42,8 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 
 ## D：桌面及交付
 
-- [ ] D1：Tauri 外壳/权限/CSP、锁文件、共享静态资源与 Python 运行时打包清单。
-- [ ] D2：后端私有握手/版本身份/动态 loopback端口、数据目录级任务所有权。
+- [x] D1：Tauri 外壳/权限/CSP、锁文件、共享静态资源与 Python 运行时打包清单。
+- [x] D2：后端私有握手/版本身份/动态 loopback端口、数据目录级任务所有权。
 - [ ] D3：单实例/托盘/通知/关闭隐藏/退出取消/崩溃清理，限定自身进程树。
 - [ ] D4：Windows EXE/便携/安装包与 WebView2 策略、无系统 Python实际验证。
 - [ ] D5：macOS Intel/Apple Silicon与Linux打包/构建/运行证据，不以Windows结果代替。
@@ -61,4 +61,5 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 - B1 已实现模式配置/候选纯函数、CLI/Web 共享限制，计时模块已通过 fixture 但尚未接生产计时。历史提示与完整目标排序尚未接入，故整项不勾选。
 - B2 已接 subprocess/HTTP/SSE/前端续接，单一所有权、seq、snapshot/resync、终态与并发请求通过本机 fixture；勾选不代表六格 CI 已执行。
 - B3 已接新模式动态队列/限定 IP 范围/带宽串行；修复 --no-ip 混合成功遗漏、worker 启动失败丢失主探测数据。新模式全生命周期取消/部分结果保存尚待 B4/B5 验收，不勾选。
-- B4/B5 已接独立出口发布、任务历史与实际字节，仍需全部阶段清理与迁移验收；B6/B7、C/D 尚未完整完成。详见 ../reports/2026-10-03-jobs-and-shared-ui.md。没有真实耗时提速结论、桌面安装包或 macOS/Linux 成功结论。
+- B4/B5 已接独立出口发布、任务历史与实际字节，仍需全部阶段清理与迁移验收；B6/B7、C/D 尚未完整完成。此前检查点见 ../reports/2026-10-03-jobs-and-shared-ui.md；不构成真实耗时提速结论。
+- D1/D2 本机实现与独立 Windows 包验证通过，见 ../reports/2026-10-03-desktop-packaging-checkpoint.md。桌面 alpha 已有 unsigned Windows NSIS/便携包，不能称 GUI 生命周期或 macOS/Linux 已验收。桌面/独立 Web 同目录所有权已验证；直接 CLI 和不同目录的全局协调仍未完成。D3–D8 不勾选，待完整要求满足。
