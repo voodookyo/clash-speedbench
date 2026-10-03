@@ -40,6 +40,7 @@ import speedbench_leak  # noqa: E402
 import speedbench_tray  # noqa: E402
 import speedbench_controller  # noqa: E402
 import speedbench_sources  # noqa: E402
+import speedbench_tasks  # noqa: E402
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
@@ -345,23 +346,51 @@ def slim_history() -> list:
     return out
 
 
+def benchmark_command(params):
+    cmd = [sys.executable, '-u', str(SCRIPT), '--yes', '--history', str(HISTORY), '--non-interactive']
+    if params.get('mode') and params['mode'] != 'legacy':
+        cmd += ['--mode',params['mode']]
+    if params.get('target_profile'):
+        cmd += ['--target-profile',params['target_profile']]
+    if params.get('include'):
+        cmd += ['--include',params['include']]
+    for key in speedbench_tasks.LIMITS:
+        if params.get(key) is not None:
+            cmd += ['--'+key.replace('_','-'),str(params[key])]
+    for key in speedbench_tasks.BOOLEAN_OPTIONS + ('auto_switch',):
+        if params.get(key):
+            cmd += ['--'+key.replace('_','-')]
+    for source_id in params.get('subscription_ids',[]):
+        cmd += ['--subscription-id',source_id]
+    for node_id in params.get('node_ids',[]):
+        cmd += ['--node-id',node_id]
+    return cmd
+
+
+def validate_run_params(params):
+    if not isinstance(params,dict):
+        raise speedbench_tasks.TaskConfigError('请求必须是对象')
+    control = {'include','auto_switch','subscription_ids','node_ids'}
+    config = {k:v for k,v in params.items() if k not in control}
+    resolved = speedbench_tasks.resolve_config(config)
+    if resolved.mode != 'legacy' and resolved.workers <= 1:
+        raise speedbench_tasks.TaskConfigError('新模式需要隔离 worker')
+    if ('auto_switch' in params and not isinstance(params['auto_switch'],bool)):
+        raise speedbench_tasks.TaskConfigError('自动切换参数无效')
+    pattern = params.get('include','')
+    if not isinstance(pattern,str) or len(pattern)>1000:
+        raise speedbench_tasks.TaskConfigError('筛选表达式无效')
+    try:
+        re.compile(pattern)
+    except re.error:
+        raise speedbench_tasks.TaskConfigError('筛选表达式无效') from None
+    return params
+
+
 def run_benchmark(params: dict) -> None:
     # -u：子进程 stdout 走管道时默认块缓冲，进度行会堵在缓冲区里，
     # 面板看不到实时进度；无缓冲模式让每行立即到达。
-    cmd = [sys.executable, "-u", str(SCRIPT), "--yes", "--history", str(HISTORY)]
-    cmd += ["--non-interactive"]
-    if params.get("include"):
-        cmd += ["--include", str(params["include"])]
-    if params.get("mb"):
-        cmd += ["--mb", str(int(params["mb"]))]
-    if params.get("rounds"):
-        cmd += ["--rounds", str(int(params["rounds"]))]
-    if params.get("auto_switch"):
-        cmd += ["--auto-switch"]
-    for source_id in params.get('subscription_ids', []):
-        cmd += ['--subscription-id', source_id]
-    for node_id in params.get('node_ids', []):
-        cmd += ['--node-id', node_id]
+    cmd = benchmark_command(params)
 
     with STATE_LOCK:
         STATE["running"] = True
@@ -797,6 +826,10 @@ class Handler(BaseHTTPRequestHandler):
                     "lines": STATE["lines"][-60:],
                     "exit_code": STATE["exit_code"],
                 })
+        elif path == '/api/task-config':
+            self._json(dict(version=1, limits=speedbench_tasks.LIMITS,
+                            modes={m:speedbench_tasks.resolve_config({'mode':m}).public()
+                                   for m in speedbench_tasks.MODES}))
         else:
             self._json({"ok": False, "msg": "not found"}, 404)
 
@@ -828,10 +861,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._reject("已有测速任务进行中", 409)
                 return
             params = self._read_body()
+            try:
+                params = validate_run_params(params)
+            except speedbench_tasks.TaskConfigError as e:
+                self._json({'ok':False,'msg':str(e)},400)
+                return
             if not _check_source_selection(params):
                 self._json({'ok': False, 'msg': '来源/节点选择无效或未加载，请刷新目录'}, 400)
                 return
-            threading.Thread(target=run_benchmark, args=(params,), daemon=True).start()
+            # Reserve ownership before dispatch. Otherwise simultaneous POSTs
+            # can both observe idle before either benchmark thread starts.
+            with STATE_LOCK:
+                if STATE['running']:
+                    self._reject('已有测速任务进行中',409)
+                    return
+                STATE.update(running=True, started=time.time(), exit_code=None, proc=None, lines=[])
+            try:
+                threading.Thread(target=run_benchmark, args=(params,), daemon=True).start()
+            except Exception:
+                with STATE_LOCK:
+                    STATE.update(running=False,exit_code=-1)
+                self._json({'ok':False,'msg':'测速任务启动失败'},500)
+                return
             self._json({"ok": True})
         elif path == "/api/switch":
             body = self._read_body()

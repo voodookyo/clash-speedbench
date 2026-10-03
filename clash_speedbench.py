@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import speedbench_controller as controller_config
 import speedbench_sources as source_catalog
+import speedbench_tasks
 
 from speedbench_ip_intel import (
     IpIntelCache,
@@ -548,6 +549,7 @@ class Result:
     ip_grade: Optional[str] = None
     dual_stack_inconsistent: bool = False
     origin: Optional[dict] = None          # safe, versioned source/identity fields
+    measurement_scope: Optional[dict] = None
 
 
 def detect_controller(secret: str, explicit: Optional[str]) -> Tuple[str, bool]:
@@ -1535,9 +1537,14 @@ def clip_disp(s: str, width: int) -> str:
 
 
 def rank_results(results: List[Result]) -> List[Result]:
+    def coverage(r):
+        scope = r.measurement_scope or {}
+        if scope.get('mode') in ('quick','standard','deep'):
+            return {'completed':2,'failed':1}.get(scope.get('bandwidth'),0)
+        return 0
     return sorted(
         results,
-        key=lambda r: (-r.score, r.latency_ms if r.latency_ms is not None else 999999),
+        key=lambda r: (-coverage(r), -r.score, r.latency_ms if r.latency_ms is not None else 999999),
     )
 
 
@@ -1685,6 +1692,7 @@ def result_to_dict(r: Result) -> dict:
         "name": r.name,
         "provider": r.provider,
         **source_catalog.result_origin(r.origin),
+        **({"measurement_scope": r.measurement_scope} if r.measurement_scope else {}),
         "node_key": r.node_key,
         "proto": r.proto,
         "latency_ms": r.latency_ms,
@@ -1794,7 +1802,10 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
     )
     write_csv(results, out)
     print(f"\nCSV 已保存: {out.resolve()}")
-    print("排序规则：按 Overall（Network + 可用 IP Quality，未知 IP 不加分）从高到低。")
+    if getattr(args,'mode',None) in ('quick','standard','deep'):
+        print('排序规则：优先已完成带宽精测的覆盖范围，再按 Overall 排序；未知 IP 不加分。')
+    else:
+        print("排序规则：按 Overall（Network + 可用 IP Quality，未知 IP 不加分）从高到低。")
     if any("未精测" in (r.tags or "") for r in results):
         print("注：「未精测」节点仅完成 Phase 1 粗筛（延迟/连通性/IP 画像），未参与带宽精测。")
     if not args.no_history:
@@ -1841,11 +1852,17 @@ def main() -> int:
                         help="只测指定已验证订阅 ID，可重复指定；不切换/下载订阅")
     parser.add_argument("--node-id", action="append", default=[],
                         help="只测指定当前节点身份 ID，可重复指定")
+    parser.add_argument('--mode', choices=('quick','standard','deep','ip'), default=None,
+                        help='任务模式；不指定保持旧 Top 15 行为。新模式目前要求隔离 worker')
+    parser.add_argument('--target-profile', choices=speedbench_tasks.PROFILES, default='balanced',
+                        help='候选目标，原始测量值不变')
+    parser.add_argument('--all-ip', action='store_true',
+                        help='quick/standard 对全部候选取得出口而不只精测候选')
     parser.add_argument("--mb", type=int, default=None,
                         help="单轮请求数据量 MB（1~95）；不指定时先 ~1MB 预热估速，"
                              "再自适应 10/30/60/95MB（目标单样本 2-4 秒）")
-    parser.add_argument("--rounds", type=int, default=1, help="每节点测速轮数，默认 1")
-    parser.add_argument("--max-time", type=float, default=4.0,
+    parser.add_argument("--rounds", type=int, default=None, help="每节点测速轮数，默认 1")
+    parser.add_argument("--max-time", type=float, default=None,
                         help="每轮下载最长秒数，默认 4（自适应模式下最多放宽到 6s）")
     parser.add_argument("--settle", type=float, default=0.35,
                         help="切换节点后等待秒数，默认 0.35")
@@ -1880,7 +1897,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=6,
                         help="并发 worker 数（起多个临时 mihomo 实例并行做出口 IP 画像，不影响运行中的 Clash）；"
                              "1=关闭并发，回退到串行 GLOBAL 切换模式。默认 6")
-    parser.add_argument("--top-n", type=int, default=15,
+    parser.add_argument("--top-n", type=int, default=None,
                         help="两阶段模式：Phase 2 只对延迟最优的前 N 个连通节点串行精测带宽，默认 15")
     parser.add_argument("--all", action="store_true",
                         help="两阶段模式：跳过 Top-N 筛选，Phase 2 对所有连通节点串行精测")
@@ -1891,6 +1908,21 @@ def main() -> int:
     parser.add_argument("--yes", action="store_true",
                         help="不询问确认直接开始")
     args = parser.parse_args()
+    config_params = {key:value for key,value in vars(args).items()
+                     if key in set(speedbench_tasks.LIMITS) | set(speedbench_tasks.BOOLEAN_OPTIONS)
+                     | {'mode','target_profile'} and value is not None}
+    try:
+        task_config = speedbench_tasks.resolve_config(config_params)
+    except speedbench_tasks.TaskConfigError as e:
+        print(f'错误：{e}',file=sys.stderr)
+        return 2
+    for key in speedbench_tasks.LIMITS:
+        setattr(args,key,getattr(task_config,key))
+    args.all = task_config.measure_all
+    args.task_config = task_config if args.mode else None
+    if args.mode and args.workers <= 1:
+        print('新模式需要隔离 worker；串行模式请暂时不指定 --mode。',file=sys.stderr)
+        return 2
 
     if args.mb is not None and (args.mb < 1 or args.mb > 95):
         print("错误：--mb 建议范围 1~95。", file=sys.stderr)
@@ -1989,8 +2021,8 @@ def main() -> int:
         else:
             sample_desc = "自适应 10~95 MB（~1MB 预热估速）"
             max_mb = 95
-        n_phase2 = len(candidates) if args.all else min(args.top_n, len(candidates))
-        est_mb = max_mb * args.rounds * n_phase2 * (5 if args.multi else 1)
+        n_phase2 = (len(candidates) if args.all else min(args.top_n, len(candidates))) if task_config.bandwidth else 0
+        est_mb = task_config.download_budget_mb(len(candidates))
         print("Clash SpeedBench（两阶段并发模式，不影响正在运行的 Clash）")
         print(f"候选节点: {len(candidates)}")
         print(f"流程: Phase 1 粗筛（延迟经主实例 /delay 并发探测 + worker 出口 IP 画像，不跑带宽） → "
@@ -1999,6 +2031,9 @@ def main() -> int:
               + ("，追加 4 路并发峰值" if args.multi else "")
               + ("，含出口 IP 画像" if not args.no_ip else "，已跳过 IP 画像"))
         print(f"理论最大流量消耗约: {est_mb / 1024:.2f} GiB（仅 Phase 2 精测节点消耗带宽）")
+        if args.mode:
+            print(f'模式: {args.mode}；probe {args.probe_count} 次；IP 范围 {task_config.ip_scope}。'
+                  '快速/标准模式只保证已测范围内推荐，预算不等于实际下载字节。')
         if not args.yes:
             ans = input("\n开始测速？[Y/n] ").strip().lower()
             if ans not in ("", "y", "yes"):
@@ -2011,6 +2046,9 @@ def main() -> int:
             print(str(e), file=sys.stderr)
             return 1
         except WorkerUnavailable as e:
+            if args.mode:
+                print(f'隔离 worker 不可用：{e}。新模式不会静默改用全量串行测试。',file=sys.stderr)
+                return 1
             print(f"并发模式不可用：{e}\n回退到串行模式。", file=sys.stderr)
         else:
             return report(results, args, api, proxies)

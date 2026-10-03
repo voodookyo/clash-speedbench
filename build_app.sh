@@ -14,6 +14,8 @@ cp "$ROOT/clash_speedbench.py" \
    "$ROOT/speedbench_controller.py" \
    "$ROOT/speedbench_identity.py" \
    "$ROOT/speedbench_sources.py" \
+   "$ROOT/speedbench_tasks.py" \
+   "$ROOT/speedbench_jobs.py" \
    "$ROOT/speedbench_db.py" \
    "$ROOT/speedbench_ip_intel.py" \
    "$ROOT/speedbench_leak.py" \
@@ -24,7 +26,7 @@ cp "$ROOT/clash_speedbench.py" \
    "$APP/Contents/Resources/app/"
 
 echo "→ 校验程序文件完整性（防止漏拷打出残包）"
-for f in clash_speedbench.py speedbench_controller.py speedbench_identity.py speedbench_sources.py speedbench_db.py speedbench_ip_intel.py \
+for f in clash_speedbench.py speedbench_controller.py speedbench_identity.py speedbench_sources.py speedbench_tasks.py speedbench_jobs.py speedbench_db.py speedbench_ip_intel.py \
          speedbench_leak.py speedbench_web.py \
          speedbench_switch.py speedbench_workers.py speedbench_tray.py; do
   if [ ! -f "$APP/Contents/Resources/app/$f" ]; then
