@@ -19,14 +19,15 @@
 - 52092d0：串行阶段计时与所有已报告下载样本计数、取消尝试计数、主实例已完成探测计数留存。
 - a416425：逐次 probe 留存、独立 main／worker／serial 元数据、取消停止未开始的队列、共享详情说明和包内取消任务验收。
 - 3bfead6：provider/cache 实际调用计数、独立最终等待时间、worker 就绪启动数、任务接受时钟的五个首次里程碑与历史持久化。
-- 最新产物固定源码：`3bfead6d0daf49924535548b69ef96157be273e3`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345、8548d62、8755c87、52092d0、a416425 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
+- 1dee46f／39f8b44：取消作用域、DNS 队列／owned curl、非阻塞 controller socket 读写、worker 就绪和后续 provider 请求停止；不阻断恢复写操作。
+- 最新产物固定源码：`39f8b4458b0fde3e64a4bc59592f17d67899e605`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345、8548d62、8755c87、52092d0、a416425、3bfead6 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
 - 桌面版本 `1.1.0-alpha.1`，运行时 CPython `3.14.8`，平台 `windows-x86_64`。核心稳定版入口与 legacy 测速默认未改为桌面 alpha。
-- 当前包目录 `dist/desktop-artifacts/3bfead6d0daf/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续验收夹具修正／报告提交不改变此包的冻结源码。
+- 当前包目录 `dist/desktop-artifacts/39f8b4458b0f/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告提交不改变此包的冻结源码。
 
 | 文件 | 字节 | SHA-256 |
 |---|---:|---|
-| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12769997 | e6babb37620a570cf7c2ba568c11a5eedae180f8f25010dfde4338a16104c507 |
-| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15750950 | 91dfc263828c6cdd6d89e0c4e5557f8dfc1082924a65973366af8c30e0b546e5 |
+| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12775575 | f38e1bea79ae66a4b90138e7c6d40748488fbdfe36130e20d8194b204c6d6edc |
+| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15753745 | 5b4a0ee4dfd31ce01fb080e1a3295233a4cc303c5cef837d2a8e90b6ecc2426e |
 
 SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核对。包 **unsigned**，自动更新禁用；WebView2 是系统组件，不是单文件免运行时承诺。
 
@@ -160,6 +161,18 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 - 新夹具初验失败：synthetic execute 漏发 probing/enriching 导致 finalizing 被合法拒绝；模拟 Key 嵌入 python -c 文本被命令日志捕获。夹具改为完整阶段协议及仅环境变量传递 Key 后独立包验收通过；provider 构造仍显式读取该环境 Key。修正仅为仓库验收脚本（不在 70 项运行资源中），生产资产未改，无需改变冻结版本或重建。未输出真实凭据／未请求真实 controller／provider，没有 push/tag/Release／安装覆盖。
 
 本批完成可观察性子功能，不等于 B/C/D 完成或相同覆盖实测提速。剩余目标策略、所有传输取消／资源预算、30/100/300 fixture 与真实同覆盖对比、C 全页面／错误／可访问性矩阵、D 历史导入／原生多平台生命周期仍待完成，整体目标 active。
+
+### 取消 DNS／controller socket 请求与情报后续查询
+
+- 1dee46f：线程局部、可嵌套的取消作用域只捕获本请求／池的停止信号，不是全局任务开关；run_external 合并原 private-parent／cancel-file 通道，未入作用域的老契约不改。DNS 队列中断后置本池停止标志、取消未开始 futures、让已启动 curl 主动取消并收回自有句柄，等待所有线程；不用进程名杀外部服务。竞争的普通 resolver 失败保留第一个原始异常，不让同池的 KeyboardInterrupt 把失败误标成用户取消。成功域名集合、DoH 服务器／IPv4／IPv6／fake-IP 绕过规则不改。
+- TCP／Unix controller 探测和 worker 就绪的 HTTP I/O 使用本请求的非阻塞 socket＋50ms select 检查取消，缓冲在原 BufferedReader 内保留，不重发 HTTP、未返回探测不计失败。捕获移交给 response.makefile 的所有权，Connection: close 响应体取消也能回收，resp.close／conn.close finally 执行；没有 detached I/O／watcher 线程。仅包裹 probe／readiness read，取消后 restoration PUT/PATCH 保持原非取消契约。普通无取消读取仍保持原 socket timeout／API 降级语义。
+- 失败先行和根因：实际 Windows TCP stalled-header／stalled-body 夹具证明另线程 shutdown 没有及时唤醒 Python timeout/select 读；未把 shutdown 成功当成完成验收。改为 nonblocking raw recv/send 的 select polling 后实际取消通过。TLS WantRead／WantWrite 按原操作重试并保持缓冲，WantWrite 专项验证 polling 方向；连接建立／TLS 握手仍原 timeout，未声称真实 TLS 全生命周期已验收。实现参考 Python 官方 socket、concurrent.futures 文档：https://docs.python.org/3/library/socket.html ，https://docs.python.org/3/library/concurrent.futures.html 。Windows pipe 当前不包装非 socket 句柄，仍需专门取消机制和原生验证。
+- worker 启动前和就绪后取消不能生成新资源／误报 ready；就绪 GET 的 TCP read 可主动停止，start 的既有 owned cleanup 仍执行。Intelligence.close 置本池停止标志，结束当前 provider 的缓存写入后不再查询同出口下一 provider；现有 outer 队列仍取消／join。39f8b44 另修复 worker 捕获 Ctrl+C 后带 args.cancelled 正常进入 enrichment finish 的路径，不依赖 cancel-file 才停止后续请求。正在执行的 urllib provider 保留原超时，本批不主动 abort 它或伪造 cancelled=timeout 状态。
+- 新增 test_transport_cancel 20 回归，最终专项20／0.535s通过；首轮与 Windows／进程／情报／partial probe 合计103专项通过。最终全量 `python -m unittest discover -s tests -v`：Windows Python3.14.7 **890／39.343s**、3.9.25 **890／41.660s**、3.12.10 **890／41.350s**，均 OK (skipped=7)。日志 ignored dist/transport-cancel-python*-tests.log，skip 仍为 POSIX 权限与可选 PyYAML对照；没有外部 DNS／controller／provider。Rust locked/offline 7／2.61s；py_compile／git diff --check 通过。本批无前端可视更改，不复用旧截图冒充新 UI 验收。
+- 冻结 clean 39f8b44，70 项资源／包内 CPython3.14.8，locked/offline unsigned NSIS／ZIP 构建、解压独立验证通过。新增包内真实后端→CLI 的 sentinel/controller-socket fixture：临时 loopback server 故意停在 Connection: close body，实际取消文件中止读操作，取消之后 restoration PUT 仍成功；退出130、partial 1行、started1／completed0／failure rate=N/A、delay attempts1／success0，只有父确认 cleanup milestone，不伪造 first_result／network／intel complete。原 JSONL raw 不改、SQLite 精确导入、run 关联／lease 可重新取得，server／threads 全部 join。原 checksum/native integrity/tamper、private bootstrap、Origin、restart/preferences、CLI ownership、worker 隔离、cold/hot cache、五里程碑及既有 partial fixture 全部通过。两个 Get-FileHash 与 provenance 的 bytes／SHA-256 独立一致。
+- 文件：speedbench_process.py、clash_speedbench.py、speedbench_workers.py、speedbench_ip_intel.py、test_transport_cancel.py、desktop/verify_windows_package.py、README／desktop README 与报告／实施清单。无 schema／评分／采样／节点带宽并发／第三方 Python依赖新增；真实用户数据与安装不改，未 push／tag／Release。旧冻结 3bfead6 保留，不覆盖；1dee46f 仅中间源码未交付包，不混用最新 artifact 证据。
+
+这批完成可安全停止的 DNS／socket／后续查询，不是完整硬取消预算或网络测速提速结论。原生 Windows pipe、provider 在途 urllib、连接／TLS、OS／磁盘与汇总写入仍待预算及取消验证；同覆盖性能、完整目标策略、C/D迁移与原生矩阵继续未完成，目标 active。
 
 ## 仍未完成
 
