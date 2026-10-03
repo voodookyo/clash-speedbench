@@ -26,7 +26,7 @@ function esc(s){ return (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','
 
 // localStorage 在某些隐私模式下会抛异常，包一层静默降级
 const SB_DESKTOP = window.SPEEDBENCH_ENV?.client==='webview';
-let desktopPreferences={},preferenceWrites=Promise.resolve();
+let desktopPreferences={},preferenceWrites=Promise.resolve(),desktopPreferencesReady=!SB_DESKTOP;
 function lsGet(k){ if(SB_DESKTOP) return desktopPreferences[k]??null;try{ return localStorage.getItem(k); }catch(e){ return null; } }
 function lsSet(k,v){
   if(SB_DESKTOP){
@@ -535,8 +535,7 @@ async function loadSourceCatalog(){
       const migrated=SBTasks.migrateFavorites([...favs],catalog.nodes||[],[...favIds]);
       favIds=new Set(migrated.ids); favs=new Set(migrated.pending);
       lsSet('sb_favs_v2',JSON.stringify([...favIds])); lsSet('sb_favs',JSON.stringify([...favs]));
-      const pending=document.getElementById('pending-favorites');
-      if(pending) pending.textContent=favs.size?`待确认旧收藏：${[...favs].join('、')}。不会按名称合并到其他节点。`:'旧收藏迁移完成；新收藏按稳定节点身份保存。';
+      updatePendingFavorites();
     }
     select.innerHTML = '<option value="">全部已加载节点</option>' + (catalog.sources||[]).map(s=>
       `<option value="${esc(s.subscription_id)}"${s.loaded?'':' disabled'}>${esc(s.name)}${s.loaded?'':' · 未加载/不可用'}</option>`).join('');
@@ -1744,6 +1743,85 @@ function applyTheme(){
   if(document.documentElement) document.documentElement.dataset.theme=dark?'dark':'light';
   const input=document.getElementById('f-theme');if(input) input.value=theme;
 }
+function updatePendingFavorites(){
+  const pending=document.getElementById('pending-favorites');if(!pending) return;
+  const known=new Set((sourceCatalog.nodes||[]).filter(n=>n.identity_strength==='strong').map(n=>n.node_id));
+  const unresolved=[...favIds].filter(id=>!known.has(id)).length;
+  pending.textContent=(favs.size?`待确认旧收藏：${[...favs].join('、')}。不会按名称合并到其他节点。 `:'')+
+    (unresolved?`${unresolved} 个稳定 ID 收藏尚未匹配当前目录；不会自动改绑。`:
+      '新收藏按稳定节点身份保存；未确认项不会用于自动扩大测速范围。');
+}
+async function loadDataGuide(){
+  const status=document.getElementById('data-status');if(!status) return;
+  try{
+    const response=await fetch('/api/data-status',{headers:{'X-SpeedBench-Token':SB_TOKEN}});
+    const info=await response.json();if(!info.ok) throw new Error('Data status unavailable');
+    status.textContent=`本实例数据目录：${info.data_home}\nJSONL：${info.history.jsonl_path}（${info.history.jsonl_exists?'已有文件，沿用该位置':'尚无文件'}）\nSQLite：${info.history.database_path}（${info.history.database_exists?'已有文件':'尚无文件'}）`+
+      (info.alternate?.jsonl_exists?`\n另发现源码目录同名 JSONL 文件：${info.alternate.path}；未核验内容，没有自动导入。`:'');
+  }catch(e){status.textContent='无法读取数据位置；没有重置或迁移文件。请检查本实例连接。';}
+}
+let pendingPreferenceImport=null;
+function transferPreferenceRead(key){
+  if(SB_DESKTOP){if(!desktopPreferencesReady) throw new Error('Desktop preferences unavailable');return lsGet(key);}
+  return localStorage.getItem(key); // Do not pretend an inaccessible store is an empty export.
+}
+function refreshPreferenceUI(){
+  currentProfile=PROFILES.includes(lsGet('sb_profile'))?lsGet('sb_profile'):'all';
+  favs=new Set(JSON.parse(lsGet('sb_favs')||'[]'));favIds=new Set(JSON.parse(lsGet('sb_favs_v2')||'[]'));
+  subsDays=+(lsGet('sb_subs_days')||30)||30;
+  for(const button of document.querySelectorAll('#profile-bar .pf')) button.classList.toggle('on',button.dataset.p===currentProfile);
+  for(const [id,key] of [['f-mode','sb_mode'],['f-target','sb_target'],['subs-days','sb_subs_days']]){
+    const input=document.getElementById(id);if(input && lsGet(key)!==null) input.value=lsGet(key);
+  }
+  const notifications=document.getElementById('f-notifications');if(notifications) notifications.checked=lsGet('sb_notifications')==='on';
+  applyTheme();updatePendingFavorites();renderTable();renderBoard();renderNodePicker();updateTaskBudget();
+}
+async function applyPreferenceImport(){
+  const text=document.getElementById('preference-json').value;
+  const status=document.getElementById('preference-transfer-status');
+  if(!pendingPreferenceImport || text!==pendingPreferenceImport.text) return;
+  const incoming=pendingPreferenceImport.values;
+  document.getElementById('btn-preferences-import').disabled=true;
+  try{
+    await preferenceWrites;
+    const merged=SBPreferences.merge(SBPreferences.readValues(transferPreferenceRead),incoming);
+    if(typeof SBTasks!=='undefined' && sourceCatalog.status==='ok'){
+      const favorites=SBTasks.migrateFavorites(JSON.parse(merged.sb_favs||'[]'),sourceCatalog.nodes||[],JSON.parse(merged.sb_favs_v2||'[]'));
+      merged.sb_favs=JSON.stringify(favorites.pending);merged.sb_favs_v2=JSON.stringify(favorites.ids);
+    }
+    if(SB_DESKTOP){
+      const result=await post('/api/preferences',merged);
+      if(!result.ok) throw new Error('桌面偏好无法安全保存；原文件未被重置');
+      desktopPreferences=merged;
+    }else SBPreferences.saveBrowser(merged,k=>localStorage.getItem(k),(k,v)=>localStorage.setItem(k,v),k=>localStorage.removeItem(k));
+    pendingPreferenceImport=null;refreshPreferenceUI();
+    status.textContent='界面偏好已导入，收藏已合并；历史、身份种子和当前测速未改变。未匹配收藏需核验。';
+    toast('界面偏好已导入');
+  }catch(e){status.textContent='偏好未能完整保存；未报告导入成功。请检查现有偏好，原历史未改变。';toast('偏好导入失败',false);}
+}
+function initPreferenceTransfer(){
+  if(typeof SBPreferences==='undefined') return;
+  const textarea=document.getElementById('preference-json'), status=document.getElementById('preference-transfer-status');
+  const apply=document.getElementById('btn-preferences-import');
+  if(!textarea || !status || !apply) return;
+  const reset=()=>{pendingPreferenceImport=null;apply.disabled=true;};
+  textarea.addEventListener('input',()=>{reset();status.textContent='内容已改变；请重新预览。不要粘贴敏感配置。';});
+  document.getElementById('btn-preferences-export').addEventListener('click',()=>{
+    reset();try{textarea.value=SBPreferences.exportText(transferPreferenceRead);textarea.focus?.();textarea.select?.();status.textContent='已导出白名单偏好，选中后可复制。未读取密钥、历史或身份种子。';}
+    catch(e){status.textContent='现有偏好无效或过大；没有导出，请保留原值后核对。';}
+  });
+  document.getElementById('btn-preferences-preview').addEventListener('click',()=>{
+    reset();try{
+      const values=SBPreferences.parseImport(textarea.value);
+      const names=JSON.parse(values.sb_favs||'[]').length,ids=JSON.parse(values.sb_favs_v2||'[]').length;
+      status.textContent=`有效偏好：${Object.keys(values).length} 项；旧名称收藏 ${names}，稳定 ID 收藏 ${ids}。界面选项按导入内容更新，收藏合并；尚未保存。`;
+      pendingPreferenceImport={text:textarea.value,values};apply.disabled=false;
+    }catch(e){status.textContent='导入格式无效、含非白名单字段或超过限制；没有应用任何内容。';}
+  });
+  apply.addEventListener('click',()=>confirmModal('确认导入白名单界面选项并合并收藏？不会导入历史、密钥或身份种子，也不会修改当前测速。',applyPreferenceImport));
+  document.getElementById('btn-data-refresh').addEventListener('click',loadDataGuide);
+  loadDataGuide();
+}
 function initTaskControls(){
   if(typeof SBTasks==='undefined') return;
   applyTheme();
@@ -1799,6 +1877,7 @@ async function boot(){
       const data=await response.json();
       if(!data.ok) throw new Error('Preferences unavailable');
       desktopPreferences=data.values||{};
+      desktopPreferencesReady=true;
       currentProfile=PROFILES.includes(lsGet('sb_profile'))?lsGet('sb_profile'):'all';
       favs=new Set(JSON.parse(lsGet('sb_favs')||'[]'));
       favIds=new Set(JSON.parse(lsGet('sb_favs_v2')||'[]'));
@@ -1808,6 +1887,7 @@ async function boot(){
   const environment=document.getElementById('leak-environment');
   if(environment && window.SPEEDBENCH_ENV?.client==='webview') environment.textContent='执行环境：系统 WebView；本次 WebRTC 结果不代表 Chrome、Edge 或 Firefox。WebView 不支持采集时只能显示无法确认。';
   init();
+  initPreferenceTransfer();
   route();
   renderTable();      // latestData=null → 骨架屏，loadLatest 完成后替换
   updateSortArrows('th.sort', sortKey, sortAsc);

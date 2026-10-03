@@ -43,7 +43,9 @@ def validate(values):
                 raise PreferenceError('Invalid stable favorite identity')
             value=json.dumps(list(dict.fromkeys(names)),ensure_ascii=False)
         result[key]=value
-    if len(json.dumps(result,ensure_ascii=False).encode('utf-8'))>MAX_BYTES:
+    try:size=len(json.dumps(result,ensure_ascii=False).encode('utf-8'))
+    except UnicodeError:raise PreferenceError('Invalid preference encoding') from None
+    if size>MAX_BYTES:
         raise PreferenceError('Preferences exceed limit')
     return result
 

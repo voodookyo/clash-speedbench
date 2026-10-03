@@ -221,6 +221,18 @@
     <section id="view-settings" style="display:none">
       <div class="card"><h2>界面与连接</h2><label for="f-theme">主题</label><select id="f-theme"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><p class="muted">基础测速自动连接本机 Clash Verge，不需要第三方 IP 风控 API Key。下方可选 Key 只用于扩展画像。</p><div id="pending-favorites" class="muted"></div></div>
       <div id="desktop-settings" class="card" hidden><h2>桌面客户端</h2><label class="chk"><input type="checkbox" id="f-notifications"> 任务完成通知（默认关闭；仅发送模式、状态和节点数量）</label><p class="muted">通知是否显示还取决于系统设置。窗口关闭后任务继续，可从托盘重新打开；退出会先取消并清理任务。</p><button class="mini" id="btn-official-releases">官方版本与手动升级</button></div>
+      <div class="card" id="data-guide"><h2>数据位置与迁移指引</h2>
+        <p id="data-status" class="muted" role="status">正在读取本实例数据位置…</p>
+        <p class="muted">程序不会自动搬动或覆盖其他目录。升级／回退前先退出测速及旧程序，再备份 JSONL、SQLite、ui-preferences.json 和 identity-seed；种子属于私有备份，不能上传或放入下方偏好 JSON。其他数据目录的迁移仍需按 README 操作，不会读取浏览器 profile。</p>
+        <button class="mini" id="btn-data-refresh">刷新数据位置</button>
+      </div>
+      <div class="card" id="preference-transfer"><h2>显式迁移界面偏好</h2>
+        <p class="muted">在旧浏览器中导出，复制到桌面后预览并确认导入。仅含主题、目标／模式和收藏；不含 API Key、写 token、控制器信息、路径、历史或身份种子。收藏合并，无法匹配的收藏保留待确认；不同数据目录的稳定 ID 未必匹配。</p>
+        <label for="preference-json">偏好 JSON（导出后可选中复制，或粘贴待导入内容）</label>
+        <textarea id="preference-json" rows="7" spellcheck="false" autocomplete="off" placeholder="请勿粘贴密钥、订阅配置或历史文件"></textarea>
+        <div class="leak-actions"><button class="mini" id="btn-preferences-export">导出非敏感偏好</button><button class="mini" id="btn-preferences-preview">预览导入</button><button id="btn-preferences-import" disabled>确认应用导入</button></div>
+        <p id="preference-transfer-status" class="muted" role="status" aria-live="polite">尚未导入；真实历史不受影响。</p>
+      </div>
       <div class="card settings-card">
         <div class="card-title">IP Intelligence 设置</div>
         <p class="card-sub">Key 只提交给本机 SpeedBench 后端，默认仅驻留内存；不会写入 localStorage、Cookie、JSONL、SQLite、日志或命令行。清空输入可移除本次面板配置。</p>
@@ -286,6 +298,7 @@
 </div>
 
 <script src="/static/tasks.js"></script>
+<script src="/static/preferences.js"></script>
 <script src="/static/view.js"></script>
 <script src="/static/app.js"></script>
 </body>

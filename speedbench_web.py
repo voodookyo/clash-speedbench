@@ -56,9 +56,10 @@ HISTORY = DATA_HOME / "speedbench-history.jsonl"
 CANCEL_FILE = DATA_HOME / "cancel-request"
 
 # 前端静态文件目录与分发白名单：URL 路径 → (磁盘文件名, MIME)。
-# 只认这三个文件、不做任何路径拼接，天然免疫 ".." 穿越；其余一律 404。
+# 只认列出的静态文件、不做任何路径拼接，其余一律 404。
 WEB_DIR = HERE / "web"
 STATIC_FILES = {
+    '/static/preferences.js': ('preferences.js','application/javascript; charset=utf-8'),
     '/static/view.js': ('view.js','application/javascript; charset=utf-8'),
     '/static/tasks.js': ('tasks.js','application/javascript; charset=utf-8'),
     "/static/app.js": ("app.js", "application/javascript; charset=utf-8"),
@@ -818,21 +819,22 @@ class Handler(BaseHTTPRequestHandler):
         except JobError as e:
             self._json({'ok':False,'msg':str(e)},404 if 'unavailable' in str(e) else 400)
 
-    def _read_body(self) -> dict:
+    def _read_body(self, *, strict=False):
+        invalid=None if strict else {}
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
-            return {}
+            return invalid
         # Avoid allowing a malformed client to make the handler read an
         # unbounded body.  The endpoint payloads are all tiny JSON objects.
         if length < 0 or length > 1024 * 1024:
-            return {}
+            return invalid
         if not length:
-            return {}
+            return invalid
         try:
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}
+            return invalid
 
     def _drain_body(self) -> None:
         """丢弃尚未读取的请求体（上限与 _read_body 一致）。
@@ -912,6 +914,23 @@ class Handler(BaseHTTPRequestHandler):
             if not self._check_post():return
             try:self._json({'ok':True,'version':1,'values':Preferences(DATA_HOME).read()})
             except PreferenceError:self._json({'ok':False,'msg':'无法读取偏好，请保留文件并恢复私有备份'},503)
+        elif path == '/api/data-status':
+            if not self._check_post():return
+            try:
+                # Existence only: never open raw history, migrate a database,
+                # copy an identity seed or enumerate an arbitrary directory.
+                home=DATA_HOME.resolve();history=HISTORY.resolve()
+                database=HISTORY.with_suffix('.db').resolve()
+                source_history=HERE/'speedbench-history.jsonl'
+                alternate=(dict(path=str(source_history.parent.resolve()),
+                                jsonl_exists=source_history.is_file())
+                           if source_history.parent.resolve()!=home else None)
+                self._json(dict(ok=True,data_home=str(home),automatic_import=False,
+                    history=dict(jsonl_path=str(history),jsonl_exists=history.is_file(),
+                                 database_path=str(database),database_exists=database.is_file()),
+                    alternate=alternate,
+                    backup_names=['speedbench-history.jsonl','speedbench-history.db','ui-preferences.json','identity-seed']))
+            except (OSError,RuntimeError,ValueError):self._json({'ok':False,'msg':'数据目录状态暂不可用；未修改任何文件'},503)
         elif path == '/api/desktop/state':
             if not self._check_post():return
             if DESKTOP_ACTIONS is None:self._reject('not a desktop backend',404);return
@@ -1141,7 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
             result["persistence"] = saved
             self._json(result)
         elif path == '/api/preferences':
-            body=self._read_body()
+            body=self._read_body(strict=True)
             try:
                 values=Preferences(DATA_HOME).patch(body)
                 if DESKTOP_ACTIONS:DESKTOP_ACTIONS.notifications=values.get('sb_notifications')=='on'

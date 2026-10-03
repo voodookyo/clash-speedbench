@@ -267,6 +267,8 @@ button.fav.on { color:var(--accent); }
 .hist-item.on { background:var(--selected); }
 canvas,.about code { background:var(--input); }
 :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+#preference-json { display:block; box-sizing:border-box; width:100%; margin:12px 0; resize:vertical; min-height:140px; padding:12px; background:var(--input); color:var(--fg); border:1px solid var(--border); border-radius:6px; font:12px/1.6 monospace; }
+#data-status,#preference-transfer-status { white-space:pre-line; overflow-wrap:anywhere; line-height:1.7; }
 @media (max-width:860px) {
   #nav { flex-wrap:wrap; width:100%; }
   .nav-item { padding:8px 10px; }

@@ -112,7 +112,27 @@ SQLite backup including in-flight WAL), `identity-seed` and `ui-preferences.json
 Do not upload the seed or credentials as diagnostics. New tables/columns are
 additive; old raw JSONL/`runs.raw` are not rewritten. Stable IDs need the same
 private seed. Old-name-only rows stay legacy/unknown, not guessed subscription
-history. User-controlled import/export/first-run directory guidance are still
+history. Settings now expose the current data directory and the existence of
+JSONL/SQLite, without opening raw history or automatically importing other
+directories. A detected source-directory history is a hint, not permission to
+copy it. This guidance is not yet an in-app history directory picker/importer.
+
+For UI preferences, open Settings in the original browser at its original
+SpeedBench address, choose **Export non-secret preferences**, copy the JSON,
+then paste it into desktop Settings, preview and explicitly confirm import.
+Only theme/profile/mode/target, subscription time range, notification choice
+and favorites are accepted. Favorites merge rather than replace; unknown
+names/IDs stay pending. Source directory identities depend on the private
+seed: exporting favorites does not copy that seed or prove an ID in a different
+data directory. API keys/tokens, paths, controller/subscription configuration,
+raw history and identity seeds cannot be transferred with this JSON.
+
+Older versions without an export button must first be backed up, then load the
+new shared Web UI in the same browser/host/port to expose the existing local
+preferences. Do not inspect or copy arbitrary browser profile files. Desktop
+imports use an authenticated, atomic backend patch; browser storage failures
+attempt to restore the old whitelist values and never report partial success.
+History directory import and full first-run migration acceptance are still
 pending; do not copy whole browser profiles or imply automatic migration.
 
 Use tray Exit and wait for cleanup **before** reinstalling. NSIS replaces its

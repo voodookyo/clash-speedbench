@@ -64,3 +64,4 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 - B4/B5 已接独立出口发布、任务历史与实际字节，仍需全部阶段清理与迁移验收；B6/B7、C/D 尚未完整完成。此前检查点见 ../reports/2026-10-03-jobs-and-shared-ui.md；不构成真实耗时提速结论。
 - D1/D2 本机实现与独立 Windows 包验证通过，见 ../reports/2026-10-03-desktop-packaging-checkpoint.md。桌面 alpha 已有 unsigned Windows NSIS/便携包，不能称 GUI 生命周期或 macOS/Linux 已验收。桌面/独立 Web 同目录所有权已验证；直接 CLI 和不同目录的全局协调仍未完成。D3–D8 不勾选，待完整要求满足。
 - 最新冻结源码 5c1f796：三版 Windows Python 全量各 725 tests，OK (skipped=7)，Rust 7 tests；Windows NSIS/便携包重新构建并解压验收，包含下载目标历史提示与 worker 清理重试。最新包及 SHA-256 见桌面报告；未 push 或替换用户安装。
+- C/D 迁移体验继续推进：显式白名单偏好导出/预览/确认导入、收藏合并和未匹配 ID 提示、认证的数据路径/文件存在性指引；不自动导入 raw 或复制 seed。三版 Windows Python 全量各 737 tests，OK (skipped=7)。浏览器及模拟桌面偏好路径的实际交互通过，原生 GUI 与历史目录导入仍未验收，C4/D6 暂不整体勾选。

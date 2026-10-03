@@ -23,7 +23,7 @@ MODULES=('clash_speedbench','speedbench_controller','speedbench_identity','speed
          'speedbench_tasks','speedbench_jobs','speedbench_process','speedbench_progress',
          'speedbench_owner','speedbench_desktop','speedbench_preferences','speedbench_db','speedbench_ip_intel',
          'speedbench_leak','speedbench_web','speedbench_switch','speedbench_workers','speedbench_tray')
-WEB=('index.html','app.js','tasks.js','view.js','style.css')
+WEB=('index.html','app.js','tasks.js','view.js','preferences.js','style.css')
 
 
 def digest(path):

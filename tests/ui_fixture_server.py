@@ -16,6 +16,8 @@ from speedbench_tasks import resolve_config
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--port',type=int,default=8964)
+    parser.add_argument('--desktop-preferences',action='store_true',
+                        help='Simulate the WebView preference path in a browser; NOT native GUI acceptance')
     args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='speedbench-ui-fixture-') as folder:
         web.DATA_HOME=Path(folder)
@@ -60,7 +62,19 @@ def main():
                 web.speedbench_db.save_task(web.db_path(),web.JOBS.snapshot(job))
                 with web.STATE_LOCK: web.STATE.update(running=False,proc=None,exit_code=0)
         web.run_benchmark=run
-        server=ThreadingHTTPServer(('127.0.0.1',args.port),web.Handler)
+        class FixtureHandler(web.Handler):
+            def _send(self,code,body,ctype):
+                if args.desktop_preferences and ctype.startswith('text/html'):
+                    body=body.replace(b'<script src="/static/tasks.js">',
+                                      b'<script src="/static/fixture-environment.js"></script><script src="/static/tasks.js">')
+                return super()._send(code,body,ctype)
+            def do_GET(self):
+                if args.desktop_preferences and self.path=='/static/fixture-environment.js':
+                    if not self._check_host():return
+                    return self._send(200,b"Object.defineProperty(window,'SPEEDBENCH_ENV',{value:Object.freeze({client:'webview'}),writable:false});",
+                                      'application/javascript; charset=utf-8')
+                return super().do_GET()
+        server=ThreadingHTTPServer(('127.0.0.1',args.port),FixtureHandler)
         print('Isolated UI fixture http://127.0.0.1:'+str(server.server_port),flush=True)
         try: server.serve_forever()
         except KeyboardInterrupt: pass
