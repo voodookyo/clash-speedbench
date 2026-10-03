@@ -53,6 +53,7 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 
 ## 实施状态与证据
 
+- 2026-10-04 macOS 接续：恢复 7cdf4fd 开发链与两份 Windows pipe WIP；本机 baseline 895 tests。新增作用域内 OVERLAPPED pipe 读写、精确操作取消/完成确认、默认 SIGINT 暂存与处理器恢复，保留 NT fallback/reader 所有权/非取消恢复写；25 portable 回归通过，Python3.14.7/3.12.13 最终全量各920 tests（skipped=6/10）。独立 K3 建议已核对修正，GLM无最终输出，review_coverage=partial。真实 Windows pipe/包、Python3.9、原生桌面和所有传输硬预算仍待验收；未安装依赖、push或改变真实用户数据。见 ../reports/2026-10-04-pipe-cancellation-checkpoint.md；B/C/D整项仍不勾选。
 - 初始代码 HEAD：32e21dd；书面规格提交：1000ff7。
 - 初始全量基线：Windows / Python 3.14.7，539 tests，OK (skipped=5)。不能据此称升级代码通过或其他平台已通过。
 - writing-plans/test-driven-development 技能当前未提供，采用本清单与 unittest 失败先行作为明确替代，不安装未知技能或依赖。
