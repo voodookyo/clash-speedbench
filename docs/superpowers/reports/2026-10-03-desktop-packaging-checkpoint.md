@@ -18,14 +18,15 @@
 - 8755c87：CLI 取消／异常部分结果留存、报告失败不掩盖原退出码、包内 JSONL／SQLite／任务状态独立验收。
 - 52092d0：串行阶段计时与所有已报告下载样本计数、取消尝试计数、主实例已完成探测计数留存。
 - a416425：逐次 probe 留存、独立 main／worker／serial 元数据、取消停止未开始的队列、共享详情说明和包内取消任务验收。
-- 最新产物固定源码：`a4164256d7b861145c3fa8219527c26d8af50503`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345、8548d62、8755c87、52092d0 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
+- 3bfead6：provider/cache 实际调用计数、独立最终等待时间、worker 就绪启动数、任务接受时钟的五个首次里程碑与历史持久化。
+- 最新产物固定源码：`3bfead6d0daf49924535548b69ef96157be273e3`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345、8548d62、8755c87、52092d0、a416425 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
 - 桌面版本 `1.1.0-alpha.1`，运行时 CPython `3.14.8`，平台 `windows-x86_64`。核心稳定版入口与 legacy 测速默认未改为桌面 alpha。
-- 当前包目录 `dist/desktop-artifacts/a4164256d7b8/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告提交不改变此包的冻结源码。
+- 当前包目录 `dist/desktop-artifacts/3bfead6d0daf/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续验收夹具修正／报告提交不改变此包的冻结源码。
 
 | 文件 | 字节 | SHA-256 |
 |---|---:|---|
-| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12767573 | 2f3d3fef15f836c4ebf0a86fddecd5aa80e9db98b1ae49c095553616ee1b77ee |
-| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15746830 | 6e591950387906e5dad321a594acf15287b577d41e2aa8bcb55e449a8f4bec94 |
+| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12769997 | e6babb37620a570cf7c2ba568c11a5eedae180f8f25010dfde4338a16104c507 |
+| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15750950 | 91dfc263828c6cdd6d89e0c4e5557f8dfc1082924a65973366af8c30e0b546e5 |
 
 SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核对。包 **unsigned**，自动更新禁用；WebView2 是系统组件，不是单文件免运行时承诺。
 
@@ -147,6 +148,18 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 - 冻结 clean a416425，70 项资源／CPython3.14.8，locked/offline NSIS／ZIP unsigned 构建与独立解包验收通过。实际包内后端→CLI 使用真实 probe primitive＋fake controller 值（20、None、中断），退出130，追加 cancelled/partial JSONL，SQLite raw 精确保留，任务只一行，完成2／失败1／loss50%、started3 与 delay metrics 3 attempts／1 success 一致，lease 最终可重新取得。此前 failed download 的250000字节／1attempt／1success fixture 与完整性／Origin／重启／私有所有权／worker 隔离继续通过。两包 Get-FileHash 与 provenance 独立一致。
 
 没有 schema／依赖新增、IP 评分／缓存策略改动、push 或覆盖 Downloads。剩余 provider/cache 计数／五性能里程碑、全传输硬预算、同覆盖真实性能、C/D 完整矩阵／迁移／原生 GUI／macOS/Linux 仍待完成；目标 active，B5/B7、C/D 不全勾选。
+
+### 情报成本观测与五个任务里程碑
+
+- 3bfead6：各 provider 的真实 transport 尝试／HTTP 2xx／解析可用结果分别计数，缺少 Key、disabled、timeout、quota、限流／冷却可独立观察。可选 numeric-only observer 不包含 IP／URL／错误／Key，失效不阻塞测速。兼容 adapter 调用前用 signature 选参数，不把函数内部 TypeError 当作参数不匹配重试；失败先行复现旧 transport 重复三次／自定义 query 重复两次，现均只进一次。参数根本无法匹配时不计未发生的调用。
+- cache hit/miss 记录真实 get 检查（首次＋竞争复查），single-flight reuse 单独统计等待共享结果，cache write/error 与真正开始的 unique IP 任务数分开。不是每次 get_or_query 的逻辑命中率，也不是每节点 provider 调用。既有 7 天／24 小时 TTL、失败不缓存、单飞规则保留。`provider_wait` 不再混同 provider 实际服务时间；累加的并发 span 不能直接相加作壁钟耗时。worker_count 是成功就绪累计启动次数，不是峰值进程数；补上 Phase 2 追加 DNS 解析计时，不改变解析范围。
+- 首次结果／首次可用推荐候选／网络结束／情报结束／确认清理完成由父后端 monotonic 接受时钟记录，首次值不可改。子进程只可报告网络／情报完成信号，不能伪造耗时或清理成功。IP 目标需有效 quality/grade，partial 下载不是推荐候选；这是当前目标、已测范围的有限候选，不改变评分或全球冠军承诺。正常／取消子任务已退出才记录清理成功，code 3 或未 reaped 不记录。未到达的里程碑缺省 N/A；旧历史无此字段仍可回放。
+- 复用 task_metrics.counters_json，五里程碑使用 phase=milestones 独立行，无 schema／依赖新增，raw 原文不改。数据库事务内保留已落盘首次值，迟到 active checkpoint 不删除后来观察或重写首次耗时。纯前端任务状态合约接收 counters/milestones，不新增可视化面板，本批未声称新的 rendered UI 验收。
+- 新增 25 项回归：test_intel_metrics 13、test_task_milestones 10、test_task_milestones_js 1、test_job_api 1；35 项专项通过，涵盖 cache 冷热、single-flight、内层 TypeError、计数脱敏、两个真实串行／worker orchestration、存储／HTTP／SSE 合约。最终 `python -m unittest discover -s tests -v`：Windows Python3.14.7 **870／33.337s**、3.9.25 **870／33.184s**、3.12.10 **870／33.779s**，均 OK (skipped=7)。跳过项为 Windows 不适用 POSIX 权限及可选 PyYAML 对照，无真实 API；日志 ignored dist/intel-milestones-python*-tests.log。node --check、git diff --check、验收脚本 py_compile 通过；Rust locked/offline 7 tests／2.65s。
+- 冻结 clean 3bfead6，70 项资源／包内 CPython3.14.8，NSIS／ZIP locked/offline unsigned 构建通过。新包解压后实际后端→CLI 私有委派运行 real coordinator/cache/provider parser/report，fake transport／同出口两节点／两次冷热 enrichment：API calls=1、usable=1、cache hit=1、cache write=1、unique IP 执行任务=2，五里程碑全量持久化，raw 字节一致，canary Key 不出现在 public task／日志／JSONL／CSV／cache，最终 lease 可重新取得。原 integrity/tamper／Origin／重启／偏好／worker 隔离／direct CLI／failed download／cancelled probe 继续通过。Get-FileHash 独立核对两包 bytes/SHA-256/provenance 一致。
+- 新夹具初验失败：synthetic execute 漏发 probing/enriching 导致 finalizing 被合法拒绝；模拟 Key 嵌入 python -c 文本被命令日志捕获。夹具改为完整阶段协议及仅环境变量传递 Key 后独立包验收通过；provider 构造仍显式读取该环境 Key。修正仅为仓库验收脚本（不在 70 项运行资源中），生产资产未改，无需改变冻结版本或重建。未输出真实凭据／未请求真实 controller／provider，没有 push/tag/Release／安装覆盖。
+
+本批完成可观察性子功能，不等于 B/C/D 完成或相同覆盖实测提速。剩余目标策略、所有传输取消／资源预算、30/100/300 fixture 与真实同覆盖对比、C 全页面／错误／可访问性矩阵、D 历史导入／原生多平台生命周期仍待完成，整体目标 active。
 
 ## 仍未完成
 

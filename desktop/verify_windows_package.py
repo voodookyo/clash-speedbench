@@ -314,19 +314,22 @@ import sys
 sys.path.insert(0,sys.argv.pop(1))
 import clash_speedbench as core
 from speedbench_ip_intel import IpqsProvider
-from speedbench_progress import publish_result,milestone
+from speedbench_progress import publish_result,milestone,phase
+import os
 calls=[]
 def transport(*args,**kwargs):
     calls.append(1)
     return {'success':True,'fraud_score':4,'proxy':False,'vpn':False,'tor':False,'recent_abuse':False}
 def execute(args,config):
-    provider=IpqsProvider(key='CANARY-private-key',transport=transport)
+    provider=IpqsProvider(key=os.environ['SPEEDBENCH_IPQS_KEY'],transport=transport)
     core.make_default_providers=lambda **kwargs:[provider]
+    phase(args,'probing');phase(args,'measuring')
     rows=[core.Result(name=name,provider='',proto='ss',latency_ms=20,
         speeds_mbps=[30.0],median_mbps=30.0,best_mbps=30.0,status='ok',
         exit_ipv4='192.0.2.14',measurement_scope={'bandwidth':'completed'}) for name in ('A','B')]
     for row in rows:publish_result(args,'node_measurement',row,phase_name='measuring')
     milestone(args,'network_complete')
+    phase(args,'enriching')
     for _ in range(2):
         enricher=core.start_intelligence_enrichment(rows,args)
         assert enricher is not None
@@ -385,6 +388,9 @@ with BackendLease(history.parent):pass
     env=dict(os.environ,SPEEDBENCH_HOME=str(fixture),PATH=str(Path(os.environ['SystemRoot'])/'System32'))
     for key in list(env):
         if key.startswith(('SPEEDBENCH_IP','SPEEDBENCH_SCAMALYTICS')) or key=='SPEEDBENCH_VERGE_ROOT':env.pop(key)
+    # Exercise the normal in-memory environment route, not a credential
+    # literal embedded in a Python -c command that the log correctly records.
+    env['SPEEDBENCH_IPQS_KEY']='CANARY-private-key'
     result=subprocess.run([str(root/'runtime/python.exe'),'-B','-E','-s','-c',program,child],
         cwd=root/'app',env=env,capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
     if result.returncode!=0:raise ValueError('Bundled CLI intelligence/cache/milestone fixture failed')
