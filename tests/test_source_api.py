@@ -66,3 +66,17 @@ class SourceApiTest(WebServerCase):
             self.assertEqual(json.loads(body),[])
             query.assert_called_once_with(web.db_path(),sid,days=7)
             self.assertEqual(self.request('GET','/api/source?subscription_id='+sid,headers={'Host':'evil.example'})[0],403)
+
+    def test_slim_history_keeps_identity_and_scopes_without_credentials(self):
+        row={'name':'旧名称','node_id':'node_v2_'+'a'*32,'subscription_ids':['subscription_v2_'+'b'*32],
+             'subscription_name':'订阅改名','source_status':'verified','network_score':71,
+             'measurement_scope':{'bandwidth':'not_selected'},'probe_attempts':3,
+             'probe_successes':2,'password':'CANARY-password'}
+        with mock.patch.object(web.speedbench_db,'all_runs',return_value=[{'ts':'fixture','results':[row]}]):
+            status,body=self.request('GET','/api/history')
+            public=json.loads(body)[0]['results'][0]
+            self.assertEqual(public['node_id'],row['node_id'])
+            self.assertEqual(public['subscription_ids'],row['subscription_ids'])
+            self.assertEqual(public['network_score'],71)
+            self.assertEqual(public['measurement_scope'],row['measurement_scope'])
+            self.assertNotIn(b'CANARY-password',body)

@@ -41,7 +41,7 @@ import speedbench_tray  # noqa: E402
 import speedbench_controller  # noqa: E402
 import speedbench_sources  # noqa: E402
 import speedbench_tasks  # noqa: E402
-from speedbench_jobs import JobStore, JobError, TERMINAL
+from speedbench_jobs import JobStore, JobError, TERMINAL, _result as safe_job_result
 from speedbench_progress import PREFIX, parse_record
 
 SCRIPT = HERE / "clash_speedbench.py"
@@ -344,6 +344,10 @@ def slim_history() -> list:
                     "median_mbps": r.get("median_mbps"),
                     "latency_ms": r.get("latency_ms"),
                     "score": r.get("score"),
+                    **speedbench_sources.result_origin(r),
+                    **{k:v for k,v in safe_job_result(r).items() if k in (
+                        'network_score','probe_attempts','probe_successes','probe_failures',
+                        'probe_loss_pct','measurement_scope','exit_status','ip_grade','ip_quality_score')},
                 }
                 for r in rec.get("results", [])
             ],
