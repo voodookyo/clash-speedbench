@@ -156,7 +156,7 @@ def _pipe_kernel32():
     return ctypes.WinDLL("kernel32", use_last_error=True)
 
 
-def _open_pipe_handle(pipe_name: str) -> int:
+def _open_pipe_handle(pipe_name: str, *, overlapped: bool = False) -> int:
     """打开命名管道，返回 Win32 句柄；失败抛 OSError。
 
     先试标准的 CreateFileW(\\\\.\\pipe\\<name>)；真机验收实测：mihomo 以服务
@@ -171,8 +171,9 @@ def _open_pipe_handle(pipe_name: str) -> int:
     kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                                      wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
                                      wintypes.HANDLE]
+    flags = 0x40000000 if overlapped else 0  # FILE_FLAG_OVERLAPPED
     handle = kernel32.CreateFileW("\\\\.\\pipe\\" + pipe_name, _PIPE_GENERIC_RW,
-                                  _PIPE_SHARE_RW, None, _PIPE_OPEN_EXISTING, 0, None)
+                                  _PIPE_SHARE_RW, None, _PIPE_OPEN_EXISTING, flags, None)
     if handle != _INVALID_HANDLE_VALUE:
         return handle
     # Win32 路径解析失败（真机实测 err 3）：回退原生 NT 路径
@@ -194,6 +195,8 @@ def _open_pipe_handle(pipe_name: str) -> int:
     attrs.Attributes = _PIPE_CASE_INSENSITIVE
     out_handle = wintypes.HANDLE()
     iosb = _IO_STATUS_BLOCK()
+    # CreateOptions=0 keeps the NT fallback asynchronous (no synchronous-I/O
+    # option); scoped callers can use the same OVERLAPPED operations here.
     status = ntdll.NtCreateFile(ctypes.byref(out_handle),
                                 _PIPE_GENERIC_RW | _PIPE_SYNCHRONIZE,
                                 ctypes.byref(attrs), ctypes.byref(iosb),
@@ -249,15 +252,18 @@ class _PipeRawReader(io.RawIOBase):
     由本对象的 close() 在响应读完时真正关句柄。
     """
 
-    def __init__(self, handle: int):
+    def __init__(self, handle: int, pipe_io=None):
         super().__init__()
         self._handle: Optional[int] = handle
+        self._pipe_io = pipe_io
 
     def readable(self) -> bool:
         return True
 
     def readinto(self, b) -> int:
-        data = _pipe_read(self._handle, len(b))
+        if self.closed:
+            raise ValueError("I/O on closed pipe reader")
+        data = self._pipe_io.read(len(b)) if self._pipe_io is not None else _pipe_read(self._handle, len(b))
         b[: len(data)] = data
         return len(data)
 
@@ -273,30 +279,34 @@ class _PipeSock:
 
     http.client 只调用 sendall()/makefile("rb")/close()。makefile("rb") 把句柄
     所有权移交给返回的文件对象（见 _PipeRawReader），此后 close() 不再管句柄。
-    管道读写是阻塞式 Win32 调用、没有 socket 意义上的超时（settimeout 收下来
-    但不生效）；/delay 等 API 的服务端 timeout 参数兜底，mihomo 总会在有限
-    时间内应答。
+    取消作用域内使用独立 OVERLAPPED 读写；作用域外保留原同步 plumbing，
+    不使恢复写操作依赖任务取消标志。
     """
 
-    def __init__(self, handle: int):
+    def __init__(self, handle: int, pipe_io=None):
         self._handle: Optional[int] = handle
+        self._pipe_io = pipe_io
 
     def sendall(self, data) -> None:
         if self._handle is None:
             raise OSError("管道句柄已移交或关闭")
-        _pipe_write_all(self._handle, bytes(data))
+        if self._pipe_io is not None:
+            self._pipe_io.write_all(bytes(data))
+        else:
+            _pipe_write_all(self._handle, bytes(data))
 
     def makefile(self, mode, buffering=None):
         if mode != "rb":
             raise ValueError("管道 socket 外观只支持 makefile(\"rb\")")
         if self._handle is None:
             raise OSError("管道句柄已移交或关闭")
-        rfile = io.BufferedReader(_PipeRawReader(self._handle), buffer_size=65536)
+        rfile = io.BufferedReader(_PipeRawReader(self._handle, self._pipe_io), buffer_size=65536)
         self._handle = None  # 句柄所有权随读侧文件移交
         return rfile
 
-    def settimeout(self, _timeout) -> None:
-        pass  # 命名管道不支持，见类注释
+    def settimeout(self, timeout) -> None:
+        if self._pipe_io is not None:
+            self._pipe_io.timeout = timeout
 
     def close(self) -> None:
         if self._handle is not None:
@@ -312,7 +322,22 @@ class WinPipeHTTPConnection(http.client.HTTPConnection):
         self.pipe_name = pipe_name
 
     def connect(self) -> None:
-        self.sock = _PipeSock(_open_pipe_handle(self.pipe_name))
+        cancel = current_cancellation()
+        if cancel is None:
+            self.sock = _PipeSock(_open_pipe_handle(self.pipe_name))
+            return
+        if cancel():
+            raise KeyboardInterrupt
+        from speedbench_pipe import PipeIO
+        handle = _open_pipe_handle(self.pipe_name, overlapped=True)
+        try:
+            pipe_io = PipeIO(handle, cancel, self.timeout)
+            if cancel():
+                raise KeyboardInterrupt
+            self.sock = _PipeSock(handle, pipe_io)
+        except BaseException:
+            _pipe_close(handle)
+            raise
 
 
 class MihomoAPI:
@@ -360,7 +385,7 @@ class MihomoAPI:
                                                   timeout=self.timeout)
 
         resp=None
-        monitor=SocketCancellation(conn,current_cancellation() if self.pipe_name is None else None)
+        monitor=SocketCancellation(conn,current_cancellation())
         try:
             with monitor:
                 conn.request(method, path, body=body, headers=headers)

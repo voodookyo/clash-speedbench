@@ -83,8 +83,9 @@ class SocketCancellation:
 
     Python's timeout/select on Windows may not wake on another thread's
     shutdown. Poll the owned nonblocking socket instead. Establishment/TLS
-    and unsupported pipe I/O retain their native timeout: not a universal
-    hard request deadline. Ordinary requests outside a scope are unchanged.
+    retains its native timeout: not a universal hard request deadline. Named
+    pipes have a separate scoped I/O adapter. Ordinary requests outside a
+    scope are unchanged.
     """
     def __init__(self,connection,cancel):
         self.connection,self.cancel=connection,cancel

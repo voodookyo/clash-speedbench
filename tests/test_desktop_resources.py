@@ -55,6 +55,7 @@ class DesktopResourcesTest(unittest.TestCase):
             with self.assertRaises(ValueError):validate_stage(root)
     def test_public_bundle_allowlist_excludes_private_and_fixture_material(self):
         self.assertEqual(len(resources.MODULES),len(set(resources.MODULES)))
+        self.assertIn('speedbench_pipe', resources.MODULES)
         for module in resources.MODULES:
             self.assertTrue((resources.ROOT/(module+'.py')).is_file())
             self.assertNotIn('test',module)

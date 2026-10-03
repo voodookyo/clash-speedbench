@@ -250,9 +250,13 @@ DNS interruption stops queued domains, propagates local stop to owned curl
 calls and joins them; the initiating ordinary error is not masked by sibling
 abort. Worker startup/readiness check cancellation before claiming ready.
 Closing intelligence skips subsequent providers while retaining and joining
-current query/cache writers. Windows named-pipe I/O, connection/TLS establishment
-and provider urllib still retain original timeouts/system behavior; no universal
-hard cancellation deadline is claimed. The portable-package fixture
+current query/cache writers. The development branch now uses per-operation
+overlapped I/O for scoped Windows pipe requests, cancelling and confirming
+completion before releasing native storage/events. Portable mock tests pass;
+real Windows fixture and new packaged acceptance are still pending. Unscoped
+pipe requests, connection/TLS establishment and provider urllib retain original
+timeouts/system behavior; no universal hard cancellation deadline is claimed.
+The portable-package fixture
 also exercises the actual bundled probe primitive with synthetic values and
 an interrupt, checking cancelled partial JSONL/SQLite/task metrics, raw-history
 preservation and ownership release without contacting Clash or third parties.

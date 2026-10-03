@@ -20,7 +20,7 @@ except ImportError:from license_notices import notices
 ROOT=Path(__file__).resolve().parents[1]
 STAGE=ROOT/'desktop'/'src-tauri'/'resources'
 MODULES=('clash_speedbench','speedbench_config','speedbench_controller','speedbench_identity','speedbench_sources',
-         'speedbench_tasks','speedbench_jobs','speedbench_process','speedbench_progress',
+         'speedbench_tasks','speedbench_jobs','speedbench_process','speedbench_pipe','speedbench_progress',
          'speedbench_owner','speedbench_desktop','speedbench_preferences','speedbench_releases','speedbench_db','speedbench_ip_intel',
          'speedbench_leak','speedbench_web','speedbench_switch','speedbench_workers','speedbench_tray')
 WEB=('index.html','app.js','tasks.js','view.js','preferences.js','releases.js','config-root.js','style.css')
