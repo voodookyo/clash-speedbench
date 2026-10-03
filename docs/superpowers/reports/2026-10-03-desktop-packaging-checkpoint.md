@@ -14,14 +14,15 @@
 - f0851bf：自定义 Verge 根目录、控制器/来源/worker 一致传递，接受任务冻结私有快照，失效不回退、任务忙碌不允许改目录。
 - f1b055c：共享设置的预览/确认/恢复自动发现、过期响应保护、资源清单/CI/文档和测试。
 - 1243345：登记 worker 并发清理、显式目录生命周期，持续失败不能被动态 shard 吞掉；CLI 专用退出码／后端 failed 和后续任务阻断。
-- 最新产物固定源码：`1243345224e718e5b5b4fba76edd71853e93a345`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c 包保留，只作对应修订的历史证据，不包含此后的功能。
+- 3ff2443／8548d62：直接 CLI 与私有委派子任务目录所有权、EOF 取消、正常完成管道退出及缓存写入者回收。
+- 最新产物固定源码：`8548d628ded1604ff30d8c398d453a44b4c4463c`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
 - 桌面版本 `1.1.0-alpha.1`，运行时 CPython `3.14.8`，平台 `windows-x86_64`。核心稳定版入口与 legacy 测速默认未改为桌面 alpha。
-- 当前包目录 `dist/desktop-artifacts/1243345224e7/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告／独立验收脚本提交不改变此包的冻结源码。
+- 当前包目录 `dist/desktop-artifacts/8548d628ded1/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告提交不改变此包的冻结源码。
 
 | 文件 | 字节 | SHA-256 |
 |---|---:|---|
-| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12758867 | c953e82cd1f76534238fedc4debdfa745aa3303c0705daebaecbc06945bd7e66 |
-| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15735831 | fa3cb4ae809e69a06c35d5b9c8f49117198d63b9c38f81f95dc77430ad46b88d |
+| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12764124 | 6dab0b93912ec8ef0e186aae0561aa81fadb8aecde86524a86e3201dbcd9af01 |
+| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15739950 | 9d9f1e36ab79b5347870bee5afb02368982c75b6ebc6cea8a9975015aa090032 |
 
 SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核对。包 **unsigned**，自动更新禁用；WebView2 是系统组件，不是单文件免运行时承诺。
 
@@ -39,7 +40,7 @@ Tauri 加载同源共享 UI；测速仍由标准库 Python、系统 curl 和隔�
 
 后端只绑定 127.0.0.1 动态端口。私有 stdin/stdout 启动协议校验 nonce、实例、PID、版本；nonce/write token 不进入 argv、URL、日志或 localStorage。公开身份 JSON 不含凭据。既有同源 HTML 的 sb-token meta 包含本实例本地写 token，这是鉴权所需，不是 provider/controller API Key。后者不会返回前端。
 
-数据目录内核锁在同步/迁移前取得；旧锁元数据不等于活跃所有权。桌面与独立 Web 使用同一目录时互斥。尚未覆盖直接 CLI 所有写入协调；不同数据目录的实例不是全局互斥。
+数据目录内核锁在同步/迁移前取得；旧锁元数据不等于活跃所有权。桌面、独立 Web 和直接 CLI 使用同一目录时互斥，CLI 同时协调显式历史与 identity home。后端子任务使用实际父进程绑定的私有管道及独立 writer 锁，异常路径的查询池在释放目录锁前取消未开始任务并等待在途缓存写入；不同数据目录的实例不是全局互斥。
 
 Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象只回收所属子树。POSIX 实现独立进程组，但未做原生崩溃/信号实测。退出先取消并等待，超时明确失败并限定自身子树，不按进程名杀用户 Mihomo。
 
@@ -96,10 +97,23 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 
 仍待全生命周期取消预算、直接 CLI 部分历史与所有权协调、真实同覆盖性能和其他平台原生验收。B4/B7、C/D 不能据此全部勾选。
 
+### CLI／后端子任务目录所有权最终验证
+
+- 新增 16 项回归，直接 CLI 在 Controller／身份／缓存／历史写入前核验目录；默认历史遵循 SPEEDBENCH_HOME，显式历史与 home 不同则同时持锁。闲置 Web／桌面也阻止同目录独立 CLI；不是全局多目录锁。没有新增 SQLite schema、pip 依赖或持久化密钥。
+- hidden 子任务参数仅标识入口，不能授权；实际父 PID、私有实例、canonical history 路径、owner metadata 与活跃内核锁均须一致。私有 stdin 有 32KiB／5s 引导限制，帧不进 argv/env/日志/历史；环境中的 HOME 为 canonical 父目录，防止子进程 cwd 导致相对路径误解。子任务 writer 锁留到报告/清理结束，父 owner 释放后仍阻止新后端，EOF 请求取消；不删除锁 inode、不把旧 PID 当活跃实例。
+- 私有管道异常时关闭并等 8s；不能确认退出则保留原句柄／running、标记 cleanup incomplete 并阻断新任务，由持有句柄的 watcher 收尾，不按 PID 名称杀进程、不将超时称为清理成功。
+- 真实包验收先发现正常完成时父管道尚打开，daemon BufferedReader 阻止解释器退出并导致 Fatal Python error。新增真实子进程回归在修复前失败，改原始 descriptor 读取后通过；不以仅 EOF 退出夹具代替正常完成。另补异常路径查询池生命周期：取消未执行查询、等待在途缓存写入后才释放 CLI lease，保持网络／IP 计分逻辑不变。
+- `python -m unittest discover -s tests -v`：Windows Python3.14.7 797 tests，28.711s；3.9.25 797 tests，28.687s；3.12 797 tests，27.457s，均 OK (skipped=7)。本轮 27 项专项也通过。三版并行，不是测速性能对照。
+- 冻结 8548d62，70 项资源、bundled CPython3.14.8；Rust 7 tests（2.23s）通过。locked/offline unsigned NSIS／ZIP 构建成功；解压后实际调用包内后端 run_benchmark→CLI main 私有管道，fixture 测量体正常退出、直接 CLI 同目录拒绝、原 raw 保持，完整性/篡改、Origin、两轮起停、设置静态哈希与 worker 清理隔离均通过。独立 Get-FileHash 与 provenance 一致。
+- 重建时旧 staging runtime/python.exe 被系统占用且无法确认占用进程身份，未猜 PID／终止它。仅核验 workspace 内明确构建 resources 目录后移动至 ignored `dist/desktop-staging-quarantine/3ff2443-resources/` 留存，重新建立 staging；没有删除用户数据或原安装，也不称旧系统占用已清理。
+- 当前 Git 生产提交 3ff2443／8548d62；本报告后续提交不改变冻结包。未 push、tag、Release、安装覆盖，未测试真实第三方 API 或带宽。
+
+此项本机验收不代表 B 全生命周期取消预算、CLI 异常部分历史或完整 C/D 已完成。下一步仍是直接 CLI 异常部分结果保存。
+
 ## 仍未完成
 
 - Windows 原生窗口/WebView2 缺失路径、托盘/通知、重复启动、休眠、活跃任务退出、安装器交互与升级验收。当前会话原生 GUI 自动化不可用，不用构建成功或浏览器截图代替。
 - macOS Intel/Apple Silicon 和 Linux 原生构建、安装、运行、信号及依赖验收；只有配置和有界资源 fixture，不能称兼容性已通过。
-- 首次旧历史目录选择/安全导入完整流程、直接 CLI 与目录所有权协调。显式非敏感偏好迁移及正式版本检查已实现并按上述边界验证，但不代表完整数据导入/升级安装与回退交互验收。
+- 首次旧历史目录选择/安全导入完整流程、直接 CLI 异常部分历史。目录所有权协调已按上段通过本机验收；显式非敏感偏好迁移及正式版本检查已实现并按上述边界验证，但不代表完整数据导入/升级安装与回退交互验收。
 - B 的完整目标策略、全阶段取消/清理预算与剩余失败传播、同覆盖性能实测；下载历史提示已接入并通过 fixture，但不构成真实提速证据。C 的更多前端职责拆分和完整错误/页面矩阵；配置根目录选择本机子功能已验收，不代表 C 整体完成。
 - 整体规格逐项完成审计和最终交付。因此不标记完整升级已完成，也不建议覆盖现有稳定安装。
