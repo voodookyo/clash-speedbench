@@ -62,6 +62,12 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 - 截图在仓库之外：`.codex/visualizations/2026/08/29/01a04bf1-7164-7b20-9bf7-4fa9066c62f5/` 下的 speedbench-preferences-desktop-qa.png、speedbench-preferences-narrow-qa.png、speedbench-release-alpha-qa.png、speedbench-release-timeout-narrow-qa.png。没有将截图或 fixture 数据加入发行包。
 - `git diff --check` 通过。桌面五平台与原六格 Python CI 已配置，但未推送/运行。
 
+### 退出夹具补充验证（不改变冻结发行源码）
+
+清理隔离 UI 服务时，一个夹具的 TemporaryDirectory 删除失败：ThreadingHTTPServer 默认 daemon handler 仍持有临时 SQLite 文件。测试专用 FixtureServer 改为非 daemon／block_on_close，在数据目录移除前等待在途请求。新增实际 HTTP + 打开文件句柄回归，Windows Python 3.9/3.14 专项通过；重新打开隔离页面并退出，辅助进程 exit=0，无残留请求错误。只删除此前明确核验的两个人工夹具文件（fixture.db、ui-preferences.json）和其空临时目录，不触碰用户历史。
+
+补充后最终源码全量：Windows Python 3.14.7 / 3.9.25 / 3.12 各 751 tests，OK (skipped=7)，并行耗时 37.455s / 37.897s / 37.587s。所有打包 Python 模块、共享静态资源及包内 README 与 e73eb9b 清单 SHA-256 逐个复核仍完全一致；这次仅改测试夹具、测试与报告，不重新打包或冒称原生 GUI 验收。已停止本轮临时服务并关闭本轮验证页，恢复 viewport。
+
 ## 仍未完成
 
 - Windows 原生窗口/WebView2 缺失路径、托盘/通知、重复启动、休眠、活跃任务退出、安装器交互与升级验收。当前会话原生 GUI 自动化不可用，不用构建成功或浏览器截图代替。

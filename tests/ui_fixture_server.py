@@ -13,6 +13,13 @@ import speedbench_web as web
 from speedbench_tasks import resolve_config
 
 
+class FixtureServer(ThreadingHTTPServer):
+    # Wait for in-flight handlers to close fixture SQLite handles before the
+    # enclosing TemporaryDirectory deletes its files (especially on Windows).
+    daemon_threads=False
+    block_on_close=True
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--port',type=int,default=8964)
@@ -84,7 +91,7 @@ def main():
                     return self._send(200,b"Object.defineProperty(window,'SPEEDBENCH_ENV',{value:Object.freeze({client:'webview'}),writable:false});",
                                       'application/javascript; charset=utf-8')
                 return super().do_GET()
-        server=ThreadingHTTPServer(('127.0.0.1',args.port),FixtureHandler)
+        server=FixtureServer(('127.0.0.1',args.port),FixtureHandler)
         print('Isolated UI fixture http://127.0.0.1:'+str(server.server_port),flush=True)
         try: server.serve_forever()
         except KeyboardInterrupt: pass
