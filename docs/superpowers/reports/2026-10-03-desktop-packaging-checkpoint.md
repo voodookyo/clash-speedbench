@@ -11,14 +11,16 @@
 - 5c1f796：worker terminate/kill 后确认退出再移除临时配置，清理失败可重试；单独安全异常不触发串行测量回退。
 - bd444df：显式白名单偏好导出/预览/确认合并，未匹配收藏保留待确认；认证的数据位置/文件存在性指引，不自动导入历史或复制 seed。
 - e73eb9b：认证点击触发固定 GitHub 正式 Release 查询、内存 single-flight/TTL、版本比较、失败无法确认；不自动下载/安装/降级，不检查 alpha 更新；包验证覆盖新设置静态模块和本地接口。
-- 最新产物固定源码：`e73eb9b072fb7f571dddd783f4c307bcea26b0cb`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df 包保留，只作对应修订的历史证据，不包含此后的功能。
+- f0851bf：自定义 Verge 根目录、控制器/来源/worker 一致传递，接受任务冻结私有快照，失效不回退、任务忙碌不允许改目录。
+- f1b055c：共享设置的预览/确认/恢复自动发现、过期响应保护、资源清单/CI/文档和测试。
+- 最新产物固定源码：`f1b055ce2dc9e95d7f859534de34452615a1dc92`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b 包保留，只作对应修订的历史证据，不包含此后的功能。
 - 桌面版本 `1.1.0-alpha.1`，运行时 CPython `3.14.8`，平台 `windows-x86_64`。核心稳定版入口与 legacy 测速默认未改为桌面 alpha。
-- 当前包目录 `dist/desktop-artifacts/e73eb9b072fb/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。报告的后续文档提交不改变此包的冻结源码。
+- 当前包目录 `dist/desktop-artifacts/f1b055ce2dc9/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。报告的后续文档提交不改变此包的冻结源码。
 
 | 文件 | 字节 | SHA-256 |
 |---|---:|---|
-| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12751620 | 8f03d14977885a8d2601209370c82a96bb9207a5fb1eda474fe4f515becef3b9 |
-| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15726307 | cb5db09382c0d41ca43d92c4e0bb0e010e3f0e67fa8492aa07743a37cc5d5500 |
+| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12756172 | 682df993d7a4057f7b290eca82d7be2a87f7bc575d3ee6296b42f3439db15f69 |
+| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15733954 | 1c3546afe1ce5c72f76f348cd81d1feecc0f339b16a4e1d64ad1e47a3f21e74a |
 
 SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核对。包 **unsigned**，自动更新禁用；WebView2 是系统组件，不是单文件免运行时承诺。
 
@@ -32,7 +34,7 @@ SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核�
 
 ## 实现边界
 
-Tauri 加载同源共享 UI；测速仍由标准库 Python、系统 curl 和隔离 Mihomo worker 执行，没有 pip 运行依赖。68 项资源逐个校验，编译进原生程序的清单是信任锚；不能通过同时替换源码和外部清单绕过校验。
+Tauri 加载同源共享 UI；测速仍由标准库 Python、系统 curl 和隔离 Mihomo worker 执行，没有 pip 运行依赖。70 项资源逐个校验，编译进原生程序的清单是信任锚；不能通过同时替换源码和外部清单绕过校验。
 
 后端只绑定 127.0.0.1 动态端口。私有 stdin/stdout 启动协议校验 nonce、实例、PID、版本；nonce/write token 不进入 argv、URL、日志或 localStorage。公开身份 JSON 不含凭据。既有同源 HTML 的 sb-token meta 包含本实例本地写 token，这是鉴权所需，不是 provider/controller API Key。后者不会返回前端。
 
@@ -68,10 +70,23 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 
 补充后最终源码全量：Windows Python 3.14.7 / 3.9.25 / 3.12 各 751 tests，OK (skipped=7)，并行耗时 37.455s / 37.897s / 37.587s。所有打包 Python 模块、共享静态资源及包内 README 与 e73eb9b 清单 SHA-256 逐个复核仍完全一致；这次仅改测试夹具、测试与报告，不重新打包或冒称原生 GUI 验收。已停止本轮临时服务并关闭本轮验证页，恢复 viewport。
 
+### 自定义配置根目录与最新产物验收
+
+设置页新增 session-only 根目录，通过同源鉴权接口先预览布局再确认应用；输入变化使旧预览和确认失效，运行/取消/清理期间禁止更改。冻结根目录仅通过私有子进程环境传递，控制器与目录及 worker 同源；不进入 argv、任务快照/SQLite/JSONL、localStorage 或偏好导出，日志脱敏。显式无效目录、控制器不匹配或 CLI --config-file 冲突在业务前失败，不回退。自动发现恢复忽略本次启动环境覆盖；重启仍按 SPEEDBENCH_VERGE_ROOT 启动变量选择。只做固定布局 metadata 校验，不是内容/连接验证；没有任意文件读取 API 或原生目录选择器。身份 namespace 跟随根目录，不删除旧历史/收藏，不强行匹配旧 ID。
+
+- 最新全量 `python -m unittest discover -s tests -v`：Windows Python 3.14.7 772 tests（30.504s）、3.9.25 772 tests（29.725s）、3.12 772 tests（30.415s），各 OK (skipped=7)。三轮并行，时间不是测速提速证据。
+- 新增 21 项配置目录/UI 测试：非法/远程/链接/缺失布局、重启初值失效、Controller/worker 一致路径且不回退、CLI 冲突、Host/Origin/token、忙碌锁定、配置 revision 竞争、任务私有快照及 SQLite 脱敏、切换竞争不写旧控制器、旧目录响应不覆盖新来源、预览/显式确认/模糊写失败不重发。
+- 新夹具初次失败分别源于 Windows 8.3 路径与 canonical 预期差异、mock 误替换共享 threading.Thread 导致 HTTP handler 不启动、SQLite context manager 未关闭读连接。修正测试边界/显式 close 后通过，未放宽生产校验或跳过新增测试。夹具 stdout 显式 UTF-8，中文/emoji 布局可见，退出 exit=0；未修改真实 Verge/数据。
+- 8969 隔离页面（模拟 WebView 偏好，不是原生 GUI）：真实点击中文/空格路径预览→确认对话框→应用→运行 fixture 任务锁定控件→无效路径报错禁用应用→显式恢复自动发现→刷新状态正确。1280x720 / 760x900 无横向溢出，页面 identity/非空/无 overlay/相关 error、warn 为零均核对。新截图为仓库外同目录的 config-root-desktop.png、config-root-narrow-invalid.png。浏览器页已关闭，临时 viewport 已恢复，fixture 端口已停止。
+- `node --check web/app.js`、`node --check web/config-root.js`、`git diff --check` 通过。Rust 7 tests 全部通过（2.24s）。
+- `prepare_resources.py --target windows-x86_64` → Tauri locked/offline unsigned NSIS → `package_windows.py` → `verify_windows_package.py` → `collect_artifacts.py --target windows-x86_64` 全部成功；独立 ZIP 解包再运行原生 integrity/tamper、内置 Python/私有握手、Origin、两轮起停/偏好、原 raw 保持，新增认证根目录接口默认 auto/session、非法目录拒绝/不回显以及第三份设置 JS 清单哈希核对。70 项资源，source_dirty=false，两个包 SHA-256 经 Get-FileHash 单独复核与 provenance 一致。
+
+配置选择子功能已本机验收，不表示 C 全页矩阵、D 原生 GUI 或 A–D 完整规格已完成。
+
 ## 仍未完成
 
 - Windows 原生窗口/WebView2 缺失路径、托盘/通知、重复启动、休眠、活跃任务退出、安装器交互与升级验收。当前会话原生 GUI 自动化不可用，不用构建成功或浏览器截图代替。
 - macOS Intel/Apple Silicon 和 Linux 原生构建、安装、运行、信号及依赖验收；只有配置和有界资源 fixture，不能称兼容性已通过。
 - 首次旧历史目录选择/安全导入完整流程、直接 CLI 与目录所有权协调。显式非敏感偏好迁移及正式版本检查已实现并按上述边界验证，但不代表完整数据导入/升级安装与回退交互验收。
-- B 的完整目标策略、全阶段取消/清理预算与剩余失败传播、同覆盖性能实测；下载历史提示已接入并通过 fixture，但不构成真实提速证据。C 的配置根目录选择、更多前端职责拆分和完整错误/页面矩阵。
+- B 的完整目标策略、全阶段取消/清理预算与剩余失败传播、同覆盖性能实测；下载历史提示已接入并通过 fixture，但不构成真实提速证据。C 的更多前端职责拆分和完整错误/页面矩阵；配置根目录选择本机子功能已验收，不代表 C 整体完成。
 - 整体规格逐项完成审计和最终交付。因此不标记完整升级已完成，也不建议覆盖现有稳定安装。
