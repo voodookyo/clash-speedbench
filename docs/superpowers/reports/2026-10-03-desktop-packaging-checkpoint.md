@@ -15,14 +15,15 @@
 - f1b055c：共享设置的预览/确认/恢复自动发现、过期响应保护、资源清单/CI/文档和测试。
 - 1243345：登记 worker 并发清理、显式目录生命周期，持续失败不能被动态 shard 吞掉；CLI 专用退出码／后端 failed 和后续任务阻断。
 - 3ff2443／8548d62：直接 CLI 与私有委派子任务目录所有权、EOF 取消、正常完成管道退出及缓存写入者回收。
-- 最新产物固定源码：`8548d628ded1604ff30d8c398d453a44b4c4463c`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
+- 8755c87：CLI 取消／异常部分结果留存、报告失败不掩盖原退出码、包内 JSONL／SQLite／任务状态独立验收。
+- 最新产物固定源码：`8755c87ba6e67ebc342c97442fa6ba775cb40390`，构建时 `source_dirty=false`。早期 c4d9d10、5c1f796、bd444df、e73eb9b、f1b055c、1243345、8548d62 包保留，只作对应修订的历史证据，不包含此后的功能。3ff2443 包未通过新增正常完成验收，不作为可交付包。
 - 桌面版本 `1.1.0-alpha.1`，运行时 CPython `3.14.8`，平台 `windows-x86_64`。核心稳定版入口与 legacy 测速默认未改为桌面 alpha。
-- 当前包目录 `dist/desktop-artifacts/8548d628ded1/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告提交不改变此包的冻结源码。
+- 当前包目录 `dist/desktop-artifacts/8755c87ba6e6/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。后续报告提交不改变此包的冻结源码。
 
 | 文件 | 字节 | SHA-256 |
 |---|---:|---|
-| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12764124 | 6dab0b93912ec8ef0e186aae0561aa81fadb8aecde86524a86e3201dbcd9af01 |
-| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15739950 | 9d9f1e36ab79b5347870bee5afb02368982c75b6ebc6cea8a9975015aa090032 |
+| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12760253 | 6df35de11fc60d0a827db983ecb1cc285a8362dd59601ffdc02d59c682de79db |
+| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15742613 | 59f786b028d34155993057785789ae5292d50d7263b5730483e3ee915639079f |
 
 SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核对。包 **unsigned**，自动更新禁用；WebView2 是系统组件，不是单文件免运行时承诺。
 
@@ -110,10 +111,22 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 
 此项本机验收不代表 B 全生命周期取消预算、CLI 异常部分历史或完整 C/D 已完成。下一步仍是直接 CLI 异常部分结果保存。
 
+### CLI 取消／异常部分结果留存
+
+- 8755c87：每任务内存 journal 在发布事件前冻结快照，不依赖 stdout 或 Web 父进程存活。按本次冻结目录的唯一 runtime name 去重（不是跨历史身份）；早期出口事件保留主探测的成功／失败计数。串行和 worker 每轮保存已完成样本，第二轮中断不丢弃第一轮、已报告下载字节和 connect；IPv6 中断不丢弃已完成 IPv4。未完成指标不是网络不可达，未知 IP 仍 N/A。
+- CLI lease 内等待／关闭登记 Intelligence 写入者后尝试导出；取消返回 130、持续 worker 清理失败 3、其他异常 1。部分报告失败不能覆盖原退出码；关闭的事件通道不打断清理和留存；无自动切换或新测量。串行恢复原组／模式后才导出。Scoring／原测速方法和第三方配额策略未重写。
+- CSV 失败仍尝试 JSONL，`--no-history` 保持有效；两者失败明确提示未持久化。已提交历史不重写／不因稍后中断重复追加。没有 SQLite schema 变化；可选 task.status 只接受固定状态，新 partial 元数据增量导入，旧 legacy 成功行结构保持、旧 runs.raw 字节与重复导入均通过。
+- 失败先行复现：Phase 1 中断无报告、cleanup code 3 无历史、第二轮丢样本、导出失败误标保存，以及串行报告异常将 130 改为 1。新增 21 项回归（专项 57 项与最后 partial 18 项均通过）；无真实节点／付费 API。
+- 最终 `python -m unittest discover -s tests -v`：Windows Python3.14.7 818 tests／34.726s、3.9.25 818／33.677s、3.12 818／34.684s，均 OK (skipped=7)。日志在 ignored `dist/partial-history-python*-tests.log`；三版并行，不作测速提速证据。`git diff --check`、验收脚本 py_compile 通过；Rust locked/offline 7 tests／2.29s。
+- 冻结 8755c87，70 项资源、包内 CPython3.14.8、source_dirty=false，Windows unsigned NSIS／ZIP locked/offline 构建成功。独立解包实际调用包内后端→CLI 私有通道，fixture code 3 后原 JSONL 不改、部分行追加、SQLite raw 精确导入、task failed/partial 与 run 关联通过；同时原有 integrity/tamper、私有引导、Origin、两轮起停／偏好、worker 清理隔离和独立 CLI 同目录拒绝验收通过。两包 Get-FileHash 与 provenance 独立一致。
+- 修改文件：clash_speedbench.py、speedbench_progress.py、speedbench_workers.py、speedbench_web.py；test_cli_partial_history、test_cli_ownership、test_ip_intel_integration、test_job_api、test_progress_stream；desktop/verify_windows_package.py、README、desktop/README 和本报告／实施清单。未 push/tag/Release、覆盖用户安装或修改真实 Verge。
+
+这是失败留存子功能验收，不是完整原子磁盘提交／全生命周期硬取消预算保证。强制 kill、磁盘不可写或连续再次中断仍可能无法落盘；已提交行不追溯改为后来中断状态。B5/B7 与 C/D 仍不整体勾选。
+
 ## 仍未完成
 
 - Windows 原生窗口/WebView2 缺失路径、托盘/通知、重复启动、休眠、活跃任务退出、安装器交互与升级验收。当前会话原生 GUI 自动化不可用，不用构建成功或浏览器截图代替。
 - macOS Intel/Apple Silicon 和 Linux 原生构建、安装、运行、信号及依赖验收；只有配置和有界资源 fixture，不能称兼容性已通过。
-- 首次旧历史目录选择/安全导入完整流程、直接 CLI 异常部分历史。目录所有权协调已按上段通过本机验收；显式非敏感偏好迁移及正式版本检查已实现并按上述边界验证，但不代表完整数据导入/升级安装与回退交互验收。
+- 首次旧历史目录选择/安全导入完整流程。目录所有权协调、CLI 异常部分留存已按上段通过本机验收；显式非敏感偏好迁移及正式版本检查已实现并按上述边界验证，但不代表完整数据导入/升级安装与回退交互验收。
 - B 的完整目标策略、全阶段取消/清理预算与剩余失败传播、同覆盖性能实测；下载历史提示已接入并通过 fixture，但不构成真实提速证据。C 的更多前端职责拆分和完整错误/页面矩阵；配置根目录选择本机子功能已验收，不代表 C 整体完成。
 - 整体规格逐项完成审计和最终交付。因此不标记完整升级已完成，也不建议覆盖现有稳定安装。
