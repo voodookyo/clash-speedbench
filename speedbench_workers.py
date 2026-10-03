@@ -53,6 +53,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from speedbench_sources import apply_origin
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -635,6 +636,12 @@ class _BlockYaml:
                     out.append(self.parse_block(nxt[0]))
                 else:
                     out.append(None)
+                continue
+            # A flow collection after '-' is one value, not a block mapping
+            # whose first ':' belongs to the outer sequence. Real subscription
+            # files commonly use '- {name: ..., password: ...}'.
+            if rest[:1] in ('{', '['):
+                out.append(_parse_yaml_scalar(rest, lineno))
                 continue
             try:
                 key_value = _split_yaml_key(rest, lineno)
@@ -1228,6 +1235,24 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     print(f"Worker 模式: {mihomo_bin}")
     print(f"配置文件: {config_file}")
     all_proxies = extract_proxies(config_file)
+    origins = getattr(args, 'source_origins', {})
+    if origins:
+        import os
+        from speedbench_identity import load_seed, IdentityError
+        from speedbench_sources import revalidate_origins, SourceSelectionChanged
+        try:
+            seed = load_seed(Path(os.environ.get('SPEEDBENCH_HOME') or
+                                 str(Path(args.history).resolve().parent)) / 'identity-seed')
+            checked = revalidate_origins(origins, all_proxies, seed=seed,
+                                        namespace=os.path.normcase(str(Path(config_file).resolve().parent)))
+        except IdentityError:
+            checked = {}
+        changed = set(origins) - set(checked)
+        if changed.intersection(candidates) and (getattr(args, 'subscription_id', []) or
+                                                getattr(args, 'node_id', [])):
+            raise SourceSelectionChanged('节点配置已变化，请刷新目录后重试')
+        # Non-ID legacy runs may continue, but may not retain stale provenance.
+        args.source_origins = checked
     by_name = {p.get("name"): p for p in all_proxies if isinstance(p, dict)}
     selected = [by_name[n] for n in candidates if n in by_name]
     missing = [n for n in candidates if n not in by_name]
@@ -1441,6 +1466,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     provider_map = provider_by_name or {}
     for r in results:
         r.provider = provider_map.get(r.name, "")
+        apply_origin(r, getattr(args, 'source_origins', {}).get(r.name))
         cred = by_name.get(r.name)
         if cred:
             r.node_key = node_key_of(str(cred.get("type", "")),
