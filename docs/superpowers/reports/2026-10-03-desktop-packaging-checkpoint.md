@@ -23,7 +23,7 @@ SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核�
 - 后端：speedbench_desktop.py、speedbench_owner.py、speedbench_preferences.py、speedbench_web.py、speedbench_jobs.py。
 - 共享界面：web/app.js、web/index.html、web/tasks.js；区分浏览器与 WebView，受控 DNS 引导外链，不把 WebView 检测当作 Chrome/Edge 审计。
 - 桌面：desktop/src-tauri/src/backend.rs、main.rs、Cargo.toml/Cargo.lock、Tauri 配置、capabilities、NSIS hooks、原生平台配置。
-- 工具与依赖：desktop/scripts/prepare_resources.py、license_notices.py、package_windows.py、verify_windows_package.py、collect_artifacts.py、runtime-lock.json、package.json/package-lock.json。
+- 工具与依赖：desktop/prepare_resources.py、license_notices.py、package_windows.py、verify_windows_package.py、collect_artifacts.py、runtime-lock.json、package.json/package-lock.json。
 - 文档/CI/打包：README.md、desktop/README.md、.github/workflows/desktop.yml、test.yml、release.yml、build_app.sh、.gitignore；专项 tests。
 
 ## 实现边界
@@ -46,7 +46,7 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 - Windows Python 3.9.25：同一全量命令，706 tests，OK (skipped=7)，15.815s。
 - Windows Python 3.12：同一全量命令，706 tests，OK (skipped=7)，15.404s。
 - Rust：`cargo test --locked --offline --manifest-path desktop/src-tauri/Cargo.toml`，7 tests 通过；实际临时中文/空格/emoji 路径、无 Python PATH、重复目录所有权、原 raw 保持、Job Object 子孙进程回收且不影响独立进程。
-- Windows Tauri Release/NSIS 构建成功；`python desktop/scripts/package_windows.py`、`verify_windows_package.py`、`collect_artifacts.py` 成功。
+- Windows Tauri Release/NSIS 构建成功；`python desktop/package_windows.py`、`verify_windows_package.py`、`collect_artifacts.py` 成功。
 - 独立产物验收实际解压 ZIP，再验证原生完整性/篡改、内置 Python 启动、私有握手、Origin 拒绝、两轮起停、偏好跨重启、旧 raw 不改。没有创建窗口，因此不把它称为 GUI 验收。
 - 浏览器隔离 fixture 泄漏页：实际截图、浏览器环境边界提示、控制台无相关 error/warn；未点击 STUN/外部 DNS 服务，没有真实环境泄漏结论。
 - `git diff --check` 通过。桌面五平台与原六格 Python CI 已配置，但未推送/运行。

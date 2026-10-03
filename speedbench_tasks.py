@@ -127,6 +127,7 @@ def select_candidates(rows, top_n, *, measure_all=False, legacy=False, target_pr
             recent = row.get('recent_mbps')
             age = row.get('history_age_days')
             hint = (float(recent) if target_profile == 'download' and row.get('node_id')
+                    and row.get('identity_strength') == 'strong'
                     and isinstance(recent,(int,float)) and math.isfinite(recent) and recent > 0
                     and isinstance(age,(int,float)) and 0 <= age <= 7 else 0)
             return (-coverage, -hint, row['latency_ms'],str(row.get('node_id') or row.get('name','')))

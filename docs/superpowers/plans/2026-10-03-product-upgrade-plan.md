@@ -58,7 +58,7 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 - writing-plans/test-driven-development 技能当前未提供，采用本清单与 unittest 失败先行作为明确替代，不安装未知技能或依赖。
 - 真实用户历史与 Downloads 安装不作测试 fixture。实验仅使用 TemporaryDirectory/ignored dist 路径。
 - A 核心验收：见 ../reports/2026-10-03-origins-and-task-foundations.md。本机 40/40 运行节点来源 verified，worker 定义复核 40/40；A 完成时三种 Windows Python 全量 586 tests，OK (skipped=6)。
-- B1 已实现模式配置/候选纯函数、CLI/Web 共享限制，计时模块已通过 fixture 但尚未接生产计时。历史提示与完整目标排序尚未接入，故整项不勾选。
+- B1 已实现模式配置/候选纯函数、CLI/Web 共享限制和生产计时。下载目标已接同强身份近 7 天成功带宽的只读提示（每任务一次、250ms预算），不复制为当前成绩；完整目标策略和全部计时覆盖仍待验收，故整项不勾选。
 - B2 已接 subprocess/HTTP/SSE/前端续接，单一所有权、seq、snapshot/resync、终态与并发请求通过本机 fixture；勾选不代表六格 CI 已执行。
 - B3 已接新模式动态队列/限定 IP 范围/带宽串行；修复 --no-ip 混合成功遗漏、worker 启动失败丢失主探测数据。新模式全生命周期取消/部分结果保存尚待 B4/B5 验收，不勾选。
 - B4/B5 已接独立出口发布、任务历史与实际字节，仍需全部阶段清理与迁移验收；B6/B7、C/D 尚未完整完成。此前检查点见 ../reports/2026-10-03-jobs-and-shared-ui.md；不构成真实耗时提速结论。

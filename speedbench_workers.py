@@ -1249,11 +1249,25 @@ def choose_task_nodes(results, args):
     if not config.bandwidth:
         return []
     from speedbench_tasks import select_candidates
+    if not hasattr(args, '_candidate_history'):
+        from speedbench_db import candidate_history_hints
+        ids = [(r.origin or {}).get('node_id') for r in results
+               if (r.origin or {}).get('identity_strength') == 'strong']
+        history = getattr(args, 'history', None)
+        args._candidate_history = (candidate_history_hints(Path(history).with_suffix('.db'), ids)
+                                   if history and ids and not config.measure_all else {})
     by_name = {r.name:r for r in results}
-    rows = [dict(name=r.name, latency_ms=r.latency_ms,
-                 node_id=(r.origin or {}).get('node_id',''),
-                 subscription_ids=(r.origin or {}).get('subscription_ids',[]),
-                 region=r.ip.country_code if r.ip and r.ip.ok else None) for r in results]
+    rows = []
+    for r in results:
+        origin = r.origin or {}
+        strong = origin.get('identity_strength') == 'strong'
+        hint = args._candidate_history.get(origin.get('node_id'), {}) if strong else {}
+        row = dict(name=r.name, latency_ms=r.latency_ms, node_id=origin.get('node_id',''),
+                   identity_strength=origin.get('identity_strength'),
+                   subscription_ids=origin.get('subscription_ids',[]),
+                   recent_mbps=hint.get('recent_mbps'), history_age_days=hint.get('history_age_days'),
+                   region=r.ip.country_code if r.ip and r.ip.ok else hint.get('region'))
+        rows.append(row)
     selected = select_candidates(rows, config.top_n, measure_all=config.measure_all,
                                  target_profile=config.target_profile)
     return [by_name[row['name']] for row in selected]

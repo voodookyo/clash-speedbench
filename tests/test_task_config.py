@@ -55,10 +55,10 @@ class TaskConfigTest(unittest.TestCase):
 
 class CandidateSelectionTest(unittest.TestCase):
     def rows(self):
-        return [dict(name='a',node_id='1',latency_ms=10,subscription_ids=['s1'],region='US'),
-                dict(name='b',node_id='2',latency_ms=11,subscription_ids=['s1'],region='US'),
-                dict(name='c',node_id='3',latency_ms=20,subscription_ids=['s2'],region='JP'),
-                dict(name='d',node_id='4',latency_ms=None,subscription_ids=['s3'],region='HK')]
+        return [dict(name='a',node_id='1',identity_strength='strong',latency_ms=10,subscription_ids=['s1'],region='US'),
+                dict(name='b',node_id='2',identity_strength='strong',latency_ms=11,subscription_ids=['s1'],region='US'),
+                dict(name='c',node_id='3',identity_strength='strong',latency_ms=20,subscription_ids=['s2'],region='JP'),
+                dict(name='d',node_id='4',identity_strength='strong',latency_ms=None,subscription_ids=['s3'],region='HK')]
 
     def test_representative_coverage_before_latency_fill(self):
         self.assertEqual([r['name'] for r in select_candidates(self.rows(),2)],['a','c'])
@@ -87,4 +87,9 @@ class CandidateSelectionTest(unittest.TestCase):
     def test_weak_identity_cannot_borrow_auth_history(self):
         rows = self.rows()[:2]
         rows[1].update(node_id='',recent_mbps=200,history_age_days=0)
+        self.assertEqual(select_candidates(rows,1,target_profile='download')[0]['name'],'a')
+
+    def test_weak_id_with_valid_text_still_cannot_borrow_history(self):
+        rows = self.rows()[:2]
+        rows[1].update(identity_strength='weak', recent_mbps=200, history_age_days=0)
         self.assertEqual(select_candidates(rows,1,target_profile='download')[0]['name'],'a')

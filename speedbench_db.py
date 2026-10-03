@@ -829,6 +829,71 @@ def all_runs(db_path) -> list:
         conn.close()
 
 
+def candidate_history_hints(db_path, node_ids, *, now=None) -> dict:
+    """Bounded read-only hints for this task's strong stable-ID scope.
+
+    Never creates/migrates a database, imports raw history, matches a name or
+    returns a previous measurement as a present result. Missing/old/busy
+    databases silently fall back to current probes. Seven-day successful
+    single-stream samples and validated country codes are selection hints
+    only; country/exit reputations may have changed since that observation.
+    """
+    ids = sorted({v for v in list(node_ids)[:3000] if isinstance(v, str)
+                  and re.fullmatch(r'node_v2_[0-9a-f]{32}', v)})
+    if not ids:
+        return {}
+    conn = None
+    hints = {}
+    deadline = time.monotonic() + 0.25
+    observed_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    try:
+        path = Path(db_path)
+        if not path.is_file():
+            return {}
+        conn = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.05)
+        conn.execute('PRAGMA query_only=ON')
+        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        # One indexed lookup per ID, limited to the newest usable bandwidth
+        # observation. A newer probe-only or failed run is not a speed sample.
+        sql = '''SELECT n.median_mbps,r.ts,
+                 (SELECT p.country_code FROM ip_profiles p
+                  WHERE p.node_result_id=n.id AND p.ok=1 ORDER BY p.id DESC LIMIT 1)
+                 FROM node_results n JOIN runs r ON r.id=n.run_id
+                 WHERE n.node_id=? AND n.identity_version=2
+                 AND n.identity_strength='strong' AND n.status='ok'
+                 AND n.median_mbps>0 ORDER BY n.id DESC LIMIT 1'''
+        for node_id in ids:
+            if time.monotonic() >= deadline:
+                # Do not bias a large task towards the first sorted IDs when
+                # its optional history budget expires halfway through.
+                return {}
+            row = conn.execute(sql, (node_id,)).fetchone()
+            if not row:
+                continue
+            speed, stamp, region = row
+            try:
+                date = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+                # Historical CLI timestamps without an offset are local time.
+                age = (observed_now - date.astimezone(timezone.utc)).total_seconds() / 86400
+                if (not isinstance(speed, (int, float)) or not math.isfinite(speed)
+                        or speed <= 0 or not 0 <= age <= 7):
+                    continue
+            except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+                continue
+            hint = dict(recent_mbps=speed, history_age_days=age)
+            if isinstance(region, str) and re.fullmatch(r'[A-Z]{2}', region):
+                hint['region'] = region
+            hints[node_id] = hint
+    except (sqlite3.Error, OSError, ValueError):
+        # Optional enrichment cannot make a task fail or leak a local path,
+        # corrupt database content, credentials or raw exception in logs.
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+    return hints
+
+
 def node_series(db_path, name: str, days: int = 30, node_key: str = "", node_id: str = "") -> list:
     """某节点最近 days 天逐次测速序列（时间升序）。
 
