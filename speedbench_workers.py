@@ -936,6 +936,39 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+class _WorkerDirectory:
+    """Explicitly-owned private config; never GC-delete beneath a live process.
+
+    Unlike TemporaryDirectory, finalization cannot silently remove a config
+    after process reaping failed. Worker.stop remains the sole cleanup owner.
+    A failed cleanup keeps the exact private directory for an explicit retry.
+    """
+    def __init__(self):
+        self.name=tempfile.mkdtemp(prefix='speedbench-worker-')
+
+    def cleanup(self):
+        if os.path.lexists(self.name):shutil.rmtree(self.name)
+
+
+def stop_workers(registered) -> None:
+    """Stop this registry concurrently, join every attempt, then report failure.
+
+    At most the configured maximum 16 workers are reaped concurrently. Their
+    existing 3s terminate + 3s kill waits overlap rather than accumulate per
+    process. This is not a hard deadline for OS calls or filesystem cleanup.
+    No detached cleanup threads, global process lookup, or name-based killing.
+    """
+    unique={id(worker):worker for worker in registered}
+    if not unique:return
+    failed=False
+    with ThreadPoolExecutor(max_workers=min(16,len(unique))) as cleanup:
+        pending=[cleanup.submit(worker.stop) for worker in unique.values()]
+        for future in pending:
+            try:future.result()
+            except Exception:failed=True
+    if failed:raise WorkerCleanupError('Registered temporary worker cleanup incomplete') from None
+
+
 class Worker:
     """One throwaway mihomo process: mixed-port + tiny external controller."""
 
@@ -946,7 +979,7 @@ class Worker:
         self.hosts = hosts
         self.iface = iface
         self.proc: Optional[subprocess.Popen] = None
-        self.dir: Optional[tempfile.TemporaryDirectory] = None
+        self.dir: Optional[_WorkerDirectory] = None
         self.api: Optional[MihomoAPI] = None
         self.proxy_url = ""
         # stop() 幂等保护：中断路径（run_pool 的 worker 注册表统一清理）与
@@ -975,7 +1008,7 @@ class Worker:
             raise
 
     def _initialize_unlocked(self) -> Tuple[float, int]:
-        self.dir = tempfile.TemporaryDirectory(prefix="speedbench-worker-")
+        self.dir = _WorkerDirectory()
         mix_port = _free_port()
         ctl_port = _free_port()
         while ctl_port == mix_port:
@@ -1537,11 +1570,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         def stop_live_workers() -> None:
             with workers_lock:
                 ws = list(live_workers)
-            for w in ws:
-                try:
-                    w.stop()  # Worker.stop 幂等，与 shard_loop 的 finally 不冲突
-                except Exception:
-                    pass
+            stop_workers(ws)  # Idempotent; independent waits overlap, failures are not swallowed.
 
         def shard_loop(shard: List[dict]) -> None:
             if cancelled():
@@ -1629,7 +1658,14 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
             stop_live_workers()
             raise
         finally:
-            pool.shutdown(wait=True)
+            try:
+                pool.shutdown(wait=True)
+            finally:
+                # Guarded dynamic shards can fail independently. Reconcile
+                # every registered resource, including failed start/stop,
+                # before proceeding to Phase 2 or claiming a finished task.
+                with measure(args,'cleanup'):
+                    stop_live_workers()
         if dynamic:
             existing = {r.name for r in results}
             for p in ip_pending:

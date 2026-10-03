@@ -384,6 +384,7 @@ $env:MIHOMO_SECRET = '你的secret'
 - **仅串行模式**（`--workers 1` 或并发不可用时的回退）会临时切主实例到 GLOBAL 模式，全网流量跟着被测节点走；别在视频会议/游戏时跑。结束或 Ctrl+C 后自动恢复。两阶段模式全程不碰你正在用的 Clash。
 - **流量消耗**：全量 ≈ Phase 2 节点数 × 样本大小 × `--rounds`（自适应 10~95MB），默认 Top 15 约 0.5~1.4 GiB；`--all` 精测全量会大很多。粗筛阶段只走小流量探测，可忽略。
 - **探测失败率定义**：`probe_loss_pct` 是 HTTP/HTTPS application-level probe failure rate（应用层探测失败率），不是 ICMP 层真实 packet loss，也不等于物理链路丢包率。延迟/jitter 只按成功样本计算；全部失败时显示 N/A。
+- **清理失败（开发版）**：中断时仅按本任务登记的 worker 句柄并发清理（最多 16 路），不按进程名杀 Mihomo。每个 worker 原有 terminate/kill 等待重叠，不再逐个累加；这不是操作系统／文件删除的硬总时限承诺。只有确认进程退出才显式删除临时配置，GC 不自动删除仍可能使用的配置。若清理仍失败，CLI 返回专用退出码 3，不回退串行；后端保留已接收的部分任务结果并标记 failed，而不是“取消成功”。同一后端阻止新任务和目录修改，请退出并先核对该任务残留资源，不要按进程名批量结束用户 Clash 或广泛删除临时目录。失败后直接 CLI 的自动部分历史报告、全阶段取消预算仍待完善。
 - **评分**：100 Mbps 仍是单流带宽满分标尺；Network Score 由单流/多流、延迟、jitter、TCP/TLS connect 和 probe success 组成。IP Quality Score 可用时 Overall 按 Network 80% + IP Quality 20%，数据缺失时按剩余有效维度重新归一化；未知 IP 不会得到 100 分。
 - **双栈边界**：节点支持 IPv6 与客户端真实 IPv6 是否绕过代理是两件事。每节点分别记录出口 IPv4/IPv6；双栈国家/ASN 不一致只是出口画像提示，只有「环境泄漏检测」页面才判断当前客户端是否绕过。
 - **IP 画像与配额**：未禁用且无 Key 时使用 ip-api 免费基础画像；第三方 provider 可能受账户套餐、配额、限速和 TTL 影响，缺失字段保持未知，不把缺失解释为 false。

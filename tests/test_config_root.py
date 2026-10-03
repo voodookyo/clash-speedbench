@@ -126,6 +126,11 @@ class ConfigRootApiTest(WebServerCase):
         code,raw=self.post_authorized('/api/config-root',{'root':str(self.root)})
         self.assertEqual(code,409);self.assertEqual(web.CONFIG_ROOT.snapshot(),('',0))
 
+    def test_unconfirmed_cleanup_blocks_root_changes_even_when_child_has_exited(self):
+        self.set_state(running=False,cleanup_incomplete=True)
+        self.assertEqual(self.post_authorized('/api/config-root',{'root':str(self.root)})[0],409)
+        self.assertEqual(web.CONFIG_ROOT.snapshot(),('',0))
+
     def test_catalog_uses_selected_runtime_but_public_response_never_contains_path_or_config(self):
         web.CONFIG_ROOT.apply(str(self.root))
         api=mock.Mock(controller_base='http://127.0.0.1:19997')

@@ -30,6 +30,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from clash_speedbench import (  # noqa: E402
+    CLEANUP_FAILED_EXIT,
     build_selectable_graph,
     connect_controller as core_connect_controller,
     pick_switch_group,
@@ -82,6 +83,7 @@ def db_path() -> Path:
 
 STATE = {
     "running": False,
+    "cleanup_incomplete": False,
     "lines": [],
     "started": None,
     "exit_code": None,
@@ -538,7 +540,12 @@ def run_benchmark(params: dict) -> None:
             with STATE_LOCK:
                 cancelled = STATE.get('cancel_requested',False)
                 exit_code = STATE['exit_code']
-            if cancelled:
+            if exit_code == CLEANUP_FAILED_EXIT:
+                with STATE_LOCK:
+                    STATE['cleanup_incomplete']=True
+                    STATE['lines'].append('!! 临时 worker 清理未完成；保留部分结果，任务标记失败，不能确认取消成功。')
+                JOBS.transition(job_id,'failed')
+            elif cancelled:
                 JOBS.transition(job_id,'cancelling')
                 JOBS.transition(job_id,'cancelled')
             elif exit_code == 0 and JOBS.snapshot(job_id)['status']=='finalizing':
@@ -1096,7 +1103,7 @@ class Handler(BaseHTTPRequestHandler):
                 if path.endswith('/preview'):
                     self._json(dict(ok=True,path=root or None,mode='custom' if root else 'auto',connection_verified=False));return
                 with STATE_LOCK:
-                    if STATE['running'] or (DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set()):
+                    if STATE['running'] or STATE.get('cleanup_incomplete',False) or (DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set()):
                         self._json({'ok':False,'msg':'任务或清理仍在进行，不能更改配置目录'},409);return
                     choice=CONFIG_ROOT.apply(root)
                 self._json(dict(ok=True,**choice))
@@ -1111,7 +1118,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({'ok':False,'msg':'客户端正在退出，不能开始新任务'},409);return
             with STATE_LOCK:
                 busy = STATE["running"]
+                cleanup_incomplete=STATE.get('cleanup_incomplete',False)
                 root,root_revision=CONFIG_ROOT.snapshot()
+            if cleanup_incomplete:
+                self._reject('此前 worker 清理未完成；请退出并核对本任务残留资源后再重新启动，不会强行继续测速',409)
+                return
             if busy:
                 self._reject("已有测速任务进行中", 409)
                 return
@@ -1135,6 +1146,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({'ok':False,'msg':'客户端正在退出，不能开始新任务'},409);return
                 if STATE['running']:
                     self._reject('已有测速任务进行中',409)
+                    return
+                if STATE.get('cleanup_incomplete',False):
+                    self._reject('此前 worker 清理未完成；不能接受新任务',409)
                     return
                 try:
                     config = speedbench_tasks.resolve_config({k:v for k,v in params.items()

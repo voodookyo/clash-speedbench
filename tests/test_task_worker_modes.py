@@ -36,6 +36,40 @@ class TaskWorkerModeTest(unittest.TestCase):
         self.assertFalse(any(c[0]=='speed' for c in calls))
         self.assertTrue(all(r.sample_mb is None for r in results))
 
+    def test_dynamic_shard_cannot_swallow_persistent_cleanup_failure(self):
+        worker=mock.Mock();worker.stop.side_effect=workers.WorkerCleanupError('CANARY config')
+        with ExitStack() as stack:
+            for name,value in [('find_mihomo_bin','fake'),('extract_proxies',fixtures.RunPoolMainApiTest.PROXIES),
+                               ('physical_interface','en0'),('build_hosts',{}),
+                               ('probe_latency_pool',{'A':(100,1),'B':(200,2)})]:
+                stack.enter_context(mock.patch.object(workers,name,return_value=value))
+            stack.enter_context(mock.patch.object(workers,'Worker',return_value=worker))
+            stack.enter_context(mock.patch.object(workers,'_probe_node_in_worker',side_effect=lambda w,n,p,a,l,j:
+                core.Result(name=n,provider='',proto=p,latency_ms=l,speeds_mbps=[],median_mbps=None,best_mbps=None,status='ok')))
+            download=stack.enter_context(mock.patch.object(workers,'_speed_node_in_worker'))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            with self.assertRaises(workers.WorkerCleanupError) as caught:
+                workers.run_pool(['A','B'],{},self.args('quick'),main_api=mock.Mock())
+        self.assertNotIn('CANARY',str(caught.exception));download.assert_not_called()
+
+    def test_cli_reports_cleanup_failure_without_serial_fallback_or_raw_details(self):
+        import tempfile
+        import os
+        from pathlib import Path
+        api=mock.Mock();api.get.side_effect=lambda path:{'proxies':{'node':{'type':'ss'}}} if path=='/proxies' else {}
+        with tempfile.TemporaryDirectory() as folder,ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ,{},clear=True))
+            stack.enter_context(mock.patch('sys.argv',['clash_speedbench.py','--workers','2','--yes','--history',str(Path(folder)/'h.jsonl')]))
+            stack.enter_context(mock.patch.object(core,'connect_controller',return_value=api))
+            stack.enter_context(mock.patch.object(core,'clear_cancel_request'))
+            stack.enter_context(mock.patch.object(core.signal,'signal'))
+            stack.enter_context(mock.patch.object(core.source_catalog,'discover_catalog',return_value={'nodes':[],'sources':[]}))
+            stack.enter_context(mock.patch.object(workers,'run_pool',side_effect=workers.WorkerCleanupError('CANARY config')))
+            output=io.StringIO();stack.enter_context(redirect_stdout(output))
+            stack.enter_context(mock.patch('sys.stderr',output))
+            self.assertEqual(core.main(),3)
+        self.assertNotIn('CANARY',output.getvalue());self.assertNotIn('回退到串行',output.getvalue());api.patch.assert_not_called()
+
     def test_deep_measures_all_reachable_nodes(self):
         _results,calls,_worker,_stdout = self.run_mock(self.args('deep',top_n=1), {'A':(100,1),'B':(200,2)})
         self.assertEqual([c[1] for c in calls if c[0]=='speed'],['A','B'])

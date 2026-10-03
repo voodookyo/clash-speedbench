@@ -178,3 +178,17 @@ Portable replacement likewise must be done only after exit. Rollback restores
 the old installation after a backup without deleting newer raw history. Never
 run old/new writers simultaneously; legacy source entry remains a fallback,
 not evidence of native platform acceptance.
+
+Registered worker reaping is now bounded to at most 16 concurrent cleanup
+attempts; existing per-process terminate/kill waits overlap instead of summing.
+Every attempt is joined and persistent errors are propagated, including dynamic
+shard failures. OS calls and directory removal do not have a hard total deadline.
+Generated worker directories are explicitly owned: garbage collection cannot
+delete a configuration before its process is confirmed reaped. A failed reap
+leaves private configuration for explicit recovery, never serial fallback.
+CLI exit code 3 denotes incomplete worker cleanup. The backend marks that task
+failed even when cancellation was requested, retains already accepted partial
+results, and refuses new tasks/root changes in that session. Exit and verify
+owned leftover resources before restart; do not kill processes by name or broadly
+delete temp directories. Complete all-phase cancellation and direct CLI partial
+history acceptance remain separate pending gates.

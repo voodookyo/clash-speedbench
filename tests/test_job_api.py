@@ -105,6 +105,23 @@ class JobApiTest(WebServerCase):
         self.assertEqual(web.JOBS.snapshot(job)['status'],'cancelled')
         self.assertFalse(any('启动测速失败' in line for line in web.STATE['lines']))
 
+    def test_cleanup_failure_during_requested_cancel_is_failed_not_successful_cancel(self):
+        job=self.create();self.set_state(running=True,job_id=job,cancel_requested=False)
+        web.JOBS.publish(job,'node_probe',node_id='fixture',payload={'result':{'name':'fixture','latency_ms':12}})
+        proc=mock.Mock(stdout=iter(()));proc.wait.return_value=3
+        def spawn(*args,**kwargs):
+            self.set_state(cancel_requested=True);return proc
+        with mock.patch.object(web,'connect_controller'),mock.patch.object(web,'sync_db'), \
+             mock.patch.object(web.subprocess,'Popen',side_effect=spawn):
+            web.run_benchmark({'mode':'quick','_job_id':job})
+        snapshot=web.JOBS.snapshot(job)
+        self.assertEqual(snapshot['status'],'failed');self.assertTrue(snapshot['partial'])
+        self.assertEqual(len(snapshot['results']),1)
+        self.assertTrue(web.STATE['cleanup_incomplete'])
+        with mock.patch.object(web,'run_benchmark') as run:
+            code,raw=self.post_authorized('/api/jobs',{'mode':'quick'})
+        self.assertEqual(code,409);run.assert_not_called()
+
     def test_cancel_between_preflight_and_popen_is_delivered_to_child(self):
         job = self.create()
         proc = mock.Mock(stdout=iter(()))

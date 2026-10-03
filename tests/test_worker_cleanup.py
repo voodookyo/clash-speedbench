@@ -1,6 +1,8 @@
 import subprocess
 import sys
 import tempfile
+import threading
+import gc
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -84,3 +86,64 @@ class WorkerCleanupTest(unittest.TestCase):
                 worker.proc.kill()
                 worker.proc.wait(timeout=3)
             worker.dir.cleanup()
+
+    def test_failed_reap_does_not_implicitly_remove_live_configuration_on_gc(self):
+        worker=workers.Worker('fixture',[],{},None)
+        proc=mock.Mock();proc.poll.return_value=None
+        proc.wait.side_effect=subprocess.TimeoutExpired('fixture',3)
+        with mock.patch.object(workers.subprocess,'Popen',return_value=proc):
+            worker._initialize_unlocked()
+        folder=Path(worker.dir.name)
+        try:
+            with self.assertRaises(workers.WorkerCleanupError):worker.stop()
+            del worker;gc.collect()
+            self.assertTrue(folder.exists(),'Unreaped process config must not be removed by object finalization')
+        finally:
+            # Exact fixture-only layout; no recursive deletion or real process.
+            if (folder/'config.json').exists():(folder/'config.json').unlink()
+            if folder.exists():folder.rmdir()
+
+
+class WorkerGroupCleanupTest(unittest.TestCase):
+    def test_all_registered_workers_enter_stop_before_any_wait_finishes(self):
+        count=16;barrier=threading.Barrier(count);stopped=[];lock=threading.Lock()
+        class FixtureWorker:
+            def stop(self):
+                barrier.wait(timeout=2)
+                with lock:stopped.append(self)
+        group=[FixtureWorker() for _ in range(count)]
+        workers.stop_workers(group)
+        self.assertEqual({id(w) for w in group},{id(w) for w in stopped})
+
+    def test_failures_are_collected_after_every_worker_is_attempted_without_raw_error(self):
+        group=[mock.Mock(),mock.Mock(),mock.Mock()]
+        group[0].stop.side_effect=workers.WorkerCleanupError('CANARY private path')
+        group[1].stop.side_effect=PermissionError('CANARY credential')
+        with self.assertRaises(workers.WorkerCleanupError) as caught:workers.stop_workers(group)
+        for worker in group:worker.stop.assert_called_once_with()
+        self.assertNotIn('CANARY',str(caught.exception))
+
+    def test_duplicate_registrations_are_stopped_once_and_empty_group_is_safe(self):
+        worker=mock.Mock();workers.stop_workers([worker,worker]);worker.stop.assert_called_once_with()
+        workers.stop_workers([])
+
+    def test_real_registered_group_reaps_only_owned_handles_and_leaves_other_process_alive(self):
+        group=[];other=None
+        def process():
+            return subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'],
+                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        try:
+            other=process()
+            for _ in range(2):
+                worker=workers.Worker('fixture',[],{},None)
+                worker.dir=workers._WorkerDirectory();group.append(worker);worker.proc=process()
+            directories=[Path(w.dir.name) for w in group]
+            workers.stop_workers(group)
+            self.assertTrue(all(w.proc.poll() is not None for w in group))
+            self.assertTrue(all(not p.exists() for p in directories))
+            self.assertIsNone(other.poll())
+        finally:
+            for proc in [w.proc for w in group]+[other]:
+                if proc is not None and proc.poll() is None:proc.kill();proc.wait(timeout=3)
+            for worker in group:worker.dir.cleanup()

@@ -77,6 +77,7 @@ DEFAULT_CONTROLLERS = tuple(
 )
 DEFAULT_DELAY_URL = "https://cp.cloudflare.com/generate_204"
 DEFAULT_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
+CLEANUP_FAILED_EXIT = 3  # Owned worker cleanup failed; distinct from successful cancellation.
 DEFAULT_IPIFY4_URL = "https://api.ipify.org?format=json"
 DEFAULT_IPIFY6_URL = "https://api6.ipify.org?format=json"
 # ip-api.com 免费端点（仅 HTTP）；每个节点经各自出口 IP 查询，45 次/分钟限制足够
@@ -2088,7 +2089,7 @@ def main() -> int:
 
     if args.workers > 1:
         try:
-            from speedbench_workers import WorkerUnavailable, run_pool
+            from speedbench_workers import WorkerUnavailable, WorkerCleanupError, run_pool
         except ImportError:
             print("错误：缺少 speedbench_workers.py（应与 clash_speedbench.py 同目录）。",
                   file=sys.stderr)
@@ -2127,6 +2128,11 @@ def main() -> int:
         except source_catalog.SourceSelectionChanged as e:
             print(str(e), file=sys.stderr)
             return 1
+        except WorkerCleanupError:
+            # Stable machine-readable failure: never serialize private paths,
+            # retry a measurement in-place, or claim cancellation succeeded.
+            print('临时 worker 清理未完成；已停止后续测速，不会回退串行。',file=sys.stderr)
+            return CLEANUP_FAILED_EXIT
         except WorkerUnavailable as e:
             if args.mode:
                 print(f'隔离 worker 不可用：{e}。新模式不会静默改用全量串行测试。',file=sys.stderr)
