@@ -216,7 +216,8 @@ python3 speedbench_web.py          # 打开 http://127.0.0.1:8950
 
 - **节点视图**：一键开始测速（可设节点过滤/每轮 MB/轮数/自动切换），实时进度和日志，可随时「中断测速」（SIGINT 优雅中断，自动恢复 Clash 配置）；结果表格支持点表头排序（不通沉底）、当前节点高亮、行内一键切换、点击行展开详情（抖动/建连/单·多流/ASN/ISP/出口 IP）
 - **历史视图**：历次测速轮次列表 + 该轮完整结果 + 任意节点 30 天带宽趋势图、出口 IP/ASN 变化时间线和 IP Grade/分类信誉变化（SQLite 历史库 `speedbench-history.db` 支撑）
-- **订阅视图**：按订阅来源（provider）聚合的回顾面板——各订阅的可用率/中位速度/平均分汇总，单订阅逐轮三线趋势（可用率·速度·评分）与最近一轮节点明细；节点凭据变化会用 `node_key`（proto|server|port 哈希）续上历史，失败记录带 `fail_reason` 分类
+- **来源选择（开发版）**：测速前可选择已加载的 Verge 订阅。通过本机 profile 与运行节点的有效连接定义验证来源，不将内核 provider 名直接视为订阅。相同定义属于多个订阅时标为多来源，脚本修改或无法验证时标为未知。未加载订阅不会被自动启用或下载。
+- **订阅历史**：旧 provider 汇总与 `node_key` 入口保留；新来源历史按不透明 `subscription_id` 聚合，新 `node_id` 区分认证/传输/链式依赖。改名不断链，凭据变化产生新身份，不再将不同账号成绩误合并。旧 raw 不回填当前订阅，可用率和测量覆盖率分开计算。
 - **评分 Profile 切换**：综合推荐 / ⚡日常（延迟+抖动优先）/ 🚀下载（单·多流带宽优先）/ 🧼IP（分类、风险、信誉优先）/ 🏠住宅优先；下载 Profile 不受 IP 风险排序干扰；搜索框实时过滤；地区分组榜单 + ⭐ 收藏节点（仅收藏偏好写入 localStorage）
 - **环境泄漏检测 `#/leak`**：检测当前浏览器 + 当前 Clash/TUN + 当前活动节点，独立于离线节点结果；WebRTC 使用浏览器标准 RTCPeerConnection/ICE，识别 host/srflx/prflx/relay 和公网候选。mDNS、隐私策略或 STUN 失败时显示“无法确认”，不会误报“无泄漏”
 - **DNS Guided Audit**：通过按钮打开 BrowserLeaks DNS / DNSLeakTest，由用户人工查看 resolver；不读取系统 DNS、不爬站点 HTML、不自动声称无泄漏。页面提示正常/危险判读并可保存人工结果
@@ -252,6 +253,16 @@ cp -R "dist/Clash SpeedBench.app" /Applications/
 数据（历史/CSV/日志）存放在 `~/Library/Application Support/ClashSpeedBench/`，不污染应用包。
 
 ## 常用参数
+
+开发版增加 `--subscription-id ID`、`--node-id ID`，可重复指定。ID 可从本机面板
+`/api/catalog` 获取；来源仅限当前已加载范围，身份过期会拒绝操作，不隐式切订阅。
+自定义配置可使用已有 `--config-file PATH` 指向本机 Verge 运行配置；该配置声明的
+控制器必须与实际连接一致，否则来源降级为未知。UI 目录选择器仍在后续阶段实现。
+
+新身份使用应用数据目录的私有 `identity-seed` 文件参与 HMAC。它不是 API Key，
+不返回浏览器或进入导出/历史/发布包。POSIX 要求 0600；Windows 检查当前用户
+所有权与受限 ACL。迁移时应连同原配置目录及身份种子备份；种子丢失、配置根目录
+移动或凭据轮换可能产生新身份，旧历史仍保留，不自动合并。不要公开该文件。
 
 | 参数 | 说明 | 默认 |
 |---|---|---|

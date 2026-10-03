@@ -502,6 +502,27 @@ let searchText = '';
 let expandedNode = null;      // 节点视图中展开详情面板的节点（一次只展开一个）
 let pollTimer = null;         // 测速状态轮询：全局单例，切视图不清除
 
+async function loadSourceCatalog(){
+  const select = document.getElementById('f-source');
+  const status = document.getElementById('source-status');
+  if(!select || !status) return;
+  const selected = select.value || '';
+  try{
+    const catalog = await getJSON('/api/catalog');
+    select.innerHTML = '<option value="">全部已加载节点</option>' + (catalog.sources||[]).map(s=>
+      `<option value="${esc(s.subscription_id)}"${s.loaded?'':' disabled'}>${esc(s.name)}${s.loaded?'':' · 未加载/不可用'}</option>`).join('');
+    const valid = (catalog.sources||[]).some(s=>s.loaded && s.subscription_id===selected);
+    if(selected && !valid){
+      select.innerHTML += `<option value="${esc(selected)}" disabled>原选订阅已失效 · 请重新选择</option>`;
+    }
+    select.value = selected;
+    const unknown = (catalog.nodes||[]).filter(n=>n.source_status!=='verified').length;
+    status.textContent = catalog.status==='ok'
+      ? `已核验 ${(catalog.nodes||[]).length} 个节点 · ${unknown} 个来源不唯一/未知。未加载订阅不会自动切换。`
+      : '订阅目录暂不可核验，仍可测速已加载节点；来源不会被猜测填入。';
+  }catch(e){ status.textContent='订阅目录读取失败；请确认 Verge 已运行。'; }
+}
+
 /* ==================== 表格行渲染（节点/历史/订阅三视图复用） ==================== */
 // opts: {readonly, currentNode, favs, expanded, selected, provider, cols}
 function rowHtml(r, i, opts){
@@ -533,7 +554,7 @@ function rowHtml(r, i, opts){
   h += `<td>${tagHtml(r.tags)}</td><td>`;
   if(!ro)
     h += isCur ? '<button class="mini" disabled>使用中</button>'
-               : `<button class="mini sw" data-name="${esc(r.name)}">切换</button>`;
+               : `<button class="mini sw" data-name="${esc(r.name)}" data-node-id="${esc(r.node_id||'')}">切换</button>`;
   h += '</td></tr>';
   if(opts.expanded) h += detailHtml(r, opts.cols||8);
   return h;
@@ -1087,6 +1108,8 @@ async function startRun(){
     rounds: +document.getElementById('f-rounds').value,
     auto_switch: document.getElementById('f-autoswitch').checked,
   };
+  const source = document.getElementById('f-source');
+  if(source && source.value) body.subscription_ids = [source.value];
   let r;
   try{ r = await post('/api/run', body); }
   catch(e){ toast('启动请求失败', false); return; }
@@ -1142,10 +1165,10 @@ function cancelRun(){
 async function switchNode(name, btn){
   if(btn){ btn.disabled = true; btn.textContent = '切换中…'; }
   let r;
-  try{ r = await post('/api/switch', {name}); }
+  try{ r = await post('/api/switch', btn && btn.dataset && btn.dataset.nodeId ? {node_id:btn.dataset.nodeId} : {name}); }
   catch(e){ toast('切换请求失败', false); renderTable(); return; }
   if(r.ok){
-    currentNode = name;
+    currentNode = r.now || name;
     if(r.group) currentGroup = r.group;
     toast(r.msg || `已切换 → ${name}`);
     renderMeta();
@@ -1384,6 +1407,8 @@ function route(){
 
 /* ==================== 事件绑定（全部 addEventListener/委托） ==================== */
 function init(){
+  const sourceRefresh = document.getElementById('btn-source-refresh');
+  if(sourceRefresh) sourceRefresh.addEventListener('click',loadSourceCatalog);
   // 节点表格：事件委托；节点名一律走 dataset（HTML 属性经 esc 转义），绝不拼接进 JS 源码
   document.getElementById('tbody').addEventListener('click', e=>{
     const fv = e.target.closest('.fav');
@@ -1508,6 +1533,7 @@ function boot(){
   renderTable();      // latestData=null → 骨架屏，loadLatest 完成后替换
   updateSortArrows('th.sort', sortKey, sortAsc);
   loadLatest(); loadCurrent();
+  loadSourceCatalog();
   resumeRun();        // 接管进行中的测速（若有）：恢复运行态 UI 并启动轮询
 }
 boot();
