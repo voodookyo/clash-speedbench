@@ -221,6 +221,7 @@ with BackendLease(history.parent) as lease:
     assert record['results'][0]['median_mbps']==30.0 and record['results'][0]['ip_quality_score'] is None
     task=web.speedbench_db.task_snapshot(web.db_path(),job)
     assert task['status']=='failed' and task['partial'] and task['results'][0]['median_mbps']==30.0
+    assert 'cleanup_complete' not in task['milestones']
     assert task['results'][0]['download_bytes']==250000
     assert task['metrics']['download']['attempts']==1 and task['metrics']['download']['successes']==1
     assert task['metrics']['download']['bytes']==250000 and task['metrics']['summary']['duration_ms']>=0
@@ -288,6 +289,8 @@ with BackendLease(history.parent) as lease:
     assert expected['status']=='partial' and expected['loss_pct']==50
     task=web.speedbench_db.task_snapshot(web.db_path(),job)
     assert task['status']=='cancelled' and task['partial'] and len(task['results'])==1
+    assert 'first_result' in task['milestones'] and 'cleanup_complete' in task['milestones']
+    assert 'network_complete' not in task['milestones'] and 'intelligence_complete' not in task['milestones']
     assert task['results'][0]['probe_sources']['serial']==expected
     assert task['metrics']['delay']['attempts']==3 and task['metrics']['delay']['successes']==1
     assert task['metrics']['summary']['duration_ms']>=0 and task['run_id'] is not None
@@ -301,6 +304,90 @@ with BackendLease(history.parent):pass
     result=subprocess.run([str(root/'runtime/python.exe'),'-B','-E','-s','-c',program,child],
         cwd=root/'app',env=env,capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
     if result.returncode!=0:raise ValueError('Bundled cancelled probe JSONL/SQLite fixture failed')
+
+
+def verify_cli_intel_metrics(root,data):
+    """Real bundled coordinator/cache/provider and reports, fake transport only."""
+    fixture=data/'intel-metrics-fixture';fixture.mkdir()
+    child='''
+import sys
+sys.path.insert(0,sys.argv.pop(1))
+import clash_speedbench as core
+from speedbench_ip_intel import IpqsProvider
+from speedbench_progress import publish_result,milestone
+calls=[]
+def transport(*args,**kwargs):
+    calls.append(1)
+    return {'success':True,'fraud_score':4,'proxy':False,'vpn':False,'tor':False,'recent_abuse':False}
+def execute(args,config):
+    provider=IpqsProvider(key='CANARY-private-key',transport=transport)
+    core.make_default_providers=lambda **kwargs:[provider]
+    rows=[core.Result(name=name,provider='',proto='ss',latency_ms=20,
+        speeds_mbps=[30.0],median_mbps=30.0,best_mbps=30.0,status='ok',
+        exit_ipv4='192.0.2.14',measurement_scope={'bandwidth':'completed'}) for name in ('A','B')]
+    for row in rows:publish_result(args,'node_measurement',row,phase_name='measuring')
+    milestone(args,'network_complete')
+    for _ in range(2):
+        enricher=core.start_intelligence_enrichment(rows,args)
+        assert enricher is not None
+        with core.measure(args,'provider_wait'):
+            core.finish_intelligence_enrichment(enricher,rows)
+    assert calls==[1]
+    milestone(args,'intelligence_complete')
+    return core.report(rows,args,None,{})
+core._execute_benchmark=execute
+raise SystemExit(core.main())
+'''
+    program='''
+import os,sys,json,sqlite3,math
+from pathlib import Path
+from contextlib import closing
+import speedbench_web as web
+from speedbench_owner import BackendLease
+from speedbench_tasks import resolve_config
+history=Path(os.environ['SPEEDBENCH_HOME'])/'speedbench-history.jsonl'
+original=b'{"ts":"fixture-original", "results": []}\\n'
+history.write_bytes(original)
+job=web.JOBS.create(resolve_config())
+with BackendLease(history.parent) as lease:
+    web.DATA_OWNER=lease;web.HISTORY=history
+    web.connect_controller=lambda *args,**kwargs:None
+    web.benchmark_command=lambda params:[sys.executable,'-B','-E','-s','-u','-c',sys.argv[1],str(Path(web.SCRIPT).parent),
+        '--yes','--history',str(history),'--output',str(history.parent/'result.csv')]
+    web.run_benchmark({'_job_id':job})
+    assert web.STATE['exit_code']==0 and not web.STATE['running'] and not web.STATE['cleanup_incomplete']
+    assert history.read_bytes().startswith(original)
+    rows=history.read_text(encoding='utf-8').splitlines();assert len(rows)==2
+    task=web.speedbench_db.task_snapshot(web.db_path(),job)
+    assert task['status']=='completed' and not task['partial'] and len(task['results'])==2
+    assert task['run_id'] is not None
+    milestones=task['milestones']
+    expected=('first_result','first_recommendation','network_complete','intelligence_complete','cleanup_complete')
+    assert set(milestones)==set(expected)
+    assert all(math.isfinite(milestones[key]) and milestones[key]>=0 for key in expected)
+    assert [milestones[key] for key in expected]==sorted(milestones.values())
+    assert web.JOBS.snapshot(job)['milestones']==milestones
+    metrics=task['metrics']
+    assert metrics['provider']['attempts']==1 and metrics['provider']['successes']==1
+    assert metrics['provider']['counters']['api_calls']==1 and metrics['provider']['counters']['usable_results']==1
+    assert metrics['intel_cache']['counters']['unique_ips']==2
+    assert metrics['intel_cache']['counters']['cache_hits']==1 and metrics['intel_cache']['counters']['cache_writes']==1
+    assert metrics['provider_wait']['duration_ms']>=0
+    assert 'CANARY-private-key' not in json.dumps(task) and 'CANARY-private-key' not in str(web.STATE['lines'])
+    assert 'CANARY-private-key' not in history.read_text(encoding='utf-8')
+    assert 'CANARY-private-key' not in (history.parent/'result.csv').read_text(encoding='utf-8-sig')
+    with closing(sqlite3.connect(web.db_path())) as connection:
+        assert [r[0] for r in connection.execute('SELECT raw FROM runs ORDER BY id')]==rows
+        assert 'CANARY-private-key' not in repr(connection.execute('SELECT * FROM ip_intel_cache').fetchall())
+web.DATA_OWNER=None
+with BackendLease(history.parent):pass
+'''
+    env=dict(os.environ,SPEEDBENCH_HOME=str(fixture),PATH=str(Path(os.environ['SystemRoot'])/'System32'))
+    for key in list(env):
+        if key.startswith(('SPEEDBENCH_IP','SPEEDBENCH_SCAMALYTICS')) or key=='SPEEDBENCH_VERGE_ROOT':env.pop(key)
+    result=subprocess.run([str(root/'runtime/python.exe'),'-B','-E','-s','-c',program,child],
+        cwd=root/'app',env=env,capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode!=0:raise ValueError('Bundled CLI intelligence/cache/milestone fixture failed')
 
 
 def verify(package):
@@ -324,13 +411,14 @@ def verify(package):
         verify_cli_ownership(root,data)
         verify_cli_partial(root,data)
         verify_cli_probe_partial(root,data)
+        verify_cli_intel_metrics(root,data)
         if history.read_bytes()!=raw:raise ValueError('Original fixture raw changed during packaged lifecycle')
         # An attacker-updated side manifest cannot authorize modified source.
         source=root/'app/speedbench_desktop.py';source.write_bytes(source.read_bytes()+b'\n# fixture tamper\n')
         manifest['files']['app/speedbench_desktop.py']=digest(source)
         (root/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
         if native_check()==0:raise ValueError('Mutable side manifest bypassed native integrity anchor')
-    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, failed download and cancelled per-sample probe JSONL/SQLite/task retention and observed metrics, original raw retained. Native window/tray acceptance not included.')
+    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, failed download and cancelled per-sample probe JSONL/SQLite/task retention and observed metrics, actual intelligence coordinator/cache with fake API, five persisted milestones, original raw retained. Native window/tray acceptance not included.')
 
 
 if __name__=='__main__':

@@ -248,3 +248,25 @@ guarantee a hard total cancellation deadline. The portable-package fixture
 also exercises the actual bundled probe primitive with synthetic values and
 an interrupt, checking cancelled partial JSONL/SQLite/task metrics, raw-history
 preservation and ownership release without contacting Clash or third parties.
+
+Task snapshots and history details now preserve numeric-only provider/cache
+counters and five first-observed, parent-monotonic milestones. Actual transport
+invocations count as API attempts; HTTP 2xx is not usable intelligence or clean
+reputation. Key-missing/disabled/cooldown skips do not spend a counted API call.
+Adapter signatures are selected before invocation; a body TypeError does not
+retry paid I/O. Cache hits/misses count physical lookups, including the race
+recheck; unique exit tasks and single-flight reuse are separate counters. Worker
+count is cumulative ready starts, not peak concurrency. Provider service time
+and final provider_wait overlap other work and cannot be added as elapsed time.
+
+Milestones cover first result, first usable recommendation candidate in measured
+scope/current target, network completion, intelligence completion and confirmed
+cleanup. They are not a new ranking or a global fastest-node claim. Unreached
+milestones remain absent/N/A; failed cleanup does not get a completion marker.
+The existing task_metrics counters_json also holds a milestones phase row;
+no schema change or runs.raw rewrite occurs, and stale checkpoints cannot drop
+or overwrite first observations. The packaged fixture runs the real coordinator,
+cache, provider parser and report through backend-to-CLI delegation with a fake
+transport: two nodes/same exit, cold then hot cache, one API call, persisted
+milestones and no canary Key in public state/history/cache/CSV. It does not
+exercise native GUI lifecycle, real bandwidth performance or paid APIs.

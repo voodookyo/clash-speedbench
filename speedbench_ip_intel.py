@@ -20,6 +20,7 @@ request should use the local network or another controlled route.
 from __future__ import annotations
 
 import ipaddress
+import inspect
 import json
 import os
 import re
@@ -532,6 +533,32 @@ def _urllib_transport(url: str, timeout: float = 8.0,
 Transport = Callable[..., Any]
 
 
+def _invoke_compatible(function, variants, on_invoke=None):
+    """Select a legacy adapter signature before I/O, never retry its body."""
+    try:signature=inspect.signature(function)
+    except (TypeError,ValueError):signature=None
+    if signature is not None:
+        for args,kwargs in variants:
+            try:signature.bind(*args,**kwargs)
+            except TypeError:continue
+            if on_invoke is not None:on_invoke()
+            return function(*args,**kwargs)
+        raise TypeError('Unsupported callable signature')
+    # Opaque callables must obey the canonical contract. A TypeError after
+    # entering them is not proof that another paid request is safe.
+    args,kwargs=variants[0]
+    if on_invoke is not None:on_invoke()
+    return function(*args,**kwargs)
+
+
+def _observe(observer,phase,*,duration_ms=0,attempts=0,successes=0,counters=None):
+    """Optional numeric-only observation; no address, URL, error or credential."""
+    if not callable(observer):return
+    try:observer(phase,dict(duration_ms=duration_ms,attempts=attempts,successes=successes,
+        bytes=0,counters=dict(counters or {})))
+    except Exception:pass # Optional telemetry must not disable intelligence.
+
+
 class IpIntelProvider:
     """Small provider interface; subclasses only parse their official API."""
 
@@ -547,6 +574,7 @@ class IpIntelProvider:
         self._secrets: Tuple[str, ...] = ()
         self._cooldown_lock = threading.RLock()
         self._cooldown_until = 0.0
+        self.observer = None
 
     def configured_status(self) -> str:
         return "ok"
@@ -609,19 +637,16 @@ class IpIntelProvider:
         )
 
     def _request(self, url: str) -> _TransportResponse:
+        started=time.monotonic();response=None;invoked=False
+        def mark_invoked():
+            nonlocal invoked
+            invoked=True
         try:
-            # The common keyword form is convenient for test fakes.  The two
-            # fallbacks keep compatibility with tiny ``lambda url`` mocks.
-            try:
-                response = self.transport(url, timeout=self.timeout,
-                                           headers={"Accept": "application/json"})
-            except TypeError:
-                try:
-                    response = self.transport(url, self.timeout,
-                                              {"Accept": "application/json"})
-                except TypeError:
-                    response = self.transport(url)
-            return _coerce_transport_response(response)
+            headers={"Accept":"application/json"}
+            raw=_invoke_compatible(self.transport,[((url,),dict(timeout=self.timeout,headers=headers)),
+                ((url,self.timeout,headers),{}),((url,),{})],on_invoke=mark_invoked)
+            response=_coerce_transport_response(raw)
+            return response
         except _ProviderFailure:
             raise
         except (TimeoutError, socket.timeout) as exc:
@@ -638,6 +663,10 @@ class IpIntelProvider:
             if exc.__class__.__name__ in {"TimeoutExpired", "ReadTimeout"}:
                 raise _ProviderFailure("timeout", "timeout")
             raise _ProviderFailure("error", _sanitize_error(exc, self._secrets), None)
+        finally:
+            _observe(self.observer,'provider',duration_ms=max(0,time.monotonic()-started)*1000,
+                attempts=int(invoked),successes=int(response is not None and 200<=response.status_code<300),
+                counters={'api_calls':int(invoked)})
 
     def _failure(self, ip: str, status: str, detail: str = "error",
                  http_status: Optional[int] = None, raw: Any = None) -> ProviderResult:
@@ -652,6 +681,16 @@ class IpIntelProvider:
         )
 
     def query(self, ip: str) -> ProviderResult:
+        result=self._query(ip)
+        counter={'ok':'usable_results','timeout':'timeouts','key_missing':'key_missing',
+            'disabled':'disabled','quota_unavailable':'quota_unavailable','rate_limited':'rate_limited',
+            'invalid_response':'invalid_responses'}.get(result.status)
+        counters={counter:1} if counter else {}
+        if result.error=='provider_cooldown':counters['cooldown_skips']=1
+        _observe(self.observer,'provider',counters=counters)
+        return result
+
+    def _query(self, ip: str) -> ProviderResult:
         normalized_ip = _valid_ip(ip)
         if not normalized_ip:
             return self._failure(str(ip or ""), "invalid_response", "invalid_ip")
@@ -1085,11 +1124,12 @@ class IpIntelCache:
                  basic_ttl: int = BASIC_TTL_SECONDS,
                  risk_ttl: int = RISK_TTL_SECONDS,
                  clock: Callable[[], float] = _now,
-                 secrets: Optional[Iterable[str]] = None) -> None:
+                 secrets: Optional[Iterable[str]] = None, observer=None) -> None:
         self.db_path = str(db_path)
         self.basic_ttl = max(1, int(basic_ttl))
         self.risk_ttl = max(1, int(risk_ttl))
         self.clock = clock
+        self.observer = observer
         # Passing secrets explicitly is useful for a web process that keeps
         # credentials only in memory.  The environment fallback also protects
         # callers that construct the cache directly; values are never written
@@ -1176,6 +1216,7 @@ class IpIntelCache:
 
     def put(self, result: ProviderResult, ttl: Optional[int] = None,
             now: Optional[float] = None) -> ProviderResult:
+        started=time.monotonic();written=False
         current = self.clock() if now is None else float(now)
         ttl_value = self.ttl_seconds(result.provider) if ttl is None else max(1, int(ttl))
         fetched = float(result.fetched_at or current)
@@ -1202,9 +1243,12 @@ class IpIntelCache:
                     (result.provider, result.ip, fetched, expires, raw_json, normalized_json),
                 )
                 conn.commit()
+                written=True
             finally:
                 if conn is not self._memory_connection:
                     conn.close()
+                _observe(self.observer,'intel_cache',duration_ms=max(0,time.monotonic()-started)*1000,
+                    counters={'cache_writes':int(written),'cache_errors':int(not written)})
         return ProviderResult(
             provider=result.provider,
             ip=result.ip,
@@ -1269,7 +1313,7 @@ class IpIntelCache:
                     status="disabled",
                     error="disabled",
                 )
-        cached = None if provider_disabled else self.get(name, normalized_ip, now=now)
+        cached = None if provider_disabled else self._lookup(name, normalized_ip, now)
         if cached is not None:
             return cached
 
@@ -1282,7 +1326,12 @@ class IpIntelCache:
                 self._flights[key] = flight
         assert flight is not None
         if not owner:
-            flight.event.wait()
+            started=time.monotonic()
+            try:flight.event.wait()
+            finally:
+                _observe(self.observer,'intel_cache_wait',duration_ms=max(0,time.monotonic()-started)*1000,
+                    attempts=1,successes=int(flight.result is not None),
+                    counters={'singleflight_reuses':int(flight.result is not None)})
             if flight.result is not None:
                 return flight.result
             # Owner should always publish a result, but a defensive retry is
@@ -1292,7 +1341,7 @@ class IpIntelCache:
         try:
             # A second lookup closes the race where another process/thread
             # populated SQLite after the first lookup.
-            cached = None if provider_disabled else self.get(name, normalized_ip, now=now)
+            cached = None if provider_disabled else self._lookup(name, normalized_ip, now)
             if cached is not None:
                 result = cached
             else:
@@ -1303,10 +1352,7 @@ class IpIntelCache:
                     result = self._error_result(name, normalized_ip, "error", "missing_query")
                 else:
                     try:
-                        try:
-                            result = callable_query(normalized_ip)
-                        except TypeError:
-                            result = callable_query()
+                        result = _invoke_compatible(callable_query,[((normalized_ip,),{}),((),{})])
                     except Exception as exc:
                         result = self._error_result(name, normalized_ip, "error",
                                                     _sanitize_error(exc, self.secrets))
@@ -1343,6 +1389,17 @@ class IpIntelCache:
                     del self._flights[key]
 
     get_or_fetch = get_or_query
+
+    def _lookup(self,name,ip,now):
+        started=time.monotonic();cached=None;finished=False
+        try:
+            cached=self.get(name,ip,now=now);finished=True
+            return cached
+        finally:
+            _observe(self.observer,'intel_cache',duration_ms=max(0,time.monotonic()-started)*1000,
+                attempts=1,successes=int(cached is not None),
+                counters={'cache_hits':int(cached is not None),'cache_misses':int(finished and cached is None),
+                          'cache_errors':int(not finished)})
 
     def query_many(self, ip: str, providers: Sequence[Any],
                    max_workers: int = 4,

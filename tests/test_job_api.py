@@ -117,6 +117,8 @@ class JobApiTest(WebServerCase):
         snapshot=web.JOBS.snapshot(job)
         self.assertEqual(snapshot['status'],'cancelled');self.assertTrue(snapshot['partial'])
         self.assertEqual(len(snapshot['results']),1);self.assertFalse(web.STATE['running'])
+        self.assertIn('cleanup_complete',snapshot['milestones'])
+        self.assertNotIn('network_complete',snapshot['milestones'])
 
     def test_cleanup_failure_during_requested_cancel_is_failed_not_successful_cancel(self):
         job=self.create();self.set_state(running=True,job_id=job,cancel_requested=False)
@@ -131,9 +133,27 @@ class JobApiTest(WebServerCase):
         self.assertEqual(snapshot['status'],'failed');self.assertTrue(snapshot['partial'])
         self.assertEqual(len(snapshot['results']),1)
         self.assertTrue(web.STATE['cleanup_incomplete'])
+        self.assertNotIn('cleanup_complete',snapshot['milestones'])
         with mock.patch.object(web,'run_benchmark') as run:
             code,raw=self.post_authorized('/api/jobs',{'mode':'quick'})
         self.assertEqual(code,409);run.assert_not_called()
+
+    def test_runner_and_http_preserve_end_milestones_and_numeric_cache_counters(self):
+        job=self.create();self.set_state(job_id=job,cancel_requested=False)
+        stream=io.StringIO();emitter=ProgressEmitter(job,stream)
+        emitter.emit('phase_started','probing')
+        emitter.emit('milestone',payload={'milestone':'network_complete','elapsed_ms':0,'key':'CANARY'})
+        emitter.emit('phase_finished',payload={'metrics':{'intel_cache':{'counters':{'cache_hits':2,'api_key':'CANARY'}}}})
+        emitter.emit('milestone',payload={'milestone':'intelligence_complete'})
+        emitter.emit('phase_started','finalizing')
+        proc=mock.Mock(stdout=iter(stream.getvalue().splitlines()));proc.wait.return_value=0
+        with mock.patch.object(web,'connect_controller'),mock.patch.object(web,'sync_db'),mock.patch.object(web.subprocess,'Popen',return_value=proc):
+            web.run_benchmark({'_job_id':job})
+        status,body=self.request('GET','/api/jobs/'+job);snapshot=json.loads(body)
+        self.assertEqual(status,200);self.assertEqual(snapshot['status'],'completed')
+        self.assertEqual(set(snapshot['milestones']),{'network_complete','intelligence_complete','cleanup_complete'})
+        self.assertEqual(snapshot['metrics']['intel_cache']['counters']['cache_hits'],2)
+        self.assertNotIn('CANARY',body.decode())
 
     def test_cancel_between_preflight_and_popen_is_delivered_to_child(self):
         job = self.create()

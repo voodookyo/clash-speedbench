@@ -24,7 +24,7 @@ TRANSITIONS = {
     'cancelling':('cancelled','failed'),
 }
 EVENT_TYPES = ('job_started','phase_started','phase_finished','node_probe','node_exit',
-               'node_measurement','node_intelligence','job_finished','job_cancelled','job_failed')
+               'node_measurement','node_intelligence','milestone','job_finished','job_cancelled','job_failed')
 PHASES = ('','preparing','probing','measuring','enriching','finalizing','cleanup')
 RESULT_SCALARS = ('name','provider','node_id','proto','latency_ms','jitter_ms','connect_ms',
                   'median_mbps','multi_mbps','network_score','score','ip_quality_score','ip_grade',
@@ -36,7 +36,25 @@ SCOPE_FIELDS = ('mode','probe','bandwidth','exit','intel')
 MAX_PAYLOAD = 65536
 MAX_RESULTS = 10000
 METRIC_PHASES = ('connection','discovery','dns','worker_start','delay','exit_v4','exit_v6',
-                 'basic_intel','provider','warmup','download','summary','restore','cleanup','probe')
+                 'basic_intel','provider','provider_wait','intel_cache','intel_cache_wait',
+                 'warmup','download','summary','restore','cleanup','probe')
+METRIC_COUNTERS = ('cache_hits','cache_misses','cache_writes','cache_errors','singleflight_reuses',
+    'worker_count','nodes','unique_ips','api_calls','usable_results','key_missing','disabled',
+    'cooldown_skips','timeouts','rate_limited','quota_unavailable','invalid_responses')
+MILESTONES = ('first_result','first_recommendation','network_complete','intelligence_complete','cleanup_complete')
+CHILD_MILESTONES = ('network_complete','intelligence_complete')
+
+
+def safe_counters(value):
+    if not isinstance(value,dict):return {}
+    return {k:v for k,v in value.items() if k in METRIC_COUNTERS and
+        isinstance(v,int) and not isinstance(v,bool) and 0<=v<2**63}
+
+
+def safe_milestones(value):
+    if not isinstance(value,dict):return {}
+    return {k:v for k,v in value.items() if k in MILESTONES and
+        isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and 0<=v<=1e15}
 
 
 def safe_probe_sources(value):
@@ -77,6 +95,8 @@ def safe_metrics(value):
         d = d if isinstance(d,(int,float)) and not isinstance(d,bool) and 0<=d<=1e15 and math.isfinite(d) else 0
         public[phase] = dict(duration_ms=d,attempts=count('attempts'),
                             successes=min(count('successes'),count('attempts')),bytes=count('bytes'))
+        counters=safe_counters(metric.get('counters'))
+        if counters:public[phase]['counters']=counters
     return public
 IP_FIELDS = ('exit_ip','country','country_code','region','city','isp','org','asn','asname','kind',
              'proxy','hosting','mobile','ok')
@@ -213,7 +233,7 @@ class JobStore:
             job_id = 'job_'+secrets.token_hex(16)
             self.jobs[job_id] = dict(job_id=job_id,status='queued',config=config.public(),
                 started_at=_timestamp(),finished_at=None,seq=0,partial=False,
-                results={},results_truncated=False,metrics={},elapsed_ms=0,
+                results={},results_truncated=False,metrics={},milestones={},elapsed_ms=0,
                 _started_clock=time.monotonic(),events=deque(maxlen=self.event_limit))
             self.active = job_id
             self._append(self.jobs[job_id],'job_started','', '', {})
@@ -260,6 +280,8 @@ class JobStore:
             public['result'] = _result(payload['result'])
         if event_type=='phase_finished' and 'metrics' in payload:
             public['metrics'] = safe_metrics(payload['metrics'])
+        if event_type=='milestone' and payload.get('milestone') not in CHILD_MILESTONES:
+            raise JobError('Unsupported milestone')
         with self.lock:
             job = self._job(job_id)
             if job['status'] in TERMINAL:
@@ -267,13 +289,51 @@ class JobStore:
             for phase,metric in public.get('metrics',{}).items():
                 target = job['metrics'].setdefault(phase,dict(duration_ms=0,attempts=0,successes=0,bytes=0))
                 for key,value in metric.items():
-                    target[key] += value
+                    if key=='counters':
+                        counters=target.setdefault('counters',{})
+                        for counter,count in value.items():counters[counter]=counters.get(counter,0)+count
+                    else:target[key] += value
             if node_id and 'result' in public:
                 if node_id in job['results'] or len(job['results']) < MAX_RESULTS:
                     job['results'].setdefault(node_id,{}).update(public['result'])
+                    result=job['results'][node_id]
+                    observed=(isinstance(result.get('probe_attempts'),int) and result['probe_attempts']>0 or
+                        result.get('latency_ms') is not None or result.get('median_mbps') is not None or
+                        bool(result.get('exit_ipv4') or result.get('exit_ipv6')))
+                    if observed:self._mark(job,'first_result',public)
+                    if self._usable_recommendation(job,result):self._mark(job,'first_recommendation',public)
                 else:
                     job['results_truncated'] = True
+            if event_type=='milestone':self._mark(job,payload['milestone'],public)
             self._append(job,event_type,phase,node_id,public)
+            return True
+
+    @staticmethod
+    def _usable_recommendation(job,result):
+        def positive(key):
+            value=result.get(key)
+            return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>0
+        if job['config'].get('mode')=='ip' or job['config'].get('target_profile') in ('ip','residential'):
+            quality=result.get('ip_quality_score')
+            return (isinstance(quality,(int,float)) and not isinstance(quality,bool) and math.isfinite(quality)
+                and 0<=quality<=100 and result.get('ip_grade') in ('S','A','B','C','D'))
+        return positive('median_mbps') and (result.get('measurement_scope') or {}).get('bandwidth') not in (
+            'pending','partial','not_requested','not_selected','failed','cancelled','interrupted')
+
+    @staticmethod
+    def _mark(job,name,payload):
+        if name in job['milestones']:return False
+        value=max(0,time.monotonic()-job['_started_clock'])*1000
+        job['milestones'][name]=value
+        payload.setdefault('milestones',{})[name]=value
+        return True
+
+    def complete_cleanup(self,job_id):
+        """Parent only: call after confirmed normal/cancelled child exit."""
+        with self.lock:
+            job=self._job(job_id);payload={}
+            if job['status'] in TERMINAL or not self._mark(job,'cleanup_complete',payload):return False
+            self._append(job,'milestone','cleanup','',payload)
             return True
 
     def _snapshot(self, job):
@@ -313,8 +373,7 @@ class PhaseTimer:
         self.metrics = {}
 
     def start(self, phase):
-        if phase not in ('connection','discovery','dns','worker_start','delay','exit_v4','exit_v6',
-                         'basic_intel','provider','warmup','download','summary','restore','cleanup','probe'):
+        if phase not in METRIC_PHASES:
             raise JobError('Unsupported timing phase')
         with self.lock:
             if phase in self.started:

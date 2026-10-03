@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from speedbench_jobs import EVENT_TYPES, PHASES, MAX_PAYLOAD, _result, safe_metrics
+from speedbench_jobs import EVENT_TYPES, PHASES, MAX_PAYLOAD, _result, safe_metrics, CHILD_MILESTONES
 
 PREFIX = '@speedbench-event '
 
@@ -137,6 +137,9 @@ class ProgressEmitter:
             safe['result'] = _result(payload['result'])
         if event_type=='phase_finished' and 'metrics' in payload:
             safe['metrics'] = safe_metrics(payload['metrics'])
+        if event_type=='milestone':
+            if payload.get('milestone') not in CHILD_MILESTONES:raise ValueError('Invalid progress milestone')
+            safe['milestone']=payload['milestone']
         with self.lock:
             if self.transport_failed:return
             self.seq += 1
@@ -171,6 +174,16 @@ def phase(args,name):
     emitter = getattr(args,'progress',None)
     if emitter is not None:
         emitter.emit('phase_started',name)
+
+
+def emit_metric(args,name,metric):
+    emitter=getattr(args,'progress',None)
+    if emitter is not None:emitter.emit('phase_finished',payload={'metrics':{name:metric}})
+
+
+def milestone(args,name):
+    emitter=getattr(args,'progress',None)
+    if emitter is not None:emitter.emit('milestone',payload={'milestone':name})
 
 
 @contextmanager

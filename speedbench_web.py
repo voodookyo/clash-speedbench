@@ -529,7 +529,7 @@ def run_benchmark(params: dict) -> None:
                         if record['type'] == 'phase_started':
                             if JOBS.snapshot(job_id)['status'] != 'cancelling':
                                 JOBS.transition(job_id,record['phase'])
-                        elif record['type'].startswith('node_') or record['type']=='phase_finished':
+                        elif record['type'].startswith('node_') or record['type'] in ('phase_finished','milestone'):
                             JOBS.publish(job_id,record['type'],phase=record['phase'],
                                          node_id=record['node_id'],payload=record['payload'])
                     except JobError:
@@ -569,6 +569,8 @@ def run_benchmark(params: dict) -> None:
             with STATE_LOCK:
                 cancelled = STATE.get('cancel_requested',False)
                 exit_code = STATE['exit_code']
+            if proc is not None and not unreaped and exit_code in (0,130):
+                JOBS.complete_cleanup(job_id)
             if exit_code == CLEANUP_FAILED_EXIT:
                 with STATE_LOCK:
                     STATE['cleanup_incomplete']=True

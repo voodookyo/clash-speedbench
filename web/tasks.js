@@ -3,6 +3,10 @@
   'use strict';
   const terminal = status => ['completed','cancelled','failed','interrupted'].includes(status);
   const rowKey = row => row.node_id || `legacy:${row.proto||''}|${row.name||''}`;
+  const counterKeys=['cache_hits','cache_misses','cache_writes','cache_errors','singleflight_reuses',
+    'worker_count','nodes','unique_ips','api_calls','usable_results','key_missing','disabled',
+    'cooldown_skips','timeouts','rate_limited','quota_unavailable','invalid_responses'];
+  const milestoneKeys=['first_result','first_recommendation','network_complete','intelligence_complete','cleanup_complete'];
   class TaskState {
     constructor(snapshot){ this.replace(snapshot); }
     replace(snapshot){
@@ -29,6 +33,19 @@
         for(const [phase,metric] of Object.entries(p.metrics)){
           const target=v.metrics[phase]||(v.metrics[phase]={duration_ms:0,attempts:0,successes:0,bytes:0});
           for(const key of ['duration_ms','attempts','successes','bytes']) target[key]+=metric[key]||0;
+          for(const [key,value] of Object.entries(metric.counters||{})){
+            if(!counterKeys.includes(key)||!Number.isSafeInteger(value)||value<0)continue;
+            target.counters=target.counters||{};
+            const total=(target.counters[key]||0)+value;
+            if(Number.isSafeInteger(total))target.counters[key]=total;
+          }
+        }
+      }
+      if(p.milestones){
+        v.milestones=v.milestones||{};
+        for(const [key,value] of Object.entries(p.milestones)){
+          if(milestoneKeys.includes(key)&&Number.isFinite(value)&&value>=0&&
+             !Object.prototype.hasOwnProperty.call(v.milestones,key))v.milestones[key]=value;
         }
       }
       if(terminal(v.status)){ v.partial=v.status!=='completed'; v.finished_at=event.timestamp; }

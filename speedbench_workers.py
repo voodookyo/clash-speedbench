@@ -55,7 +55,7 @@ import sys
 import tempfile
 import threading
 from speedbench_sources import apply_origin
-from speedbench_progress import DownloadCounter, phase, publish_result, measure
+from speedbench_progress import DownloadCounter, phase, publish_result, measure, milestone
 import time
 import copy
 import queue
@@ -1604,8 +1604,10 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                 # stop_live_workers().
                 live_workers.append(worker)
             try:
-                with measure(args,'worker_start'):
+                with measure(args,'worker_start') as timing:
+                    timing['attempts']=1
                     worker.start()
+                    timing.update(successes=1,counters={'worker_count':1})
                 for p in claim_nodes(shard):
                     if cancelled():  # 节点间检查取消标志，尽快收队
                         return
@@ -1733,14 +1735,17 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         chosen_proxies = [by_name[r.name] for r in chosen if r.name in by_name]
         new_dns = [p for p in chosen_proxies if p.get('name') not in dns_names]
         if config and config.mode != 'legacy' and new_dns:
-            hosts.update(build_hosts(with_dependencies(new_dns,all_proxies)))
+            with measure(args,'dns'):
+                hosts.update(build_hosts(with_dependencies(new_dns,all_proxies)))
         worker2: Optional[Worker] = None
         try:
             # Phase 2 单 worker 同样并入 dialer-proxy 依赖闭包
             worker2 = Worker(mihomo_bin, with_dependencies(chosen_proxies, all_proxies),
                              hosts, iface)
-            with measure(args,'worker_start'):
+            with measure(args,'worker_start') as timing:
+                timing['attempts']=1
                 worker2.start()
+                timing.update(successes=1,counters={'worker_count':1})
         except Exception as e:
             print(f"⚠️ Phase 2 worker 启动失败，保留 Phase 1 粗筛结果: {e}",
                   file=sys.stderr)
@@ -1808,9 +1813,11 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     # work has completed, then derive node-level worst-IP quality and Overall.
     if intel_enricher is None:
         intel_enricher = start_intelligence_enrichment(results,args)
+    if not getattr(args,'cancelled',False) and not cancel_requested():milestone(args,'network_complete')
     phase(args,'enriching')
-    with measure(args,'provider'):
+    with measure(args,'provider_wait'):
         finish_intelligence_enrichment(intel_enricher, results)
+    if not getattr(args,'cancelled',False) and not cancel_requested():milestone(args,'intelligence_complete')
     for r in results:
         publish_result(args,'node_intelligence',r,phase_name='enriching')
 

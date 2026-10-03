@@ -48,7 +48,7 @@ import speedbench_controller as controller_config
 import speedbench_sources as source_catalog
 import speedbench_tasks
 from speedbench_process import run_cancellable
-from speedbench_progress import ProgressEmitter, DownloadCounter, ProbeObserver, phase, publish_result, measure
+from speedbench_progress import ProgressEmitter, DownloadCounter, ProbeObserver, phase, publish_result, measure, emit_metric, milestone
 from speedbench_jobs import safe_probe_sources
 
 from speedbench_ip_intel import (
@@ -1445,13 +1445,16 @@ class _IntelEnrichment:
     """
 
     def __init__(self, args: Any):
+        self.args=args
         history_value = getattr(args, "history", None)
         history = Path(history_value) if history_value else Path(__file__).with_name(
             "speedbench-history.jsonl"
         )
-        self.cache = IpIntelCache(history.with_suffix(".db"))
+        with measure(args,'intel_cache'):
+            self.cache = IpIntelCache(history.with_suffix(".db"),observer=self._observe)
         timeout = float(getattr(args, "ip_timeout", 8.0) or 8.0)
         self.providers = make_default_providers(timeout=timeout)
+        for provider in self.providers:provider.observer=self._observe
         configured = getattr(args, "intel_workers", 3)
         try:
             workers = max(2, min(4, int(configured)))
@@ -1464,10 +1467,14 @@ class _IntelEnrichment:
         if owned is not None:owned.append(self)
 
     def _query_one(self, ip: str) -> IpIntelligence:
+        self._observe('intel_cache',dict(counters={'unique_ips':1}))
         provider_results = self.cache.query_many(
             ip, self.providers, max_workers=1
         )
         return aggregate_ip_intelligence(ip, provider_results)
+
+    def _observe(self,name,metric):
+        emit_metric(self.args,name,metric)
 
     def submit_ip(self, ip: Optional[str]) -> None:
         if not ip or ip in self.futures:
@@ -2520,8 +2527,10 @@ def _execute_benchmark(args,task_config):
     # Enrichment was submitted while the serial network work was in progress;
     # only now wait for the deduplicated provider jobs and recompute Overall.
     phase(args,'enriching')
-    with measure(args,'provider'):
+    if not getattr(args,'cancelled',False) and not cancel_requested():milestone(args,'network_complete')
+    with measure(args,'provider_wait'):
         finish_intelligence_enrichment(intel_enricher, results)
+    if not getattr(args,'cancelled',False) and not cancel_requested():milestone(args,'intelligence_complete')
 
     if getattr(args,'cancelled',False):
         return 130
