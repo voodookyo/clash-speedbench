@@ -220,7 +220,13 @@
     <!-- ============ IP Intelligence 设置 ============ -->
     <section id="view-settings" style="display:none">
       <div class="card"><h2>界面与连接</h2><label for="f-theme">主题</label><select id="f-theme"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><p class="muted">基础测速自动连接本机 Clash Verge，不需要第三方 IP 风控 API Key。下方可选 Key 只用于扩展画像。</p><div id="pending-favorites" class="muted"></div></div>
-      <div id="desktop-settings" class="card" hidden><h2>桌面客户端</h2><label class="chk"><input type="checkbox" id="f-notifications"> 任务完成通知（默认关闭；仅发送模式、状态和节点数量）</label><p class="muted">通知是否显示还取决于系统设置。窗口关闭后任务继续，可从托盘重新打开；退出会先取消并清理任务。</p><button class="mini" id="btn-official-releases">官方版本与手动升级</button></div>
+      <div id="desktop-settings" class="card" hidden><h2>桌面客户端</h2><label class="chk"><input type="checkbox" id="f-notifications"> 任务完成通知（默认关闭；仅发送模式、状态和节点数量）</label><p class="muted">通知是否显示还取决于系统设置。窗口关闭后任务继续，可从托盘重新打开；退出会先取消并清理任务。</p></div>
+      <div class="card" id="release-settings"><h2>官方版本与手动升级</h2>
+        <p id="release-status" class="muted" role="status" aria-live="polite">正在读取本地版本；不会自动联网检查。</p>
+        <div class="leak-actions"><button class="mini" id="btn-release-check">检查正式 Release（联网）</button><button class="mini" id="btn-official-releases">查看官方 Release</button></div>
+        <p class="muted">仅在点击时查询 GitHub 官方 API，不携带任何 SpeedBench 密钥或历史。只检查正式版本，不检查 alpha 更新；查询失败不表示已是最新版本。不会下载、安装或自动降级。</p>
+        <ol class="muted"><li>先停止测速、退出新旧程序，备份下方列出的数据与私有身份种子。</li><li>在官方 Release 选择对应平台／架构的包，并按 SHA-256 核对文件；校验和不等于数字签名，unsigned 包仍可能触发系统警告。</li><li>手动升级，沿用原数据目录；回退前另行备份，不删除新历史，也不要同时运行两个写入程序。</li></ol>
+      </div>
       <div class="card" id="data-guide"><h2>数据位置与迁移指引</h2>
         <p id="data-status" class="muted" role="status">正在读取本实例数据位置…</p>
         <p class="muted">程序不会自动搬动或覆盖其他目录。升级／回退前先退出测速及旧程序，再备份 JSONL、SQLite、ui-preferences.json 和 identity-seed；种子属于私有备份，不能上传或放入下方偏好 JSON。其他数据目录的迁移仍需按 README 操作，不会读取浏览器 profile。</p>
@@ -299,6 +305,7 @@
 
 <script src="/static/tasks.js"></script>
 <script src="/static/preferences.js"></script>
+<script src="/static/releases.js"></script>
 <script src="/static/view.js"></script>
 <script src="/static/app.js"></script>
 </body>

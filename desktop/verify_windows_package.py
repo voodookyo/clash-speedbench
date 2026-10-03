@@ -5,6 +5,7 @@ an installation or queries a real controller/provider. Native window/tray
 manual acceptance is a separate gate, not claimed by this headless check.
 """
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -47,6 +48,24 @@ def bootstrap(root,data,manifest):
             response=connection.getresponse();body=response.read()
             if response.status!=200 or token.encode() in body or nonce.encode() in body:
                 raise ValueError('Packaged public identity disclosure or authentication failure')
+            connection.request('GET','/api/releases',headers=auth)
+            response=connection.getresponse();local_version=json.loads(response.read())
+            if response.status!=200 or local_version.get('status')!='not_checked' or local_version.get('current')!=manifest['version']:
+                raise ValueError('Packaged local version lookup failed or queried updates automatically')
+            connection.request('POST','/api/releases/check',json.dumps({'url':'https://evil.example/fixture'}),
+                headers={**auth,'Content-Type':'application/json'})
+            response=connection.getresponse();response.read()
+            if response.status!=400:raise ValueError('Packaged release check accepted arbitrary parameters')
+            connection.request('GET','/api/data-status',headers=auth)
+            response=connection.getresponse();data_status=json.loads(response.read())
+            if response.status!=200 or data_status.get('automatic_import') is not False or Path(data_status.get('data_home','')).resolve()!=data.resolve():
+                raise ValueError('Packaged data guidance mismatch')
+            for module in ('preferences.js','releases.js'):
+                connection.request('GET','/static/'+module)
+                response=connection.getresponse();body=response.read()
+                if (response.status!=200 or 'application/javascript' not in response.getheader('Content-Type','') or
+                        hashlib.sha256(body).hexdigest()!=manifest['files'].get('app/web/'+module)):
+                    raise ValueError('Packaged shared settings module missing or altered')
             connection.request('POST','/api/preferences',json.dumps({'sb_theme':'dark'}),
                 headers={**auth,'Content-Type':'application/json','Origin':'https://evil.example'})
             response=connection.getresponse();response.read()
@@ -92,7 +111,7 @@ def verify(package):
         manifest['files']['app/speedbench_desktop.py']=digest(source)
         (root/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
         if native_check()==0:raise ValueError('Mutable side manifest bypassed native integrity anchor')
-    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, original raw retained. Native window/tray acceptance not included.')
+    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, original raw retained. Native window/tray acceptance not included.')
 
 
 if __name__=='__main__':

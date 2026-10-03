@@ -18,11 +18,21 @@ def main():
     parser.add_argument('--port',type=int,default=8964)
     parser.add_argument('--desktop-preferences',action='store_true',
                         help='Simulate the WebView preference path in a browser; NOT native GUI acceptance')
+    parser.add_argument('--release-status',choices=('ok','timeout'),default='ok',
+                        help='Synthetic release metadata, never queries GitHub')
     args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='speedbench-ui-fixture-') as folder:
         web.DATA_HOME=Path(folder)
         web.HISTORY=Path(folder)/'fixture.jsonl'
         web.CANCEL_FILE=Path(folder)/'cancel-request'
+        if args.desktop_preferences: web.DESKTOP_IDENTITY={'version':'1.1.0-alpha.1'}
+        class FixtureReleaseChecker:
+            def check(self,current):
+                result=web.speedbench_releases.local_info(current)
+                result.update(status=args.release_status, latest='v1.0.1' if args.release_status=='ok' else None,
+                              comparison='ahead' if args.release_status=='ok' else None)
+                return result
+        web.RELEASE_CHECKER=FixtureReleaseChecker()
         source='subscription_v2_'+'a'*32
         nodes=[dict(node_id='node_v2_'+str(i)*32,runtime_name=name,proto='ss',identity_strength='strong',
                     source_status='verified',subscription_ids=[source],subscription_name='界面验证 fixture <订阅>')

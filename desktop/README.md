@@ -23,7 +23,19 @@ macOS/Linux build jobs is not proof that those packages run successfully.
 
 All current packages are **unsigned**. No automatic update plugin is enabled.
 Official release links support manual upgrade; there is no silent download or
-unverified self-update. Runtime artifact URLs and SHA-256 are fixed in
+installation. Settings now offers an **explicit click-to-check stable Release**
+using the fixed public GitHub endpoint documented at
+https://docs.github.com/en/rest/releases/releases#get-the-latest-release.
+No credentials/history are sent and no draft/prerelease/body/asset URLs are
+trusted. Success is cached in memory for 15 minutes (failures for 1 minute);
+timeouts, unavailable/invalid metadata and rate limits mean **cannot confirm**.
+An alpha ahead of stable is not "latest stable" and is never auto-downgraded.
+The check does not query alpha updates, verify signatures or download a file.
+Back up while all writers are stopped, choose the correct platform/architecture
+on official Releases, verify SHA-256, then upgrade manually. A checksum is not
+a digital signature. Unsigned packages and manual rollback remain explicit.
+
+Runtime artifact URLs and SHA-256 are fixed in
 `runtime-lock.json`. Version/platform/runtime/source revision/dirty status are
 recorded in manifest and `build-provenance.json`. A source-dirty build must not
 be mislabeled as an official Release. Update pinned runtimes deliberately for

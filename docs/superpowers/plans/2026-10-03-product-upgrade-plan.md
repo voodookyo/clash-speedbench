@@ -65,3 +65,6 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 - D1/D2 本机实现与独立 Windows 包验证通过，见 ../reports/2026-10-03-desktop-packaging-checkpoint.md。桌面 alpha 已有 unsigned Windows NSIS/便携包，不能称 GUI 生命周期或 macOS/Linux 已验收。桌面/独立 Web 同目录所有权已验证；直接 CLI 和不同目录的全局协调仍未完成。D3–D8 不勾选，待完整要求满足。
 - 最新冻结源码 5c1f796：三版 Windows Python 全量各 725 tests，OK (skipped=7)，Rust 7 tests；Windows NSIS/便携包重新构建并解压验收，包含下载目标历史提示与 worker 清理重试。最新包及 SHA-256 见桌面报告；未 push 或替换用户安装。
 - C/D 迁移体验继续推进：显式白名单偏好导出/预览/确认导入、收藏合并和未匹配 ID 提示、认证的数据路径/文件存在性指引；不自动导入 raw 或复制 seed。三版 Windows Python 全量各 737 tests，OK (skipped=7)。浏览器及模拟桌面偏好路径的实际交互通过，原生 GUI 与历史目录导入仍未验收，C4/D6 暂不整体勾选。
+- bd444df 偏好迁移源码重新打包，66 项资源；Windows NSIS/便携 ZIP 完整性与解包启动通过，source_dirty=false，独立 SHA-256 与 provenance 一致。该包不包含此后的版本检查功能，不能混用源码与产物证据。
+- D 手动升级：新增固定 GitHub 官方最新正式 Release 查询（只由认证点击触发）、严格响应/版本校验、内存 single-flight/TTL、失败无法确认和 alpha 不自动降级；不自动下载/安装/更新，也不检查 alpha feed。共享浏览器及模拟桌面设置页面宽窄窗口实际交互通过，未联网查真实 Release。首次 Python 3.9 回归发现无流 HTTPError.close 差异，修复后专项通过；最终全量与新包验证完成后补记，不将 D6/D7 整项勾选。
+- 手动升级源码最终全量：Windows Python 3.14.7 / 3.9.25 / 3.12 各 750 tests，OK (skipped=7)，并行耗时分别 38.457s / 37.962s / 38.436s，不作为提速证据。版本检查新增 13 项 fixture 测试；延迟本地版本响应不能覆盖用户刚检查的结果。`node --check` 与 `git diff --check` 通过。原生平台及实测性能门仍保持未验收。

@@ -52,7 +52,7 @@ class TraversalTest(WebServerCase):
 
 class WhitelistTest(WebServerCase):
     def test_shared_modules_served_with_javascript_mime_and_host_guard(self):
-        for name in ('tasks.js','view.js','preferences.js'):
+        for name in ('tasks.js','view.js','preferences.js','releases.js'):
             status, headers, body=self.request_full('GET','/static/'+name)
             self.assertEqual(status,200)
             self.assertIn('application/javascript',headers['content-type'])

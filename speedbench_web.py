@@ -45,6 +45,7 @@ from speedbench_jobs import JobStore, JobError, TERMINAL, _result as safe_job_re
 from speedbench_progress import PREFIX, parse_record
 from speedbench_owner import BackendLease, LeaseError
 from speedbench_preferences import Preferences, PreferenceError
+import speedbench_releases
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
@@ -59,6 +60,7 @@ CANCEL_FILE = DATA_HOME / "cancel-request"
 # 只认列出的静态文件、不做任何路径拼接，其余一律 404。
 WEB_DIR = HERE / "web"
 STATIC_FILES = {
+    '/static/releases.js': ('releases.js','application/javascript; charset=utf-8'),
     '/static/preferences.js': ('preferences.js','application/javascript; charset=utf-8'),
     '/static/view.js': ('view.js','application/javascript; charset=utf-8'),
     '/static/tasks.js': ('tasks.js','application/javascript; charset=utf-8'),
@@ -95,6 +97,11 @@ DESKTOP_IDENTITY = None
 DESKTOP_ACTIONS = None
 DESKTOP_SHUTDOWN = None
 DESKTOP_EXITING = None
+RELEASE_CHECKER = speedbench_releases.ReleaseChecker()
+
+
+def _release_version():
+    return (DESKTOP_IDENTITY or {}).get('version', speedbench_releases.CORE_VERSION)
 
 # 令牌同时写入数据目录（0600 仅本人可读），供本机受信脚本（SwiftBar 菜单栏
 # 插件等）调用写操作 API（如 /api/quit）。每次启动覆盖，面板停掉后自然失效。
@@ -907,6 +914,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(get_current())
         elif path == '/api/catalog':
             self._json(get_catalog())
+        elif path == '/api/releases':
+            if not self._check_post():return
+            self._json(speedbench_releases.local_info(_release_version()))
         elif path == '/api/desktop/identity':
             if not self._check_post():return
             self._json(DESKTOP_IDENTITY or {'ok':False,'msg':'Not a desktop backend'},200 if DESKTOP_IDENTITY else 404)
@@ -1046,7 +1056,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_post():
             return
         path = urllib.parse.urlparse(self.path).path
-        if path in ('/api/run','/api/jobs'):
+        if path == '/api/releases/check':
+            if self._read_body(strict=True) != {}:
+                self._json({'ok':False,'msg':'版本检查不接受参数或凭据'},400);return
+            self._json(RELEASE_CHECKER.check(_release_version()))
+        elif path in ('/api/run','/api/jobs'):
             if DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set():
                 self._json({'ok':False,'msg':'客户端正在退出，不能开始新任务'},409);return
             with STATE_LOCK:

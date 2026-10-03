@@ -1799,6 +1799,27 @@ async function applyPreferenceImport(){
     toast('界面偏好已导入');
   }catch(e){status.textContent='偏好未能完整保存；未报告导入成功。请检查现有偏好，原历史未改变。';toast('偏好导入失败',false);}
 }
+function initReleaseSettings(){
+  if(typeof SBReleases==='undefined') return;
+  const status=document.getElementById('release-status'),button=document.getElementById('btn-release-check');
+  if(!status || !button) return;
+  let userChecked=false;
+  fetch('/api/releases',{headers:{'X-SpeedBench-Token':SB_TOKEN}}).then(r=>r.json()).then(r=>{
+    if(!userChecked) status.textContent=SBReleases.text(r);
+  }).catch(()=>{if(!userChecked) status.textContent='本地版本信息暂不可用；未进行联网检查。';});
+  button.addEventListener('click',async()=>{
+    if(button.disabled) return;
+    userChecked=true;
+    button.disabled=true;status.textContent='正在查询官方正式 Release；不会下载或安装…';
+    try{status.textContent=SBReleases.text(await post('/api/releases/check',{}));}
+    catch(e){status.textContent='检查连接失败，无法确认是否需要升级。请手动查看官方 Release。';}
+    finally{button.disabled=false;}
+  });
+  document.getElementById('btn-official-releases').addEventListener('click',()=>{
+    if(SB_DESKTOP) desktopAction('releases');
+    else window.open(SBReleases.URL,'_blank','noopener,noreferrer');
+  });
+}
 function initPreferenceTransfer(){
   if(typeof SBPreferences==='undefined') return;
   const textarea=document.getElementById('preference-json'), status=document.getElementById('preference-transfer-status');
@@ -1832,7 +1853,6 @@ function initTaskControls(){
     notifications.checked=lsGet('sb_notifications')==='on';
     notifications.addEventListener('change',()=>lsSet('sb_notifications',notifications.checked?'on':'off'));
     document.getElementById('btn-browser-audit').addEventListener('click',()=>desktopAction('browser_audit'));
-    document.getElementById('btn-official-releases').addEventListener('click',()=>desktopAction('releases'));
   }
   const savedMode=lsGet('sb_mode'),savedTarget=lsGet('sb_target');
   if(['quick','standard','deep','ip'].includes(savedMode)) document.getElementById('f-mode').value=savedMode;
@@ -1888,6 +1908,7 @@ async function boot(){
   if(environment && window.SPEEDBENCH_ENV?.client==='webview') environment.textContent='执行环境：系统 WebView；本次 WebRTC 结果不代表 Chrome、Edge 或 Firefox。WebView 不支持采集时只能显示无法确认。';
   init();
   initPreferenceTransfer();
+  initReleaseSettings();
   route();
   renderTable();      // latestData=null → 骨架屏，loadLatest 完成后替换
   updateSortArrows('th.sort', sortKey, sortAsc);

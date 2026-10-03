@@ -11,6 +11,11 @@
 > Python；测速仍使用标准库 + 系统 curl/Mihomo。[桌面构建、数据迁移与限制](desktop/README.md)。
 > macOS/Linux 原生运行、完整桌面交互及四阶段最终验收仍未完成，不能把构建配置视为已兼容。
 
+开发版设置页提供显式“检查正式 Release”：点击才访问固定 GitHub 官方 API，不携带
+密钥或历史，不检查 alpha 更新；失败显示无法确认，alpha 版本号领先正式版也不会自动降级。
+升级仍由用户在官方 Release 手动选择平台包、核对 SHA-256、退出写入程序并备份后完成，
+不自动下载／安装。校验和不能代替数字签名，当前桌面包为 unsigned。
+
 > English: A zero-dependency companion benchmark for a *running* Clash Verge Rev / Mihomo
 > instance — real per-node download Mbps, multi-source exit-IP intelligence and
 > reputation, application-level stability probes, a composite network/IP view,
