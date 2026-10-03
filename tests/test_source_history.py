@@ -96,6 +96,23 @@ class SourceHistoryTest(unittest.TestCase):
         self.import_rows([[self.result()]])
         self.assertIsInstance(json.dumps(db.source_summary(self.database)), str)
 
+    def test_ip_changes_follow_stable_identity_not_reused_name(self):
+        a,b=self.result(),self.result(password='other')
+        a['ip'].update(ok=True,exit_ip='203.0.113.1',asn='AS1')
+        b['ip'].update(ok=True,exit_ip='203.0.113.2',asn='AS2')
+        self.import_rows([[a,b]])
+        changes=db.ip_changes(self.database,'',node_id=a['node_id'])
+        self.assertEqual([r['exit_ip'] for r in changes],['203.0.113.1'])
+
+    def test_source_series_follows_renamed_subscription_without_legacy_merge(self):
+        a,b=self.result(),self.result('改名节点','改名订阅')
+        self.import_rows([[a],[b,dict(name='旧名称',provider='改名订阅',median_mbps=1000)]])
+        rows=db.source_series(self.database,a['subscription_ids'][0])
+        self.assertEqual(len(rows),2)
+        self.assertEqual(rows[-1]['name_snapshot'],'改名订阅')
+        self.assertEqual(rows[-1]['node_count'],1)
+        self.assertIsNone(rows[-1]['median_mbps'])
+
 
 if __name__ == '__main__':
     unittest.main()

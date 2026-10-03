@@ -13,10 +13,11 @@
     <div class="logo">⚡ Clash SpeedBench</div>
     <nav id="nav">
       <a class="nav-item" data-view="nodes" href="#/nodes">🗂 节点</a>
+      <a class="nav-item" data-view="tasks" href="#/tasks">任务中心</a>
       <a class="nav-item" data-view="history" href="#/history">📈 历史</a>
       <a class="nav-item" data-view="subs" href="#/subs">🧭 订阅</a>
       <a class="nav-item" data-view="leak" href="#/leak">🕵 环境泄漏检测</a>
-      <a class="nav-item" data-view="settings" href="#/settings">⚙️ IP 设置</a>
+      <a class="nav-item" data-view="settings" href="#/settings">⚙️ 设置</a>
       <a class="nav-item" data-view="about" href="#/about">ℹ️ 关于</a>
     </nav>
     <div class="nav-foot"><button class="quit-btn" id="btn-quit">⏻ 退出 SpeedBench</button></div>
@@ -26,32 +27,44 @@
 
     <!-- ============ 节点视图 ============ -->
     <section id="view-nodes">
+      <header class="page-header"><h1>节点测速</h1><span id="connection-status" role="status">正在连接 Clash Verge…</span></header>
       <div class="card">
-        <div class="controls">
+        <h2>测速配置</h2>
+        <div class="controls task-controls">
           <div><label for="f-source">订阅范围</label>
             <select id="f-source"><option value="">全部已加载节点</option></select></div>
-          <div><label>&nbsp;</label><button id="btn-source-refresh" class="mini">刷新订阅</button></div>
-          <div><label>节点过滤（正则，留空=全部）</label>
-            <input type="text" id="f-include" placeholder="例如 香港|HK"></div>
-          <div><label>每轮 MB</label><input type="number" id="f-mb" value="30" min="1" max="95"></div>
-          <div><label>轮数</label><input type="number" id="f-rounds" value="1" min="1" max="5"></div>
-          <div><label>&nbsp;</label><label class="chk">
-            <input type="checkbox" id="f-autoswitch"> 测完自动切到冠军</label></div>
-          <div><label>&nbsp;</label><button id="btn-run">开始测速</button></div>
-          <div><label>&nbsp;</label><button id="btn-cancel" class="danger" style="display:none">中断测速</button></div>
+          <div><label for="f-target">使用目标</label><select id="f-target"><option value="daily">日常</option><option value="download">下载</option><option value="ip">IP 质量</option><option value="balanced">综合</option><option value="residential">住宅优先</option></select></div>
+          <div><label for="f-mode">测速模式</label><select id="f-mode"><option value="quick">快速 · 精测最多 5 节点</option><option value="standard" selected>标准 · 精测最多 10 节点</option><option value="deep">深度 · 全部连通节点</option><option value="ip">IP 专项 · 不请求带宽</option></select></div>
         </div>
+        <div id="manual-scope" hidden><label for="f-node-search">选择已加载节点</label><input id="f-node-search" type="text" placeholder="搜索节点名或来源"><div id="node-picker"></div></div>
+        <div class="task-actions"><button id="btn-source-refresh" class="mini">刷新订阅</button><button id="btn-run">开始测速</button>
+          <button id="btn-cancel" class="danger" style="display:none">取消任务</button></div>
+        <details id="advanced-settings"><summary>高级设置</summary><div class="controls">
+          <div><label for="f-include">节点过滤（正则，可选）</label><input type="text" id="f-include" placeholder="例如 香港|HK"></div>
+          <div><label for="f-mb">每轮 MB（空为模式默认）</label><input type="number" id="f-mb" min="1" max="95"></div>
+          <div><label for="f-rounds">轮数</label><input type="number" id="f-rounds" value="1" min="1" max="5"></div>
+          <div><label class="chk"><input type="checkbox" id="f-multi"> 4 路峰值（同一节点）</label></div>
+          <div><label class="chk"><input type="checkbox" id="f-all-ip"> 对全部节点查询 IP</label></div>
+          <div><label class="chk"><input type="checkbox" id="f-autoswitch"> 测完自动切到冠军</label></div>
+        </div></details>
         <div id="source-status" class="meta-line" role="status">正在核验本机订阅来源；不会切换未加载订阅。</div>
-        <div class="warn">独立 worker 模式不切换当前节点；仅串行回退会临时切 GLOBAL，结束自动恢复。</div>
+        <div id="task-budget" class="meta-line">带宽样本预算：随已选范围计算，不等于实际流量。</div>
+        <div class="warn">仅推荐已测范围内的节点；新模式使用独立 worker，不会静默串行回退或切换未加载订阅。</div>
+      </div>
+      <div class="card" id="task-card" style="display:none">
+        <h2 id="task-stage">任务状态</h2>
         <div id="prog-wrap" style="display:none">
           <progress id="prog" max="100" value="0"></progress>
           <span id="prog-text"></span>
         </div>
-        <div id="log-toggle" style="display:none"><span id="log-arrow">▸</span> 运行日志</div>
+        <div id="task-summary" role="status" aria-live="polite"></div>
+        <button id="log-toggle" class="mini" style="display:none" aria-expanded="false"><span id="log-arrow">▸</span> 运行日志</button>
         <div id="log"></div>
       </div>
 
       <div class="card">
         <div class="meta-line">
+          <h2>本次结果</h2>
           <span id="latest-meta">暂无测速记录</span>
           <span id="cur-line"></span>
         </div>
@@ -64,7 +77,7 @@
             <button class="mini pf" data-p="ipclean" title="按多源 IP 分类、风险和信誉排序">🧼 IP</button>
             <button class="mini pf" data-p="residential" title="住宅优先：仅按多源分类和风险排序，不改变下载 Profile">🏠 住宅优先</button>
           </div>
-          <input type="text" id="f-search" placeholder="🔍 搜索节点名…">
+          <input type="text" id="f-search" aria-label="搜索测速结果" placeholder="🔍 搜索节点名…">
         </div>
         <div id="board" style="display:none">
           <div id="board-toggle"><span id="board-arrow">▸</span> 地区榜 · 各地区在当前 Profile 下的 Top 3（点击看趋势）</div>
@@ -78,7 +91,7 @@
               <th class="sort" data-k="provider" id="th-provider" style="display:none">订阅 <span class="arr"></span></th>
               <th class="sort" data-k="latency_ms">延迟 <span class="arr"></span></th>
               <th class="sort" data-k="median_mbps">带宽 <span class="arr"></span></th>
-              <th class="sort" data-k="score">Network <span class="arr">▼</span></th>
+              <th class="sort" data-k="network_score">Network <span class="arr">▼</span></th>
               <th>IP Grade</th><th>IP 类型</th><th>风险</th>
               <th>标签</th><th></th>
             </tr></thead>
@@ -86,6 +99,12 @@
           </table>
         </div>
       </div>
+    </section>
+
+    <section id="view-tasks" style="display:none">
+      <header class="page-header"><h1>任务中心</h1><button class="mini" id="btn-tasks-refresh">刷新</button></header>
+      <p class="muted">任务取消、失败或应用中断后，已完成的部分结果仍保留。旧测速轮次可在“历史”回放。</p>
+      <div id="task-list" class="card"></div><div id="task-detail" class="card" hidden></div>
     </section>
 
     <!-- ============ 历史视图 ============ -->
@@ -198,6 +217,7 @@
 
     <!-- ============ IP Intelligence 设置 ============ -->
     <section id="view-settings" style="display:none">
+      <div class="card"><h2>界面与连接</h2><label for="f-theme">主题</label><select id="f-theme"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><p class="muted">基础测速自动连接本机 Clash Verge，不需要第三方 IP 风控 API Key。下方可选 Key 只用于扩展画像。</p><div id="pending-favorites" class="muted"></div></div>
       <div class="card settings-card">
         <div class="card-title">IP Intelligence 设置</div>
         <p class="card-sub">Key 只提交给本机 SpeedBench 后端，默认仅驻留内存；不会写入 localStorage、Cookie、JSONL、SQLite、日志或命令行。清空输入可移除本次面板配置。</p>
@@ -253,7 +273,7 @@
 <div id="toasts"></div>
 
 <div id="modal-mask" style="display:none">
-  <div class="modal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-text">
     <div id="modal-text"></div>
     <div class="modal-btns">
       <button class="mini" id="modal-no">取消</button>
@@ -262,6 +282,8 @@
   </div>
 </div>
 
+<script src="/static/tasks.js"></script>
+<script src="/static/view.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

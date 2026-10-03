@@ -57,3 +57,12 @@ class SourceApiTest(WebServerCase):
         status, body = self.request('GET', '/api/sources/history')
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), [])
+
+    def test_source_series_preserves_opaque_id_and_rejects_host(self):
+        sid=self.catalog['sources'][0]['subscription_id']
+        with mock.patch.object(web.speedbench_db,'source_series',return_value=[]) as query:
+            status,body=self.request('GET','/api/source?subscription_id='+sid+'&days=7')
+            self.assertEqual(status,200)
+            self.assertEqual(json.loads(body),[])
+            query.assert_called_once_with(web.db_path(),sid,days=7)
+            self.assertEqual(self.request('GET','/api/source?subscription_id='+sid,headers={'Host':'evil.example'})[0],403)

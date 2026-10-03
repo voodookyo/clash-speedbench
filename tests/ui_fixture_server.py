@@ -1,0 +1,71 @@
+"""Owned localhost UI QA fixture. No controller/curl/paid API or user history.
+
+Run explicitly (not unittest discovery): python -m tests.ui_fixture_server
+All synthetic rows are labelled fixture. This is never a production fallback.
+"""
+import argparse
+import tempfile
+import threading
+import time
+from pathlib import Path
+from http.server import ThreadingHTTPServer
+import speedbench_web as web
+from speedbench_tasks import resolve_config
+
+
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--port',type=int,default=8964)
+    args=parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix='speedbench-ui-fixture-') as folder:
+        web.DATA_HOME=Path(folder)
+        web.HISTORY=Path(folder)/'fixture.jsonl'
+        web.CANCEL_FILE=Path(folder)/'cancel-request'
+        source='subscription_v2_'+'a'*32
+        nodes=[dict(node_id='node_v2_'+str(i)*32,runtime_name=name,proto='ss',identity_strength='strong',
+                    source_status='verified',subscription_ids=[source],subscription_name='界面验证 fixture <订阅>')
+               for i,name in enumerate(['fixture 长名称节点 <香港> & "仅用于界面验证" 🇭🇰','fixture 美国节点','fixture 失败节点'],1)]
+        web.get_catalog=lambda:dict(version=2,status='ok',sources=[
+            dict(subscription_id=source,name='界面验证 fixture <订阅>',loaded=True),
+            dict(subscription_id='subscription_v2_'+'b'*32,name='fixture 未加载订阅',loaded=False)],nodes=nodes)
+        web.get_current=lambda:dict(ok=True,now=nodes[0]['runtime_name'],group='fixture 策略组')
+        web.connect_controller=lambda:None
+        web.LEAK_BASIC_LOOKUP=lambda ip:None
+        web.switch_node=lambda name:dict(ok=True,now=name,group='fixture 策略组')
+        def run(params):
+            job=params['_job_id']
+            try:
+                for phase in ['preparing','probing','measuring','enriching','finalizing']:
+                    if web.STATE.get('cancel_requested'):
+                        web.JOBS.transition(job,'cancelling');web.JOBS.transition(job,'cancelled');return
+                    web.JOBS.transition(job,phase)
+                    if phase=='probing':
+                        for i,n in enumerate(nodes):
+                            row=dict(n,name=n['runtime_name'],latency_ms=12+i*20 if i<2 else None,
+                                     median_mbps=None,status='fixture',measurement_scope={'bandwidth':'pending'},
+                                     exit_status={'ipv4':'pending','ipv6':'pending'})
+                            web.JOBS.publish(job,'node_probe',phase=phase,node_id=n['node_id'],
+                                             payload=dict(result=row,completed=i+1,total=3))
+                    elif phase=='measuring' and params.get('mode')!='ip':
+                        for i,n in enumerate(nodes[:2]):
+                            web.JOBS.publish(job,'node_measurement',phase=phase,node_id=n['node_id'],
+                                payload=dict(result=dict(node_id=n['node_id'],name=n['runtime_name'],
+                                    median_mbps=80-i*30,network_score=65,download_bytes=500000,
+                                    measurement_scope={'bandwidth':'completed'},exit_status={'ipv4':'completed','ipv6':'failed'}),completed=i+1,total=2))
+                        web.JOBS.publish(job,'phase_finished',payload={'metrics':{'download':dict(duration_ms=100,attempts=2,successes=2,bytes=1000000)}})
+                    web.speedbench_db.save_task(web.db_path(),web.JOBS.snapshot(job))
+                    time.sleep(.75)
+                web.JOBS.transition(job,'completed')
+            finally:
+                web.speedbench_db.save_task(web.db_path(),web.JOBS.snapshot(job))
+                with web.STATE_LOCK: web.STATE.update(running=False,proc=None,exit_code=0)
+        web.run_benchmark=run
+        server=ThreadingHTTPServer(('127.0.0.1',args.port),web.Handler)
+        print('Isolated UI fixture http://127.0.0.1:'+str(server.server_port),flush=True)
+        try: server.serve_forever()
+        except KeyboardInterrupt: pass
+        finally: server.server_close()
+
+
+if __name__=='__main__':
+    main()

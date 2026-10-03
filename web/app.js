@@ -44,15 +44,19 @@ function toast(msg, ok=true){
 }
 
 /* 自制确认对话框（中断测速/停止面板这类破坏性操作用） */
-let modalYes = null;
+let modalYes = null, modalReturnFocus=null;
 function confirmModal(text, onYes){
+  modalReturnFocus=document.activeElement;
   document.getElementById('modal-text').textContent = text;
   modalYes = onYes;
   document.getElementById('modal-mask').style.display = 'flex';
+  const no=document.getElementById('modal-no');if(no.focus) no.focus();
 }
 function closeModal(){
   document.getElementById('modal-mask').style.display = 'none';
   modalYes = null;
+  if(modalReturnFocus && modalReturnFocus.isConnected && modalReturnFocus.focus) modalReturnFocus.focus({preventScroll:true});
+  modalReturnFocus=null;
 }
 
 /* ==================== 评分 Profile（公式与旧版一致，勿改） ==================== */
@@ -501,6 +505,13 @@ let currentNode = '', currentGroup = '';
 let searchText = '';
 let expandedNode = null;      // 节点视图中展开详情面板的节点（一次只展开一个）
 let pollTimer = null;         // 测速状态轮询：全局单例，切视图不清除
+let sourceCatalog = {nodes:[],sources:[]}, selectedNodeIds = new Set();
+let taskClient = null, taskConfig = null, activeTask = null;
+let favIds = new Set();
+try{ favIds=new Set(JSON.parse(lsGet('sb_favs_v2')||'[]')); }catch(e){}
+const taskLabels={queued:'排队中',preparing:'准备中',probing:'探测中',measuring:'带宽精测中',enriching:'IP 画像查询中',finalizing:'保存与清理中',cancelling:'正在取消与清理',completed:'已完成',cancelled:'已取消 · 部分结果',failed:'失败 · 部分结果',interrupted:'应用中断 · 部分结果'};
+function nodeUiKey(r){ return r.node_id || r.name; }
+function sourceLabel(r){ return r.subscription_name || (r.source_status==='ambiguous'?'多个来源（无法唯一确认）':r.provider||'来源未知'); }
 
 async function loadSourceCatalog(){
   const select = document.getElementById('f-source');
@@ -509,9 +520,18 @@ async function loadSourceCatalog(){
   const selected = select.value || '';
   try{
     const catalog = await getJSON('/api/catalog');
+    sourceCatalog = catalog;
+    if(typeof SBTasks!=='undefined'){
+      const migrated=SBTasks.migrateFavorites([...favs],catalog.nodes||[],[...favIds]);
+      favIds=new Set(migrated.ids); favs=new Set(migrated.pending);
+      lsSet('sb_favs_v2',JSON.stringify([...favIds])); lsSet('sb_favs',JSON.stringify([...favs]));
+      const pending=document.getElementById('pending-favorites');
+      if(pending) pending.textContent=favs.size?`待确认旧收藏：${[...favs].join('、')}。不会按名称合并到其他节点。`:'旧收藏迁移完成；新收藏按稳定节点身份保存。';
+    }
     select.innerHTML = '<option value="">全部已加载节点</option>' + (catalog.sources||[]).map(s=>
       `<option value="${esc(s.subscription_id)}"${s.loaded?'':' disabled'}>${esc(s.name)}${s.loaded?'':' · 未加载/不可用'}</option>`).join('');
-    const valid = (catalog.sources||[]).some(s=>s.loaded && s.subscription_id===selected);
+    if(typeof SBTasks!=='undefined') select.innerHTML+='<option value="__favorites__">已收藏节点</option><option value="__manual__">手动选择节点</option>';
+    const valid = ['__favorites__','__manual__'].includes(selected) || (catalog.sources||[]).some(s=>s.loaded && s.subscription_id===selected);
     if(selected && !valid){
       select.innerHTML += `<option value="${esc(selected)}" disabled>原选订阅已失效 · 请重新选择</option>`;
     }
@@ -520,6 +540,7 @@ async function loadSourceCatalog(){
     status.textContent = catalog.status==='ok'
       ? `已核验 ${(catalog.nodes||[]).length} 个节点 · ${unknown} 个来源不唯一/未知。未加载订阅不会自动切换。`
       : '订阅目录暂不可核验，仍可测速已加载节点；来源不会被猜测填入。';
+    renderNodePicker(); updateTaskBudget();
   }catch(e){ status.textContent='订阅目录读取失败；请确认 Verge 已运行。'; }
 }
 
@@ -528,21 +549,22 @@ async function loadSourceCatalog(){
 function rowHtml(r, i, opts){
   const ro = opts.readonly;
   const isCur = !ro && r.name===opts.currentNode;
-  const isFav = !ro && opts.favs.has(r.name);
+  const isFav = !ro && (r.node_id?favIds.has(r.node_id):opts.favs.has(r.name));
   const sc = profileScore(r);
   // 评分列 = 当前 Profile 分数（一位小数）+ 星标。星标始终显示后端 stars：
   // stars 是后端综合评级的直观符号，Profile 切换只改数值与排序，不同步换算以免误导。
-  let h = `<tr data-name="${esc(r.name)}"${isCur?' class="current"':''}${opts.selected?' class="sel"':''}>`;
+  let h = `<tr data-name="${esc(r.name)}" data-node-id="${esc(r.node_id||'')}" data-row-key="${esc(nodeUiKey(r))}" tabindex="0"${ro?'':` aria-expanded="${!!opts.expanded}"`}${isCur?' class="current"':''}${opts.selected?' class="sel"':''}>`;
   h += `<td>${i+1}</td><td>`;
   if(!ro)
-    h += `<span class="fav${isFav?' on':''}" data-name="${esc(r.name)}" title="收藏/取消收藏">${isFav?'★':'☆'}</span>`;
+    h += `<button class="fav${isFav?' on':''}" data-name="${esc(r.name)}" data-node-id="${esc(r.node_id||'')}" aria-label="收藏/取消收藏 ${esc(r.name)}" aria-pressed="${isFav}">${isFav?'★':'☆'}</button>`;
   h += esc(r.name);
   if(isCur) h += '<span class="cur-mark">✅ 使用中</span>';
-  h += '</td>';
+  h += `<div class="node-source">${esc(sourceLabel(r))}</div></td>`;
   if(opts.provider) h += `<td class="mono">${esc(r.provider||'(未知订阅)')}</td>`;
   h += `<td class="mono">${r.latency_ms??'-'}</td>`;
   h += `<td class="mono">${r.median_mbps?r.median_mbps.toFixed(1):'-'}</td>`;
-  const network = r.network_score ?? r.networkScore ?? r.score;
+  const scope=(r.measurement_scope||{}).bandwidth;
+  const network = ['not_requested','not_selected','pending'].includes(scope)?null:(r.network_score ?? r.networkScore ?? r.score);
   h += `<td class="stars" data-name="${esc(r.name)}" title="查看 30 天趋势"><span class="sc-num">${network==null?'-':Number(network).toFixed(1)}</span> ${esc(r.stars||'')}</td>`;
   if(opts.intelColumns !== false){
     h += `<td class="mono">${esc(ipGradeOf(r))}</td>`;
@@ -609,7 +631,7 @@ function detailHtml(r, colspan){
     `<div class="card-sub">Provider 状态：${esc(JSON.stringify(intel.provider_status||{}))}</div>`+
     `<div class="provider-detail-list">${providerBlocks||'<span class="card-sub">暂无 Provider 细节</span>'}</div></div>`;
   return `<tr class="detail-row"><td colspan="${colspan||8}"><div class="detail-grid">${cells}</div>${intelText}` +
-         `<div class="detail-actions"><button class="mini trend" data-name="${esc(r.name)}">📈 查看 30 天趋势</button></div></td></tr>`;
+         `<div class="detail-actions"><button class="mini trend" data-name="${esc(r.name)}" data-node-id="${esc(r.node_id||'')}">📈 查看 30 天趋势</button></div></td></tr>`;
 }
 
 function skeletonRows(n, colspan){
@@ -628,7 +650,7 @@ function renderTable(){
   if(!latestData){ tbody.innerHTML = skeletonRows(6); return; }
   const all = latestData.results || [];
   if(!all.length){
-    tbody.innerHTML = emptyRow('暂无测速记录 · 在上方设置参数后点击「开始测速」');
+    tbody.innerHTML = emptyRow(activeTask && !SBTasks.terminal(activeTask.status)?'等待首个探测结果；任务正在运行。':'暂无测速记录 · 在上方选择范围与模式，点击「开始测速」');
     return;
   }
   // 有任一节点带订阅来源时才显示「订阅」列（旧历史没有 provider 字段）
@@ -644,16 +666,18 @@ function renderTable(){
     return;
   }
   sortRows(rows, sortKey, sortAsc);
-  tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
+  const render=()=>{tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
     readonly:false, currentNode, favs,
-    expanded: expandedNode===r.name, selected:false,
+    expanded: expandedNode===nodeUiKey(r), selected:false,
     provider: showProv, cols,
-  })).join('');
+  })).join('');};
+  if(typeof SBView!=='undefined') SBView.retainTable(tbody,render);else render();
 }
 
 function renderMeta(){
   document.getElementById('cur-line').textContent =
     currentNode ? `当前：${currentGroup} = ${currentNode}` : '';
+  document.getElementById('cur-line').title=currentNode;
   renderTable();
 }
 
@@ -665,7 +689,7 @@ function setSort(k){
 
 /* ---------- 地区榜 ---------- */
 function boardItem(x){
-  return `<span class="board-item" data-name="${esc(x.name)}">${esc(x.name)} <b>${x.sc==null?'-':x.sc.toFixed(1)}</b>${x.mbps!=null?`·${x.mbps.toFixed(0)}M`:''}</span>`;
+  return `<button class="board-item" data-name="${esc(x.name)}" data-node-id="${esc(x.node_id||'')}">${esc(x.name)} <b>${x.sc==null?'-':x.sc.toFixed(1)}</b>${x.mbps!=null?`·${x.mbps.toFixed(0)}M`:''}</button>`;
 }
 
 // 地区榜：按 regionOf 分组，每组取当前 Profile 下 Top 3；不通/无数据（分数 null）不进榜；
@@ -674,8 +698,8 @@ function renderBoard(){
   const bd = document.getElementById('board');
   if(!latestData || !latestData.results || !latestData.results.length){ bd.style.display='none'; return; }
   let html = '';
-  const favRows = latestData.results.filter(r=>favs.has(r.name))
-    .map(r=>({name:r.name, sc:profileScore(r), mbps:r.median_mbps}))
+  const favRows = latestData.results.filter(r=>r.node_id?favIds.has(r.node_id):favs.has(r.name))
+    .map(r=>({name:r.name, node_id:r.node_id, sc:profileScore(r), mbps:r.median_mbps}))
     .sort((a,b)=>(b.sc??-1)-(a.sc??-1));
   if(favRows.length)
     html += `<div class="board-group"><span class="board-code">⭐ 收藏</span>${favRows.map(boardItem).join('')}</div>`;
@@ -685,7 +709,7 @@ function renderBoard(){
     if(sc==null) continue;
     const code = regionOf(r);
     if(!groups[code]) groups[code] = [];
-    groups[code].push({name:r.name, sc, mbps:r.median_mbps});
+    groups[code].push({name:r.name, node_id:r.node_id, sc, mbps:r.median_mbps});
   }
   const codes = Object.keys(groups).sort((a,b)=>{
     const top = c=>Math.max(...groups[c].map(x=>x.sc));
@@ -705,7 +729,7 @@ let histData = [];
 let histLoaded = false;
 let histSortKey = 'score', histSortAsc = false;
 let histSelRun = -1;          // histData 下标；-1=未选
-let histSelNode = null;
+let histSelNode = null, histSelNodeId = '';
 // 单节点 30 天趋势：{name, pts:[{ts,v}], changes:[...], reputation_changes:[...], note}；
 // name 不符时回退 histData
 let nodeTrend = null;
@@ -727,7 +751,9 @@ async function loadHistory(){
   if(histData.length && (histSelRun<0 || histSelRun>=histData.length)){
     histSelRun = histData.length-1;   // 默认最新一轮 + 冠军节点
     const ch = championOf(histData[histSelRun]);
-    histSelNode = ch ? ch.name : ((histData[histSelRun].results||[])[0]||{}).name || null;
+    const selected=ch || (histData[histSelRun].results||[])[0];
+    histSelNode=selected?selected.name:null;
+    histSelNodeId=selected?selected.node_id||'':'';
   }
   renderHistList(); renderHistTable();
   if(histSelNode) fetchNodeTrend(histSelNode); else drawChart();
@@ -762,7 +788,7 @@ function renderHistTable(){
   sortRows(rows, histSortKey, histSortAsc);
   tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
     readonly:true, currentNode:'', favs:{has(){return false}},
-    expanded:false, selected: r.name===histSelNode, intelColumns:false,
+    expanded:false, selected: histSelNodeId?r.node_id===histSelNodeId:!r.node_id && r.name===histSelNode, intelColumns:false,
   })).join('');
 }
 
@@ -774,15 +800,15 @@ function setHistSort(k){
 
 /* ---------- 单节点 30 天趋势 + IP 变化 ---------- */
 // 数据源：优先 /api/node 的 30 天序列（含 IP 变化时间线），失败回退 histData
-async function fetchNodeTrend(name){
+async function fetchNodeTrend(name,nodeId=histSelNodeId){
   nodeTrend = null;
   drawChart();   // 先用 histData 画兜底版
   renderIpTimeline();
   try{
-    const d = await getJSON('/api/node?name='+encodeURIComponent(name)+'&days=30');
-    if(histSelNode!==name) return;  // 等待期间用户已改选别的节点，丢弃过期响应
+    const d = await getJSON('/api/node?name='+encodeURIComponent(name)+'&days=30'+(nodeId?'&node_id='+encodeURIComponent(nodeId):''));
+    if(histSelNode!==name || histSelNodeId!==nodeId) return;
     nodeTrend = {
-      name,
+      name,node_id:nodeId,
       pts: (d.series||[]).filter(s=>s.median_mbps!=null)
            .map(s=>({ts:(s.ts||'').slice(5,16), v:s.median_mbps})),
       changes: d.ip_changes||[],
@@ -791,7 +817,8 @@ async function fetchNodeTrend(name){
       note: ipChangeNote(d.ip_changes),
     };
   }catch(e){
-    nodeTrend = {name, pts:[], changes:[], reputation_changes:[], note:''};  // 静默回退 histData
+    if(histSelNode!==name || histSelNodeId!==nodeId) return;
+    nodeTrend = {name,node_id:nodeId, pts:[], changes:[], reputation_changes:[], note:''};
   }
   drawChart(); renderIpTimeline();
 }
@@ -814,14 +841,14 @@ function drawChart(){
   const name = histSelNode;
   document.getElementById('chart-title').textContent =
     name ? `30 天带宽趋势：${name}` : '30 天带宽趋势（选择节点后展示）';
-  const useSeries = nodeTrend && nodeTrend.name===name && nodeTrend.pts.length;
+  const useSeries = nodeTrend && nodeTrend.name===name && nodeTrend.node_id===histSelNodeId && nodeTrend.pts.length;
   document.getElementById('chart-sub').textContent = useSeries ? (nodeTrend.note||'') : '';
   const pts = [];
   if(useSeries){
     pts.push(...nodeTrend.pts);
   }else if(name && histData.length){
     for(const rec of histData){
-      const r = (rec.results||[]).find(x=>x.name===name);
+      const r = (rec.results||[]).find(x=>histSelNodeId?x.node_id===histSelNodeId:!x.node_id && x.name===name);
       if(r && r.median_mbps!=null) pts.push({ts:(rec.ts||'').slice(5,16), v:r.median_mbps});
     }
   }
@@ -847,7 +874,7 @@ function drawChart(){
 
 function renderIpTimeline(){
   const box = document.getElementById('ip-timeline');
-  const t = nodeTrend && nodeTrend.name===histSelNode ? nodeTrend : null;
+  const t = nodeTrend && nodeTrend.name===histSelNode && nodeTrend.node_id===histSelNodeId ? nodeTrend : null;
   const changes = t && Array.isArray(t.changes) ? t.changes : [];
   const reputation = t && Array.isArray(t.reputation_changes)
     ? t.reputation_changes : [];
@@ -915,9 +942,12 @@ function subsRawProvider(){ return subsSel===UNKNOWN_PROVIDER ? '' : subsSel; }
 
 async function loadSubs(){
   let d;
-  try{ d = await getJSON('/api/subscriptions?days='+subsDays); }
+  try{ d = await getJSON((typeof SBTasks==='undefined'?'/api/subscriptions':'/api/sources/history')+'?days='+subsDays); }
   catch(e){ d = []; toast('读取订阅汇总失败', false); }
   subsData = Array.isArray(d) ? d : [];
+  if(typeof SBTasks!=='undefined') subsData=subsData.map(s=>Object.assign({},s,{
+    provider:s.name,online_ratio:s.probe_online_ratio,avg_score:s.avg_network_score,
+    selection_key:s.subscription_id || 'legacy:'+s.source_status+'|'+s.name}));
   subsLoaded = true;
   renderSubsTable();
   if(subsSel) selectSub(subsSel);   // 天数变化后已选中的订阅也要重拉趋势
@@ -931,11 +961,11 @@ function renderSubsTable(){
     return;
   }
   tbody.innerHTML = subsData.map(s=>
-    `<tr data-provider="${esc(s.provider)}"${s.provider===subsSel?' class="sel"':''}>` +
+    `<tr data-provider="${esc(s.selection_key||s.provider)}"${(s.selection_key||s.provider)===subsSel?' class="sel"':''}>` +
     `<td>${esc(s.provider)}</td>` +
     `<td class="mono">${s.run_count}</td>` +
     `<td class="mono">${s.node_count}</td>` +
-    `<td class="mono">${s.online_ratio==null?'-':(s.online_ratio*100).toFixed(0)+'%'}</td>` +
+    `<td class="mono">${s.online_ratio==null?'N/A':(s.online_ratio*100).toFixed(0)+'%'}${s.bandwidth_coverage==null?'':`<small class="node-source">带宽覆盖 ${(s.bandwidth_coverage*100).toFixed(0)}% · 成功率 ${s.bandwidth_success_ratio==null?'N/A':(s.bandwidth_success_ratio*100).toFixed(0)+'%'}</small>`}</td>` +
     `<td class="mono">${s.median_mbps!=null?s.median_mbps.toFixed(1):'-'}</td>` +
     `<td class="mono">${s.latency_ms!=null?s.latency_ms.toFixed(0):'-'}</td>` +
     `<td class="mono">${s.avg_score!=null?s.avg_score.toFixed(1):'-'}</td>` +
@@ -945,14 +975,22 @@ function renderSubsTable(){
 
 async function selectSub(name){
   subsSel = name;
+  const source=subsData.find(s=>(s.selection_key||s.provider)===name);
+  const display=source?source.provider:name;
   document.getElementById('subs-detail-card').style.display = '';
   document.getElementById('subs-detail-title').textContent =
-    `订阅趋势：${name}（近 ${subsDays} 天，三条线各自归一）`;
+    `订阅趋势：${display}（近 ${subsDays} 天，三条线各自归一；多来源节点不能跨订阅相加）`;
   renderSubsTable();
   subsSeries = null;
   drawSubsChart();
+  if(source && !source.subscription_id && source.source_status==='unknown'){
+    subsSeries={name,pts:[]};
+    renderSubsNodes(name);
+    return; // No verified source identity: do not merge a legacy empty-name series.
+  }
   try{
-    const d = await getJSON('/api/subscription?name='+encodeURIComponent(name)+'&days='+subsDays);
+    const url=source && source.subscription_id?'/api/source?subscription_id='+encodeURIComponent(source.subscription_id):'/api/subscription?name='+encodeURIComponent(display==='历史来源未知' || display==='来源未知'?'':display);
+    const d = await getJSON(url+'&days='+subsDays);
     if(subsSel!==name) return;   // 等待期间用户已改选别的订阅，丢弃过期响应
     subsSeries = {name, pts: Array.isArray(d) ? d : []};
   }catch(e){
@@ -972,13 +1010,17 @@ async function renderSubsNodes(forName){
   }
   if(subsSel!==forName) return;   // 过期响应
   const want = subsRawProvider();
+  const source=subsData.find(s=>(s.selection_key||s.provider)===forName);
+  const matches=r=>source && source.subscription_id?(r.subscription_ids||[]).includes(source.subscription_id):
+    source && source.source_status==='unknown'?!!r.node_id && !(r.subscription_ids||[]).length:
+    source && source.source_status==='legacy_unknown'?!r.node_id && (r.provider||'')===(source.provider==='历史来源未知'?'':source.provider):(r.provider||'')===want;
   let rec = null;
   for(let i=hist.length-1;i>=0;i--){
-    if((hist[i].results||[]).some(r=>(r.provider||'')===want)){ rec = hist[i]; break; }
+    if((hist[i].results||[]).some(matches)){ rec = hist[i]; break; }
   }
   document.getElementById('subs-chart-sub').textContent =
     rec ? `最近一轮：${rec.ts}` : '';
-  const rows = rec ? (rec.results||[]).filter(r=>(r.provider||'')===want) : [];
+  const rows = rec ? (rec.results||[]).filter(matches) : [];
   if(!rows.length){ tbody.innerHTML = emptyRow('该订阅暂无节点数据'); return; }
   sortRows(rows, 'score', false);
   tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
@@ -1053,6 +1095,7 @@ async function loadLatest(){
     toast('读取测速结果失败', false);
     return;
   }
+  if(activeTask && typeof SBTasks!=='undefined' && !SBTasks.terminal(activeTask.status)) return;
   if(rec && rec.results){
     latestData = rec;
     document.getElementById('latest-meta').textContent =
@@ -1068,6 +1111,8 @@ async function loadCurrent(){
   try{
     const r = await getJSON('/api/current');
     if(r.ok){ currentGroup=r.group; currentNode=r.now; }
+    const status=document.getElementById('connection-status');
+    if(status) status.textContent=r.ok?'Clash Verge 已连接 · 独立 worker':'Clash Verge 未连接 · 请启动 Verge 并开启外部控制器';
   }catch(e){}
   renderMeta();
 }
@@ -1079,8 +1124,10 @@ function setRunUi(running){
   document.getElementById('prog-wrap').style.display = running ? 'flex' : 'none';
   if(running){
     document.getElementById('log-toggle').style.display = '';
-    document.getElementById('log').style.display = 'block';
-    document.getElementById('log-arrow').textContent = '▾';
+    if(typeof SBTasks==='undefined'){
+      document.getElementById('log').style.display = 'block';
+      document.getElementById('log-arrow').textContent = '▾';
+    }
   }
 }
 
@@ -1097,11 +1144,13 @@ async function resumeRun(){
   let s;
   try{ s = await getJSON('/api/run/status'); }catch(e){ return; }
   if(!s || !s.running) return;
+  if(typeof SBTasks!=='undefined' && s.job_id){ await attachTask(s.job_id); return; }
   setRunUi(true);
   startPolling();
 }
 
 async function startRun(){
+  if(typeof SBTasks!=='undefined'){ await startTask(); return; }
   const body = {
     include: document.getElementById('f-include').value,
     mb: +document.getElementById('f-mb').value,
@@ -1151,6 +1200,13 @@ async function pollStatus(){
 }
 
 function cancelRun(){
+  if(activeTask && !SBTasks.terminal(activeTask.status)){
+    confirmModal('取消当前任务？已完成结果会保留，清理结束后才显示任务终态。',async()=>{
+      try{ const r=await post('/api/jobs/'+activeTask.job_id+'/cancel'); toast(r.msg||'已请求取消，等待清理',!!r.ok); }
+      catch(e){ toast('取消请求失败；请刷新任务中心检查状态',false); }
+    });
+    return;
+  }
   confirmModal('中断当前测速？会向测速进程发送中断信号，恢复 Clash 配置后停止。', async ()=>{
     let r;
     try{ r = await post('/api/run/cancel'); }
@@ -1179,14 +1235,15 @@ async function switchNode(name, btn){
 }
 
 // 「查看 30 天趋势」：跳到历史视图并选中该节点（含该节点的最近一轮）
-function gotoTrend(name){
+function gotoTrend(name,nodeId=''){
   setHash('#/history');   // 触发 hashchange → route()
   const go = ()=>{
     for(let i=histData.length-1;i>=0;i--){
-      if((histData[i].results||[]).some(x=>x.name===name)){ histSelRun=i; break; }
+      if((histData[i].results||[]).some(x=>nodeId?x.node_id===nodeId:x.name===name)){ histSelRun=i; break; }
     }
     histSelNode = name;
-    renderHistList(); renderHistTable(); fetchNodeTrend(name);
+    histSelNodeId=nodeId;
+    renderHistList(); renderHistTable(); fetchNodeTrend(name,nodeId);
   };
   if(histLoaded) go();
   else loadHistory().then(go);
@@ -1378,7 +1435,7 @@ function openDnsAudit(url){
 }
 
 /* ==================== hash 路由 ==================== */
-const VIEWS = ['nodes','history','subs','leak','settings','about'];
+const VIEWS = ['nodes','tasks','history','subs','leak','settings','about'];
 function currentView(){
   let h = '';
   try{ h = (window.location && window.location.hash) || ''; }catch(e){ h=''; }
@@ -1403,25 +1460,38 @@ function route(){
   }
   if(v==='leak') loadLeakHistory();
   if(v==='settings') loadProviderStatus();
+  if(v==='tasks') loadTasks();
 }
 
 /* ==================== 事件绑定（全部 addEventListener/委托） ==================== */
 function init(){
+  initTaskControls();
   const sourceRefresh = document.getElementById('btn-source-refresh');
   if(sourceRefresh) sourceRefresh.addEventListener('click',loadSourceCatalog);
   // 节点表格：事件委托；节点名一律走 dataset（HTML 属性经 esc 转义），绝不拼接进 JS 源码
   document.getElementById('tbody').addEventListener('click', e=>{
     const fv = e.target.closest('.fav');
-    if(fv && fv.dataset.name!=null){ toggleFav(fv.dataset.name); return; }
+    if(fv && fv.dataset.name!=null){
+      if(fv.dataset.nodeId){
+        const id=fv.dataset.nodeId; if(favIds.has(id)) favIds.delete(id); else favIds.add(id);
+        lsSet('sb_favs_v2',JSON.stringify([...favIds])); renderTable();renderBoard();updateTaskBudget();
+      }else toggleFav(fv.dataset.name);
+      return;
+    }
     const sw = e.target.closest('button.sw');
-    if(sw && sw.dataset.name!=null){ switchNode(sw.dataset.name, sw); return; }
+    if(sw && sw.dataset.name!=null){
+      if(typeof SBTasks!=='undefined') confirmModal(`切换到 ${sw.dataset.name}？涉及策略组：${currentGroup||'由后端验证可选策略组'}。来源：${sourceLabel((latestData?.results||[]).find(r=>nodeUiKey(r)===(sw.dataset.nodeId||sw.dataset.name))||{})}。`,()=>switchNode(sw.dataset.name,sw));
+      else switchNode(sw.dataset.name, sw);
+      return;
+    }
     const tb = e.target.closest('button.trend');
-    if(tb && tb.dataset.name!=null){ gotoTrend(tb.dataset.name); return; }
+    if(tb && tb.dataset.name!=null){ gotoTrend(tb.dataset.name,tb.dataset.nodeId||''); return; }
     const cell = e.target.closest('td.stars');
-    if(cell && cell.dataset.name!=null){ gotoTrend(cell.dataset.name); return; }
+    if(cell && cell.dataset.name!=null){ gotoTrend(cell.dataset.name,cell.closest('tr').dataset.nodeId||''); return; }
     const tr = e.target.closest('tr[data-name]');
     if(tr && tr.dataset.name!=null){   // 点击行：展开/收起详情面板
-      expandedNode = (expandedNode===tr.dataset.name) ? null : tr.dataset.name;
+      const key=tr.dataset.rowKey||tr.dataset.name;
+      expandedNode = (expandedNode===key) ? null : key;
       renderTable();
     }
   });
@@ -1430,6 +1500,7 @@ function init(){
     const tr = e.target.closest('tr[data-name]');
     if(tr && tr.dataset.name!=null){
       histSelNode = tr.dataset.name;
+      histSelNodeId=tr.dataset.nodeId||'';
       renderHistTable();
       fetchNodeTrend(histSelNode);
     }
@@ -1442,6 +1513,7 @@ function init(){
       const rec = histData[histSelRun];
       const ch = rec ? championOf(rec) : null;
       histSelNode = ch ? ch.name : (((rec&&rec.results)||[])[0]||{}).name || null;
+      histSelNodeId=ch?ch.node_id||'':'';
       renderHistList(); renderHistTable();
       if(histSelNode) fetchNodeTrend(histSelNode); else drawChart();
     }
@@ -1466,14 +1538,16 @@ function init(){
   });
   document.getElementById('board-body').addEventListener('click', e=>{
     const it = e.target.closest('.board-item');
-    if(it && it.dataset.name!=null) gotoTrend(it.dataset.name);
+    if(it && it.dataset.name!=null) gotoTrend(it.dataset.name,it.dataset.nodeId||'');
   });
   // 运行日志折叠
-  document.getElementById('log-toggle').addEventListener('click', ()=>{
+  document.getElementById('log-toggle').addEventListener('click', e=>{
     const log = document.getElementById('log');
     const open = log.style.display==='none';
     log.style.display = open?'block':'none';
     document.getElementById('log-arrow').textContent = open?'▾':'▸';
+    if(e && e.currentTarget && e.currentTarget.setAttribute) e.currentTarget.setAttribute('aria-expanded',String(open));
+    if(open && typeof SBTasks!=='undefined') getJSON('/api/run/status').then(s=>{log.textContent=(s.lines||[]).join('\n');}).catch(()=>{});
   });
   // 搜索框：按节点名/订阅名实时过滤
   document.getElementById('f-search').addEventListener('input', e=>{
@@ -1494,7 +1568,7 @@ function init(){
   });
   document.getElementById('subs-nodes-tbody').addEventListener('click', e=>{
     const cell = e.target.closest('td.stars');
-    if(cell && cell.dataset.name!=null) gotoTrend(cell.dataset.name);
+    if(cell && cell.dataset.name!=null) gotoTrend(cell.dataset.name,cell.closest('tr').dataset.nodeId||'');
   });
   document.getElementById('btn-run').addEventListener('click', startRun);
   document.getElementById('btn-cancel').addEventListener('click', cancelRun);
@@ -1519,10 +1593,164 @@ function init(){
   document.getElementById('modal-mask').addEventListener('click', e=>{
     if(e.target===e.currentTarget) closeModal();
   });
+  document.getElementById('modal-mask').addEventListener('keydown',e=>{
+    if(e.key==='Escape'){e.preventDefault();closeModal();}
+    if(e.key==='Tab'){
+      const no=document.getElementById('modal-no'), yes=document.getElementById('modal-yes');
+      if((e.shiftKey && document.activeElement===no)||(!e.shiftKey && document.activeElement===yes)){
+        e.preventDefault();(e.shiftKey?yes:no).focus();
+      }
+    }
+  });
   window.addEventListener('hashchange', route);
   window.addEventListener('resize', ()=>{
     if(currentView()==='history') drawChart();
     if(currentView()==='subs') drawSubsChart();
+  });
+}
+
+/* ==================== 共享任务界面（传输状态在 tasks.js） ==================== */
+function scopedNodes(){
+  const source=document.getElementById('f-source').value;
+  return (sourceCatalog.nodes||[]).filter(n=>
+    source==='__favorites__'?favIds.has(n.node_id):
+    source==='__manual__'?selectedNodeIds.has(n.node_id):
+    !source || (n.subscription_ids||[]).includes(source));
+}
+function renderNodePicker(){
+  const panel=document.getElementById('manual-scope'),picker=document.getElementById('node-picker');
+  if(!panel || !picker || typeof SBTasks==='undefined') return;
+  panel.hidden=document.getElementById('f-source').value!=='__manual__';
+  const q=(document.getElementById('f-node-search').value||'').toLowerCase();
+  picker.innerHTML=(sourceCatalog.nodes||[]).filter(n=>`${n.runtime_name} ${sourceLabel(n)}`.toLowerCase().includes(q)).map(n=>
+    `<label class="node-choice"><input type="checkbox" data-node-id="${esc(n.node_id||'')}"${selectedNodeIds.has(n.node_id)?' checked':''}${n.identity_strength==='strong'?'':' disabled'}> <span>${esc(n.runtime_name)}<small>${esc(sourceLabel(n))}</small></span></label>`).join('')||'<p class="muted">暂无可选节点。请刷新订阅目录。</p>';
+}
+function updateTaskBudget(){
+  const el=document.getElementById('task-budget');
+  if(!el || !taskConfig || typeof SBTasks==='undefined') return;
+  const mode=document.getElementById('f-mode').value||'standard';
+  const config=Object.assign({},(taskConfig.modes||{})[mode]);
+  const mb=document.getElementById('f-mb').value;
+  if(mb!=='') config.mb=Number(mb);
+  config.rounds=Number(document.getElementById('f-rounds').value)||1;
+  config.multi=document.getElementById('f-multi').checked;
+  const count=scopedNodes().length;
+  const budget=SBTasks.budget(config,count);
+  el.textContent=`范围 ${count} 节点 · ${config.bandwidth?'精测最多 '+(config.measure_all?count:Math.min(count,config.top_n))+' 节点':'不请求带宽'} · 带宽样本预算上限 ${budget} MB（不含小流量探测；不是实际流量）`;
+}
+async function startTask(){
+  const mode=document.getElementById('f-mode').value||'standard';
+  const body={mode,target_profile:document.getElementById('f-target').value||'daily',
+    rounds:Number(document.getElementById('f-rounds').value)||1,
+    auto_switch:document.getElementById('f-autoswitch').checked,
+    multi:document.getElementById('f-multi').checked,
+    all_ip:document.getElementById('f-all-ip').checked};
+  const mb=document.getElementById('f-mb').value;
+  if(mb!=='') body.mb=Number(mb);
+  const include=document.getElementById('f-include').value;
+  if(include) body.include=include;
+  const source=document.getElementById('f-source').value;
+  if(source==='__manual__' || source==='__favorites__'){
+    body.node_ids=[...new Set(scopedNodes().filter(n=>n.identity_strength==='strong').map(n=>n.node_id))];
+    if(!body.node_ids.length){ toast('所选范围没有可核验节点。请刷新订阅或重新选择。',false); return; }
+  }else if(source) body.subscription_ids=[source];
+  if(mode==='ip' && body.multi){ toast('IP 专项不请求带宽，请关闭“4 路峰值”。',false); return; }
+  if(body.auto_switch){
+    confirmModal('测速完成后自动切换当前策略组到已测范围内冠军？此操作会改变当前活动节点。',()=>dispatchTask(body));
+  }else await dispatchTask(body);
+}
+async function dispatchTask(body){
+  setRunUi(true);
+  try{
+    const r=await post('/api/jobs',body);
+    if(!r.ok){ setRunUi(false);toast(r.msg||'无法启动，请检查 Verge 连接和所选范围',false);return; }
+    setProfile(({balanced:'all',daily:'daily',download:'download',ip:'ipclean',residential:'residential'})[body.target_profile]||'all');
+    await attachTask(r.job_id);
+  }catch(e){setRunUi(false);toast('启动或任务连接失败；请刷新任务中心，勿重复启动',false);}
+}
+async function attachTask(id){
+  if(!taskClient) taskClient=new SBTasks.Client({get:getJSON,EventSource:window.EventSource,
+    onChange:showTask,onError:e=>toast('任务连接中断；刷新任务中心可恢复',false)});
+  await taskClient.attach(id);
+}
+function showTask(task){
+  activeTask=task;
+  const running=!SBTasks.terminal(task.status);
+  setRunUi(running);
+  document.getElementById('task-card').style.display='';
+  // Structured tasks keep logs collapsed; no stdout regex determines state.
+  const log=document.getElementById('log');
+  if(log && document.getElementById('log-toggle').getAttribute && document.getElementById('log-toggle').getAttribute('aria-expanded')!=='true') log.style.display='none';
+  const progress=task.progress;
+  const text=taskLabels[task.status]||'状态未知';
+  document.getElementById('prog-text').textContent=text+(progress?` ${progress.completed}/${progress.total}`:'');
+  document.getElementById('prog').value=progress&&progress.total?100*progress.completed/progress.total:0;
+  const bytes=Object.values(task.metrics||{}).reduce((n,m)=>n+(m.bytes||0),0);
+  const elapsed=task.elapsed_ms==null?'未知':(task.elapsed_ms/1000).toFixed(1)+'s';
+  document.getElementById('task-stage').textContent=text;
+  document.getElementById('task-summary').textContent=`${running?'截至此更新，已等待':'总耗时'} ${elapsed} · 已报告实际下载 ${(bytes/1000000).toFixed(2)} MB · IPv4/IPv6 独立更新${running?' · 剩余时间尚无法可靠估计':' · 中断中的未报告字节不计入此值'}`;
+  latestData={ts:task.started_at,results:task.results||[],task:task.config};
+  document.getElementById('latest-meta').textContent=`${task.config?.mode||task.mode||'未知模式'} · ${text} · ${latestData.results.length} 个已返回节点 · 已测范围内推荐`;
+  renderTable();renderBoard();
+  if(!running){histLoaded=false;subsLoaded=false;}
+}
+async function loadTasks(){
+  const list=document.getElementById('task-list');
+  if(!list || typeof SBTasks==='undefined') return;
+  try{
+    const data=await getJSON('/api/tasks');
+    list.innerHTML=(data.tasks||[]).map(t=>`<button class="task-history-item mini" data-job-id="${esc(t.job_id)}"><b>${esc(taskLabels[t.status]||t.status)}</b><span>${esc(t.mode)} · ${esc(t.started_at)} · ${t.elapsed_ms==null?'耗时未知':(t.elapsed_ms/1000).toFixed(1)+'s'}</span></button>`).join('')||'<p class="muted">暂无任务。选择订阅与模式，开始一次测速。</p>';
+  }catch(e){list.textContent='无法读取任务历史，请检查本地数据目录权限后刷新。';}
+}
+async function showTaskHistory(id){
+  if(!/^job_[0-9a-f]{32}$/.test(id)) return;
+  const task=await getJSON('/api/tasks/'+id), detail=document.getElementById('task-detail');
+  if(!task || task.job_id!==id){toast('任务已失效，请刷新',false);return;}
+  detail.hidden=false;
+  const metrics=Object.entries(task.metrics||{}).map(([phase,m])=>`<tr><td>${esc(phase)}</td><td>${(m.duration_ms/1000).toFixed(2)}s</td><td>${m.successes}/${m.attempts}</td><td>${(m.bytes/1000000).toFixed(2)} MB</td></tr>`).join('');
+  detail.innerHTML=`<h2>${esc(taskLabels[task.status]||task.status)}</h2><p class="muted">${esc(task.mode)} · ${task.partial?'部分结果':'完整任务'} · 重叠阶段耗时不可直接相加。流量仅统计已报告的 curl 实际字节。</p><div class="table-wrap"><table><thead><tr><th>阶段</th><th>耗时</th><th>成功/尝试</th><th>已报告实际下载</th></tr></thead><tbody>${metrics||emptyRow('旧记录无阶段耗时',4)}</tbody></table></div><div class="table-wrap"><table><thead><tr><th>#</th><th>节点</th><th>延迟</th><th>带宽</th><th>Network</th><th>IP Grade</th><th>IP 类型</th><th>风险</th><th>标签</th><th></th></tr></thead><tbody>${(task.results||[]).map((r,i)=>rowHtml(r,i,{readonly:true,favs:new Set()})).join('')||emptyRow('任务尚未返回节点结果',10)}</tbody></table></div>`;
+}
+function applyTheme(){
+  const theme=lsGet('sb_theme')||'system';
+  const dark=theme==='dark'||(theme==='system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  if(document.documentElement) document.documentElement.dataset.theme=dark?'dark':'light';
+  const input=document.getElementById('f-theme');if(input) input.value=theme;
+}
+function initTaskControls(){
+  if(typeof SBTasks==='undefined') return;
+  applyTheme();
+  const savedMode=lsGet('sb_mode'),savedTarget=lsGet('sb_target');
+  if(['quick','standard','deep','ip'].includes(savedMode)) document.getElementById('f-mode').value=savedMode;
+  if(['daily','download','balanced','ip','residential'].includes(savedTarget)) document.getElementById('f-target').value=savedTarget;
+  getJSON('/api/task-config').then(c=>{taskConfig=c;updateTaskBudget();}).catch(()=>{});
+  for(const id of ['f-source','f-mode','f-target','f-mb','f-rounds','f-multi','f-all-ip']){
+    const el=document.getElementById(id);if(el) el.addEventListener('change',()=>{
+      if(id==='f-mode') lsSet('sb_mode',el.value);
+      if(id==='f-target') lsSet('sb_target',el.value);
+      renderNodePicker();updateTaskBudget();
+    });
+  }
+  document.getElementById('f-node-search').addEventListener('input',renderNodePicker);
+  document.getElementById('node-picker').addEventListener('change',e=>{
+    const id=e.target.dataset.nodeId;if(!id) return;
+    if(e.target.checked) selectedNodeIds.add(id);else selectedNodeIds.delete(id);updateTaskBudget();
+  });
+  document.getElementById('f-theme').addEventListener('change',e=>{lsSet('sb_theme',e.target.value);applyTheme();});
+  if(window.matchMedia){const media=window.matchMedia('(prefers-color-scheme: dark)');if(media.addEventListener) media.addEventListener('change',applyTheme);}
+  document.getElementById('btn-tasks-refresh').addEventListener('click',loadTasks);
+  document.getElementById('task-list').addEventListener('click',e=>{const item=e.target.closest('[data-job-id]');if(item) showTaskHistory(item.dataset.jobId).catch(()=>toast('读取任务失败',false));});
+  document.getElementById('tbody').addEventListener('keydown',e=>{
+    if(e.target.tagName==='TR' && (e.key==='Enter'||e.key===' ')){e.preventDefault();e.target.click();}
+  });
+  for(const id of ['hist-tbody','subs-nodes-tbody','task-detail']){
+    document.getElementById(id).addEventListener('keydown',e=>{
+      if(e.target.tagName==='TR' && (e.key==='Enter'||e.key===' ')){
+        e.preventDefault();gotoTrend(e.target.dataset.name,e.target.dataset.nodeId||'');
+      }
+    });
+  }
+  document.getElementById('task-detail').addEventListener('click',e=>{
+    const row=e.target.closest('tr[data-name]');if(row) gotoTrend(row.dataset.name,row.dataset.nodeId||'');
   });
 }
 

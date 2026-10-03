@@ -200,7 +200,7 @@ _EXTRA_COLUMNS = {
         ("node_id", "TEXT"), ("identity_version", "INTEGER"),
         ("identity_strength", "TEXT"), ("source_status", "TEXT"),
     ],
-    "ip_profiles": [("region", "TEXT"), ("city", "TEXT")],
+    "ip_profiles": [("region", "TEXT"), ("city", "TEXT"), ('node_result_id','INTEGER')],
     # These entries make an interrupted/experimental migration repairable as
     # well.  Normal v0.8/v0.9 databases do not have the tables, so SCHEMA
     # creates them first and these ALTERs become no-ops.
@@ -230,6 +230,12 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
             for col, ctype in cols:
                 if col not in have:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ctype}")
+                    if table=='ip_profiles' and col=='node_result_id':
+                        # A reused name is not sufficient identity evidence.
+                        conn.execute('''UPDATE ip_profiles SET node_result_id=(
+                            SELECT MIN(n.id) FROM node_results n
+                            WHERE n.run_id=ip_profiles.run_id AND n.name=ip_profiles.name
+                            HAVING COUNT(*)=1)''')
 
 
 def _open(db_path) -> sqlite3.Connection:
@@ -735,6 +741,9 @@ def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
              _db_text(basic.get("kind")), 1,
              _bool_or_none(basic.get("proxy")), _bool_or_none(basic.get("hosting")),
              _bool_or_none(basic.get("mobile"))))
+    if (isinstance(ip,dict) and ip) or exit_ipv4:
+        conn.execute('UPDATE ip_profiles SET node_result_id=? WHERE id=last_insert_rowid()',
+                     (inserted.lastrowid,))
     # New family-specific intelligence may be present even when the legacy
     # ``ip`` object is absent.  Keep it independent from ip_profiles so a
     # partially populated result is still useful for the reputation timeline.
@@ -849,7 +858,7 @@ def node_series(db_path, name: str, days: int = 30, node_key: str = "", node_id:
         conn.close()
 
 
-def ip_changes(db_path, name: str) -> list:
+def ip_changes(db_path, name: str, node_id: str = '') -> list:
     """某节点出口 IP / ASN 变化时间线（时间升序）。
 
     相邻两次测速 (exit_ip, asn) 不变则合并，只保留变化点；
@@ -865,6 +874,12 @@ def ip_changes(db_path, name: str) -> list:
             " WHERE p.name = ? AND p.exit_ip IS NOT NULL AND p.exit_ip != ''"
             " ORDER BY r.id, p.id",
             (name,)).fetchall()
+        if node_id:
+            rows=conn.execute('''SELECT r.ts,p.exit_ip,p.country,p.country_code,p.isp,p.org,
+                p.asn,p.asname,p.kind,p.proxy,p.hosting,p.mobile FROM ip_profiles p
+                JOIN runs r ON r.id=p.run_id JOIN node_results n ON n.id=p.node_result_id
+                WHERE n.node_id=? AND p.exit_ip IS NOT NULL AND p.exit_ip!=''
+                ORDER BY r.id,p.id''',(node_id,)).fetchall()
         timeline = []
         last_key = None
         for row in rows:
@@ -956,8 +971,8 @@ def ip_reputation_changes(db_path, name: str, node_key: str = "", node_id: str =
             "p.asname, p.kind, p.proxy, p.hosting, p.mobile "
             "FROM node_results n JOIN runs r ON r.id = n.run_id "
             "LEFT JOIN ip_profiles p ON p.id = ("
-            "SELECT p2.id FROM ip_profiles p2 WHERE p2.run_id = n.run_id "
-            "AND p2.name = n.name ORDER BY p2.id LIMIT 1) "
+            "SELECT p2.id FROM ip_profiles p2 WHERE p2.node_result_id=n.id "
+            "ORDER BY p2.id LIMIT 1) "
             f"WHERE {where} ORDER BY r.id, n.id",
             params,
         ).fetchall()
@@ -1225,6 +1240,36 @@ def source_summary(db_path, days=30, subscription_id=None):
             latency_ms=_median_or_none([r['latency_ms'] for r in rows],1),
             avg_network_score=round(statistics.fmean(scores),1) if scores else None))
     result.sort(key=lambda item: (item['last_ts'],item['name']), reverse=True)
+    return result
+
+
+def source_series(db_path, subscription_id, days=30):
+    """Per-run source-ID coverage; old provider names are never evidence."""
+    from contextlib import closing
+    since=(datetime.now()-timedelta(days=max(1,min(int(days),3650)))).isoformat(timespec='seconds')
+    with closing(_open(db_path)) as conn:
+        conn.row_factory=sqlite3.Row
+        rows=conn.execute('''SELECT n.*,r.ts,o.name_snapshot FROM node_results n
+            JOIN runs r ON r.id=n.run_id JOIN node_origins o ON o.node_result_id=n.id
+            WHERE o.subscription_id=? AND r.ts>=? ORDER BY r.id,n.id''',
+            (subscription_id,since)).fetchall()
+    grouped={}
+    for row in rows:
+        grouped.setdefault(row['run_id'],[]).append(row)
+    result=[]
+    for rows in grouped.values():
+        probed=[r for r in rows if r['probe_attempts'] or r['latency_ms'] is not None]
+        online=sum(r['probe_successes']>0 if r['probe_attempts'] and r['probe_successes'] is not None
+                   else r['latency_ms'] is not None for r in probed)
+        attempted=sum(r['sample_mb'] is not None or r['median_mbps'] is not None for r in rows)
+        successful=sum(r['median_mbps'] is not None and r['median_mbps']>0 for r in rows)
+        scores=[r['network_score'] for r in rows if r['network_score'] is not None]
+        result.append(dict(ts=rows[0]['ts'],name_snapshot=rows[0]['name_snapshot'],node_count=len(rows),
+            online_ratio=online/len(probed) if probed else None,probe_coverage=len(probed)/len(rows),
+            bandwidth_coverage=attempted/len(rows),bandwidth_success_ratio=successful/attempted if attempted else None,
+            median_mbps=_median_or_none([r['median_mbps'] for r in rows],3),
+            latency_ms=_median_or_none([r['latency_ms'] for r in rows],1),
+            avg_score=statistics.fmean(scores) if scores else None))
     return result
 
 

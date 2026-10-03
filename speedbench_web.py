@@ -57,6 +57,8 @@ CANCEL_FILE = DATA_HOME / "cancel-request"
 # 只认这三个文件、不做任何路径拼接，天然免疫 ".." 穿越；其余一律 404。
 WEB_DIR = HERE / "web"
 STATIC_FILES = {
+    '/static/view.js': ('view.js','application/javascript; charset=utf-8'),
+    '/static/tasks.js': ('tasks.js','application/javascript; charset=utf-8'),
     "/static/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/static/style.css": ("style.css", "text/css; charset=utf-8"),
 }
@@ -890,6 +892,10 @@ class Handler(BaseHTTPRequestHandler):
             sync_db()
             self._json(speedbench_db.source_summary(db_path(), days=_days_param(qs),
                 subscription_id=qs.get('subscription_id', [None])[0]))
+        elif path == '/api/source':
+            qs=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sync_db()
+            self._json(speedbench_db.source_series(db_path(),qs.get('subscription_id',[''])[0],days=_days_param(qs)))
         elif path == "/api/history":
             self._json(slim_history())
         elif path == "/api/ip-intel/status":
@@ -918,8 +924,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({
                 "series": speedbench_db.node_series(db_path(), name, days=days,
                                                     node_key=key, node_id=node_id),
-                "ip_changes": (speedbench_db.ip_changes(db_path(), name)
-                               if name else []),
+                "ip_changes": (speedbench_db.ip_changes(db_path(),name,node_id=node_id)
+                               if name or node_id else []),
                 "ip_reputation_changes": (speedbench_db.ip_reputation_changes(
                     db_path(), name, node_id=node_id) if node_id else
                     _load_ip_reputation_changes(name=name, node_key=key)),

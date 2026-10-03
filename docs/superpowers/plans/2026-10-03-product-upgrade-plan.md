@@ -20,7 +20,7 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 ## B：任务、调度、事件与耗时
 
 - [ ] B1：纯任务配置/候选选择/计时模块与测试；CLI/Web 参数一致、legacy 默认保持。
-- [ ] B2：有界任务状态/事件存储、snapshot/resync/增量读取/SSE，测试 seq、重连、终态和并发请求。
+- [x] B2：有界任务状态/事件存储、snapshot/resync/增量读取/SSE，测试 seq、重连、终态和并发请求。
 - [ ] B3：现有 worker 接入动态队列与取消；按模式控制精测/IP范围，不跨节点并发下载。
 - [ ] B4：IPv4/IPv6 独立结果状态、预算与在途请求清理；provider single-flight/cache 保持。
 - [ ] B5：task_runs/task_metrics 增量迁移、部分结果保存、真实下载字节和完整等待时间。
@@ -59,6 +59,6 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 - 真实用户历史与 Downloads 安装不作测试 fixture。实验仅使用 TemporaryDirectory/ignored dist 路径。
 - A 核心验收：见 ../reports/2026-10-03-origins-and-task-foundations.md。本机 40/40 运行节点来源 verified，worker 定义复核 40/40；A 完成时三种 Windows Python 全量 586 tests，OK (skipped=6)。
 - B1 已实现模式配置/候选纯函数、CLI/Web 共享限制，计时模块已通过 fixture 但尚未接生产计时。历史提示与完整目标排序尚未接入，故整项不勾选。
-- B2 已实现有界 JobStore、单一所有权、seq、snapshot/resync、终态与白名单；尚未接 subprocess、增量 HTTP/SSE 或前端，不勾选。
+- B2 已接 subprocess/HTTP/SSE/前端续接，单一所有权、seq、snapshot/resync、终态与并发请求通过本机 fixture；勾选不代表六格 CI 已执行。
 - B3 已接新模式动态队列/限定 IP 范围/带宽串行；修复 --no-ip 混合成功遗漏、worker 启动失败丢失主探测数据。新模式全生命周期取消/部分结果保存尚待 B4/B5 验收，不勾选。
-- B4/B5/B6/B7、C/D 没有完成；没有真实耗时提速结论、桌面安装包或 macOS/Linux 成功结论。下一检查点为事件协议接入 runner/HTTP、取消所有权及计时/任务历史。
+- B4/B5 已接独立出口发布、任务历史与实际字节，仍需全部阶段清理与迁移验收；B6/B7、C/D 尚未完整完成。详见 ../reports/2026-10-03-jobs-and-shared-ui.md。没有真实耗时提速结论、桌面安装包或 macOS/Linux 成功结论。
