@@ -105,6 +105,19 @@ class JobApiTest(WebServerCase):
         self.assertEqual(web.JOBS.snapshot(job)['status'],'cancelled')
         self.assertFalse(any('启动测速失败' in line for line in web.STATE['lines']))
 
+    def test_child_cancel_code_without_parent_request_is_cancelled_not_failed(self):
+        job=self.create();self.set_state(job_id=job,cancel_requested=False)
+        stream=io.StringIO();emitter=ProgressEmitter(job,stream)
+        emitter.emit('phase_started','probing')
+        emitter.emit('node_probe','probing','fixture',{'result':{'name':'fixture','latency_ms':12}})
+        proc=mock.Mock(stdout=iter(stream.getvalue().splitlines()));proc.wait.return_value=130
+        with mock.patch.object(web,'connect_controller'),mock.patch.object(web,'sync_db'), \
+                mock.patch.object(web.subprocess,'Popen',return_value=proc):
+            web.run_benchmark({'mode':'quick','_job_id':job})
+        snapshot=web.JOBS.snapshot(job)
+        self.assertEqual(snapshot['status'],'cancelled');self.assertTrue(snapshot['partial'])
+        self.assertEqual(len(snapshot['results']),1);self.assertFalse(web.STATE['running'])
+
     def test_cleanup_failure_during_requested_cancel_is_failed_not_successful_cancel(self):
         job=self.create();self.set_state(running=True,job_id=job,cancel_requested=False)
         web.JOBS.publish(job,'node_probe',node_id='fixture',payload={'result':{'name':'fixture','latency_ms':12}})

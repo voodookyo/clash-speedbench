@@ -157,8 +157,9 @@ raise SystemExit(core.main())
                 raise ValueError('fixture body')
             with mock.patch('sys.argv',['clash_speedbench.py','--yes','--history',str(Path(folder)/'h.jsonl')]), \
                     mock.patch.object(core,'_execute_benchmark',side_effect=execute):
-                with self.assertRaisesRegex(ValueError,'fixture body'):core.main()
-            enricher.close.assert_called_once()
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:self.assertEqual(core.main(),1)
+                self.assertNotIn('fixture body',stderr.getvalue())
+            self.assertGreaterEqual(enricher.close.call_count,1)
             with owner.BackendLease(folder):pass
 
     def test_default_history_honors_home_and_hidden_flag_requires_private_pipe(self):

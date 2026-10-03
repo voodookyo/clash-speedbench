@@ -7,6 +7,16 @@ from speedbench_progress import ProgressEmitter, parse_record, publish_result, p
 
 
 class ProgressStreamTest(unittest.TestCase):
+    def test_closed_progress_transport_does_not_abort_cleanup_or_retention(self):
+        from speedbench_progress import ResultJournal,measure
+        stream=io.StringIO();stream.close()
+        emitter=ProgressEmitter('job_'+'a'*32,stream)
+        journal=ResultJournal();args=SimpleNamespace(progress=emitter,_result_journal=journal)
+        row=core.Result(name='safe',provider='',proto='ss',latency_ms=50,
+                       speeds_mbps=[],median_mbps=None,best_mbps=None,status='ok')
+        with measure(args,'cleanup'):publish_result(args,'node_probe',row)
+        self.assertTrue(emitter.transport_failed);self.assertEqual(len(journal.snapshot()),1)
+
     def test_structured_record_can_be_read_without_parsing_human_logs(self):
         stream = io.StringIO()
         emitter = ProgressEmitter('job_'+'a'*32,stream)

@@ -1,5 +1,6 @@
 """Versioned child-to-parent progress records, independent of console wording."""
 import hashlib
+import copy
 import json
 import os
 import re
@@ -12,6 +13,39 @@ from speedbench_jobs import EVENT_TYPES, PHASES, MAX_PAYLOAD, _result, safe_metr
 PREFIX = '@speedbench-event '
 
 
+class ResultJournal:
+    """Private per-run completed-result snapshots, independent of stdout.
+
+    Runtime names are unique within one frozen Mihomo catalogue. This is not a
+    cross-run identity or switching authority. It retains one row per name and
+    never serializes arbitrary task configuration, exceptions or credentials.
+    """
+    def __init__(self):
+        self.lock=threading.RLock()
+        self.rows={}
+
+    def remember(self,result):
+        if result is None:return
+        value=copy.deepcopy(result)
+        with self.lock:
+            previous=self.rows.get(value.name)
+            if previous is not None and not value.probe_attempts:
+                # Early exit-family events may omit the already completed
+                # main probe stats. Do not lose those independent samples.
+                for key in ('probe_attempts','probe_successes','probe_failures',
+                            'probe_success_rate','probe_loss_pct'):
+                    setattr(value,key,getattr(previous,key,None))
+            self.rows[value.name]=value
+
+    def snapshot(self):
+        with self.lock:return copy.deepcopy([self.rows[k] for k in sorted(self.rows)])
+
+
+def retain_result(args,result):
+    journal=getattr(args,'_result_journal',None)
+    if journal is not None:journal.remember(result)
+
+
 class ProgressEmitter:
     def __init__(self, job_id, stream=None):
         if not re.fullmatch(r'job_[0-9a-f]{32}',job_id):
@@ -20,6 +54,7 @@ class ProgressEmitter:
         self.stream = stream if stream is not None else sys.stdout
         self.lock = threading.RLock()
         self.seq = 0
+        self.transport_failed=False
 
     @classmethod
     def from_environment(cls,environ=None):
@@ -36,11 +71,17 @@ class ProgressEmitter:
         if event_type=='phase_finished' and 'metrics' in payload:
             safe['metrics'] = safe_metrics(payload['metrics'])
         with self.lock:
+            if self.transport_failed:return
             self.seq += 1
             record = dict(version=1,job_id=self.job_id,source_seq=self.seq,type=event_type,
                           phase=phase_name,node_id=node_id,payload=safe)
-            self.stream.write(PREFIX+json.dumps(record,ensure_ascii=False,allow_nan=False)+'\n')
-            self.stream.flush()
+            try:
+                self.stream.write(PREFIX+json.dumps(record,ensure_ascii=False,allow_nan=False)+'\n')
+                self.stream.flush()
+            except (OSError,ValueError):
+                # Optional stdout transport must not interrupt owned cleanup
+                # or prevent independent journal/history retention on EOF.
+                self.transport_failed=True
 
 
 def parse_record(line,job_id):
@@ -85,6 +126,7 @@ def measure(args,name):
 
 
 def publish_result(args,event_type,result,*,phase_name='',completed=None,total=None):
+    retain_result(args,result)
     emitter = getattr(args,'progress',None)
     if emitter is None or result is None:
         return

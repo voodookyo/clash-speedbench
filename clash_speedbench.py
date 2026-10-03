@@ -1431,6 +1431,8 @@ class _IntelEnrichment:
         self.pool = ThreadPoolExecutor(max_workers=workers)
         self.futures: Dict[str, Any] = {}
         self.values: Dict[str, IpIntelligence] = {}
+        owned=getattr(args,'_owned_intel_pools',None)
+        if owned is not None:owned.append(self)
 
     def _query_one(self, ip: str) -> IpIntelligence:
         provider_results = self.cache.query_many(
@@ -1473,7 +1475,7 @@ class _IntelEnrichment:
     def close(self) -> None:
         """Cancel unstarted queries and join cache writers before lease release."""
         for future in self.futures.values():future.cancel()
-        self.pool.shutdown(wait=True)
+        self.finish()
 
     def apply(self, results: List[Result]) -> None:
         for result in results:
@@ -1500,8 +1502,6 @@ def start_intelligence_enrichment(results: List[Result], args: Any) -> Optional[
     except Exception:
         # Cache/provider setup is optional and must never abort network tests.
         return None
-    owned=getattr(args,'_owned_intel_pools',None)
-    if owned is not None:owned.append(enricher)
     for result in results:
         enricher.submit_result(result)
     if not enricher.futures:
@@ -1533,7 +1533,7 @@ def make_tags(r: Result) -> str:
     if r.median_mbps is None:
         scope = (r.measurement_scope or {}).get('bandwidth')
         tags.append('未精测' if scope=='not_selected' else '未请求带宽' if scope=='not_requested' else
-                    '已取消' if scope=='cancelled' else "不通")
+                    '已取消' if scope=='cancelled' else '未完成' if scope in ('interrupted','partial') else "不通")
     else:
         if r.median_mbps < 5:
             tags.append("龟速")
@@ -1793,7 +1793,7 @@ def result_to_dict(r: Result) -> dict:
 
 
 def append_history(results: List[Result], path: Path, mb: Optional[int], rounds: int,
-                   csv_path: Optional[Path], task=None) -> None:
+                   csv_path: Optional[Path], task=None) -> bool:
     record = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "mb": mb,
@@ -1806,12 +1806,64 @@ def append_history(results: List[Result], path: Path, mb: Optional[int], rounds:
         # record shape. No paths, credentials, raw stdout or arbitrary config.
         record['task'] = {k:v for k,v in task.items() if k in
                           ('job_id','mode','target_profile','partial') and isinstance(v,(str,bool))}
+        if task.get('status') in ('completed','cancelled','failed','interrupted'):
+            record['task']['status']=task['status']
         record['ts'] = datetime.now().isoformat(timespec='microseconds')
     try:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
     except OSError as e:
         print(f"⚠️ 历史记录写入失败: {e}", file=sys.stderr)
+        return False
+
+
+def save_partial_report(args,status):
+    """One failure/cancel export under the CLI lease, never new measurement.
+
+    Only completed snapshots are retained. Missing work is not unreachable,
+    missing Intelligence remains N/A, and no automatic switching is attempted.
+    CSV failure must not prevent JSONL retention. Already committed history is
+    never rewritten/duplicated by an exception in a later reporting step.
+    """
+    if getattr(args,'_partial_exported',False) or getattr(args,'_history_saved',False):return
+    args._partial_exported=True
+    results=args._result_journal.snapshot()
+    if not results:return
+    for enricher in args._owned_intel_pools:enricher.apply(results)
+    for r in results:
+        scope=dict(r.measurement_scope or {})
+        scope.setdefault('mode',args.mode or 'legacy')
+        scope.setdefault('probe','completed' if r.latency_ms is not None else 'failed')
+        scope.setdefault('bandwidth','partial' if r.median_mbps is not None else
+                         'not_requested' if args.mode=='ip' else 'cancelled' if status=='cancelled' else 'interrupted')
+        scope.setdefault('exit','not_requested' if args.no_ip else
+                         'partial' if r.exit_ipv4 or r.exit_ipv6 else 'cancelled' if status=='cancelled' else 'interrupted')
+        scope.setdefault('intel','completed' if r.intel_v4 or r.intel_v6 else
+                         'not_requested' if args.no_ip else 'interrupted')
+        if r.exit_status is not None:
+            r.exit_status={key:('cancelled' if status=='cancelled' else 'interrupted') if value=='pending' else value
+                           for key,value in r.exit_status.items()}
+        r.measurement_scope=scope
+        compute_score(r);r.tags=make_tags(r)
+        if '任务部分结果' not in r.tags:r.tags=','.join(filter(None,(r.tags,'任务部分结果')))
+        publish_result(args,'node_intelligence',r,phase_name='enriching')
+    out=Path(args.output) if args.output else Path(
+        f"clash-speedtest-{datetime.now().strftime('%Y%m%d-%H%M%S')}-partial.csv")
+    csv_path=None
+    try:write_csv(results,out);csv_path=out
+    except (OSError,KeyboardInterrupt):
+        print('部分 CSV 未完整保存；仍尝试保留 JSONL 历史。',file=sys.stderr)
+    task=dict(mode=args.mode or 'legacy',target_profile=args.target_profile,partial=True,status=status)
+    if args.progress is not None:task['job_id']=args.progress.job_id
+    if not args.no_history:
+        args._history_saved=append_history(results,Path(args.history),args.mb,args.rounds,csv_path,task=task)
+    try:
+        retention='已保留' if csv_path is not None or getattr(args,'_history_saved',False) else '仅内存中存在，未持久化'
+        print(f'任务 {status}，{len(results)} 个节点的部分结果{retention}；未完成指标不代表网络不可达。')
+        print_speedbench(results,args.top)
+        if csv_path is not None:print(f'部分 CSV 已保存: {csv_path.resolve()}')
+    except (OSError,ValueError):pass # Closed console cannot undo committed history.
 
 
 def pick_switch_group(proxies: Dict[str, dict], graph: Dict[str, List[str]],
@@ -1877,18 +1929,19 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
         print("注：「未精测」节点仅完成 Phase 1 粗筛（延迟/连通性/IP 画像），未参与带宽精测。")
     if not args.no_history:
         task = None
-        if getattr(args,'progress',None) is not None or getattr(args,'mode',None):
+        partial=bool(getattr(args,'cancelled',False) or cancel_requested())
+        if getattr(args,'progress',None) is not None or getattr(args,'mode',None) or partial:
             task = dict(mode=getattr(args,'mode',None) or 'legacy',
                         target_profile=getattr(args,'target_profile','balanced'),
-                        partial=bool(getattr(args,'cancelled',False) or cancel_requested()))
+                        partial=partial,status='cancelled' if partial else 'completed')
             if getattr(args,'progress',None) is not None:
                 task['job_id'] = args.progress.job_id
         with measure(args,'summary'):
-            append_history(results, Path(args.history), args.mb, args.rounds, out,task=task)
+            args._history_saved=append_history(results, Path(args.history), args.mb, args.rounds, out,task=task)
     if args.auto_switch and not getattr(args,'cancelled',False) and not cancel_requested():
         graph = build_selectable_graph(proxies)
         auto_switch_best(api, proxies, graph, args.root_group, results, args.switch_group)
-    return 0
+    return 130 if getattr(args,'cancelled',False) or cancel_requested() else 0
 
 
 def _reconfigure_stdio_for_console() -> None:
@@ -2029,10 +2082,27 @@ def main() -> int:
         return 2
 
     from speedbench_owner import benchmark_ownership, LeaseError
+    from speedbench_progress import ResultJournal
     args._owned_intel_pools=[]
+    args._result_journal=ResultJournal()
     try:
         with benchmark_ownership(args.history,delegated=args.backend_child):
-            try:return _execute_benchmark(args,task_config)
+            try:
+                try:code=_execute_benchmark(args,task_config)
+                except KeyboardInterrupt:
+                    args.cancelled=True;code=130
+                except Exception:
+                    print('测速任务异常终止；保留已完成结果，不输出私有异常内容。',file=sys.stderr)
+                    code=1
+                for enricher in args._owned_intel_pools:enricher.close()
+                if code!=0:
+                    try:save_partial_report(args,'cancelled' if code==130 else 'failed')
+                    except (Exception,KeyboardInterrupt):
+                        # Export failures must never conceal the dedicated
+                        # cleanup failure code or authorize another task.
+                        try:print('部分结果导出失败；任务仍保留原失败／取消状态。',file=sys.stderr)
+                        except (OSError,ValueError):pass
+                return code
             finally:
                 for enricher in args._owned_intel_pools:enricher.close()
     except LeaseError:
@@ -2262,6 +2332,7 @@ def _execute_benchmark(args,task_config):
                 )
                 res.tags = make_tags(res)
                 results.append(res)
+                publish_result(args,'node_probe',res,phase_name='probing')
                 continue
 
             probe = probe_latency(
@@ -2304,11 +2375,21 @@ def _execute_benchmark(args,task_config):
                     connect_ms = c_ms
                 if speed is not None:
                     speeds.append(speed)
+                partial.sample_mb=mb;partial.connect_ms=connect_ms
+                partial.speeds_mbps=list(speeds)
+                partial.median_mbps=statistics.median(speeds) if speeds else None
+                partial.best_mbps=max(speeds) if speeds else None
+                partial.download_bytes=(partial.download_bytes or 0)+round(max(0,_sz or 0)*1_000_000)
+                partial.measurement_scope=dict(mode=args.mode or 'legacy',bandwidth='partial')
+                publish_result(args,'node_measurement',partial,phase_name='measuring')
 
             multi = None
             if args.multi:
                 multi = multi_stream_speed(proxy_url, mb * 1_000_000, max_time,
                                            min(3.0, max_time))
+            partial.multi_mbps=multi
+            partial.measurement_scope=dict(mode=args.mode or 'legacy',bandwidth='completed' if speeds else 'failed')
+            publish_result(args,'node_measurement',partial,phase_name='measuring')
 
             median = statistics.median(speeds) if speeds else None
             best = max(speeds) if speeds else None
@@ -2320,7 +2401,14 @@ def _execute_benchmark(args,task_config):
             exit_ipv4 = None
             exit_ipv6 = None
             if not args.no_ip:
-                exit_ipv4, exit_ipv6, data = fetch_exit_ips(proxy_url, args.ip_timeout)
+                partial.exit_status=dict(ipv4='pending',ipv6='pending')
+                def early_exit(family,address,status):
+                    if family!='legacy':
+                        setattr(partial,'exit_'+family,address);partial.exit_status[family]=status
+                    else:partial.exit_status['basic']=status
+                    publish_result(args,'node_exit',partial,phase_name='measuring')
+                exit_ipv4, exit_ipv6, data = fetch_exit_ips(proxy_url, args.ip_timeout,
+                    on_result=early_exit,progress_args=args)
                 if data:
                     ip = classify_ip(data)
 
@@ -2342,6 +2430,8 @@ def _execute_benchmark(args,task_config):
                 node_key=node_key_of(str(info.get("type", "")), "", "", name),
                 exit_ipv4=exit_ipv4,
                 exit_ipv6=exit_ipv6,
+                download_bytes=partial.download_bytes,
+                exit_status=partial.exit_status,
             )
             _apply_probe_stats(res, probe, fallback_attempts=_probe_count_from_args(args))
             if not args.no_ip:
@@ -2371,6 +2461,7 @@ def _execute_benchmark(args,task_config):
             )
 
     except KeyboardInterrupt:
+        args.cancelled=True
         print("\n\n收到 Ctrl+C，停止测速并恢复原配置……")
     finally:
         restore_groups(api, saved_groups)
@@ -2385,6 +2476,8 @@ def _execute_benchmark(args,task_config):
     phase(args,'enriching')
     finish_intelligence_enrichment(intel_enricher, results)
 
+    if getattr(args,'cancelled',False):
+        return 130
     return report(results, args, api, proxies)
 
 

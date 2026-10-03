@@ -1203,7 +1203,7 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
         try:
             worker.select(name)
             time.sleep(args.settle)
-            extra = dict(on_result=early_exit,progress_args=args) if getattr(args,'progress',None) is not None else {}
+            extra = dict(on_result=early_exit,progress_args=args) if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
             exit_ipv4, exit_ipv6, data = fetch_exit_ips(worker.proxy_url,args.ip_timeout,**extra)
             if data:
                 ip = classify_ip(data)
@@ -1278,6 +1278,8 @@ def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
         r.median_mbps = statistics.median(speeds) if speeds else None
         r.best_mbps = max(speeds) if speeds else None
         r.status = 'ok' if speeds else ';'.join(statuses)[:160]
+        r.measurement_scope=dict(r.measurement_scope or {},mode=getattr(args,'mode',None) or 'legacy',bandwidth='partial')
+        publish_result(args,'node_measurement',r,phase_name='measuring')
 
     if getattr(args, "multi", False):
         with measure(args,'download') as counts:
@@ -1289,6 +1291,7 @@ def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
     r.median_mbps = statistics.median(speeds) if speeds else None
     r.best_mbps = max(speeds) if speeds else None
     r.status = "ok" if speeds else ";".join(statuses)[:160]
+    if r.measurement_scope is not None:r.measurement_scope['bandwidth']='completed' if speeds else 'failed'
 
 
 def select_phase2_nodes(results: List[Result], top_n: int,
@@ -1436,7 +1439,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
               f"（Clash Verge ping 同口径，不切换节点）…")
         try:
             try:
-                callback = {'on_result':publish_probe} if getattr(args,'progress',None) is not None else {}
+                callback = {'on_result':publish_probe} if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
                 with measure(args,'delay') as counts:
                     latency_map = probe_latency_pool(
                         main_api, [str(p.get("name")) for p in selected],
@@ -1772,7 +1775,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         if config:
             r.measurement_scope = dict(mode=config.mode,
                 probe='completed' if r.probe_successes else 'failed',
-                bandwidth=('completed' if r.median_mbps is not None else
+                bandwidth=('partial' if getattr(args,'cancelled',False) and (r.measurement_scope or {}).get('bandwidth')=='partial' else
+                           'completed' if r.median_mbps is not None else
                            'cancelled' if getattr(args,'cancelled',False) and r.name in {c.name for c in chosen} else
                            'failed' if r.sample_mb is not None else
                            'not_selected' if config.bandwidth else 'not_requested'),

@@ -208,5 +208,16 @@ CLI exit code 3 denotes incomplete worker cleanup. The backend marks that task
 failed even when cancellation was requested, retains already accepted partial
 results, and refuses new tasks/root changes in that session. Exit and verify
 owned leftover resources before restart; do not kill processes by name or broadly
-delete temp directories. Complete all-phase cancellation and direct CLI partial
-history acceptance remain separate pending gates.
+delete temp directories. Complete all-phase cancellation remains a pending gate.
+
+CLI cancellation (130), cleanup failure (3), and unexpected failure (1) now
+attempt to export completed per-node snapshots under the writer lease. This
+does not remeasure or auto-switch: a later-round interruption retains earlier
+samples, and an IPv6 interruption retains completed IPv4. Partial scope/status
+is explicit; missing measurements are not unreachable and unknown IP is N/A.
+Failed CSV export still attempts JSONL unless `--no-history` was requested.
+Committed history is never rewritten or duplicated; if both exports fail, the
+console explicitly says results were not persisted. Forced termination, an
+unwritable disk, or repeated interruptions cannot guarantee final persistence.
+The packaged fixture checks backend-to-CLI failed partial JSONL/SQLite/task
+retention, not real network performance or native GUI lifecycle.

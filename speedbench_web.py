@@ -574,7 +574,7 @@ def run_benchmark(params: dict) -> None:
                     STATE['cleanup_incomplete']=True
                     STATE['lines'].append('!! 临时 worker 清理未完成；保留部分结果，任务标记失败，不能确认取消成功。')
                 JOBS.transition(job_id,'failed')
-            elif cancelled:
+            elif cancelled or exit_code == 130:
                 JOBS.transition(job_id,'cancelling')
                 JOBS.transition(job_id,'cancelled')
             elif exit_code == 0 and JOBS.snapshot(job_id)['status']=='finalizing':

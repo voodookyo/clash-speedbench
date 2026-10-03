@@ -177,6 +177,60 @@ with BackendLease(history.parent):pass
     if result.returncode!=0:raise ValueError('Bundled private CLI ownership fixture failed')
 
 
+def verify_cli_partial(root,data):
+    """Bundled runner -> CLI failure -> JSONL/SQLite, fixture metrics only."""
+    partial=data/'partial-history-fixture';partial.mkdir()
+    child='''
+import sys
+sys.path.insert(0,sys.argv.pop(1))
+import clash_speedbench as core
+from speedbench_progress import publish_result
+def execute(args,config):
+    row=core.Result(name='fixture node',provider='',proto='ss',latency_ms=20,
+        speeds_mbps=[30.0],median_mbps=30.0,best_mbps=30.0,status='ok')
+    publish_result(args,'node_measurement',row,phase_name='measuring')
+    return 3
+core._execute_benchmark=execute
+raise SystemExit(core.main())
+'''
+    program='''
+import os,sys,json,sqlite3
+from pathlib import Path
+from contextlib import closing
+import speedbench_web as web
+from speedbench_owner import BackendLease
+from speedbench_tasks import resolve_config
+history=Path(os.environ['SPEEDBENCH_HOME'])/'speedbench-history.jsonl'
+original=b'{"ts":"fixture-original", "results": []}\\n'
+history.write_bytes(original)
+job=web.JOBS.create(resolve_config())
+with BackendLease(history.parent) as lease:
+    web.DATA_OWNER=lease;web.HISTORY=history
+    web.connect_controller=lambda *a,**k:None
+    web.benchmark_command=lambda params:[sys.executable,'-B','-E','-s','-u','-c',sys.argv[1],str(Path(web.SCRIPT).parent),
+        '--yes','--no-ip','--history',str(history),'--output',str(history.parent/'partial.csv')]
+    web.run_benchmark({'_job_id':job})
+    assert web.STATE['exit_code']==3 and not web.STATE['running'] and web.STATE['cleanup_incomplete']
+    assert lease.instance_id not in str(web.STATE['lines'])
+    assert history.read_bytes().startswith(original)
+    rows=history.read_text(encoding='utf-8').splitlines();assert len(rows)==2
+    record=json.loads(rows[1]);assert record['task']['partial'] and record['task']['status']=='failed'
+    assert record['results'][0]['median_mbps']==30.0 and record['results'][0]['ip_quality_score'] is None
+    task=web.speedbench_db.task_snapshot(web.db_path(),job)
+    assert task['status']=='failed' and task['partial'] and task['results'][0]['median_mbps']==30.0
+    assert task['run_id'] is not None
+    with closing(sqlite3.connect(web.db_path())) as connection:
+        assert [r[0] for r in connection.execute('SELECT raw FROM runs ORDER BY id')]==rows
+web.DATA_OWNER=None
+with BackendLease(history.parent):pass
+'''
+    env=dict(os.environ,SPEEDBENCH_HOME=str(partial),PATH=str(Path(os.environ['SystemRoot'])/'System32'))
+    env.pop('SPEEDBENCH_VERGE_ROOT',None)
+    result=subprocess.run([str(root/'runtime/python.exe'),'-B','-E','-s','-c',program,child],
+        cwd=root/'app',env=env,capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode!=0:raise ValueError('Bundled CLI partial JSONL/SQLite fixture failed')
+
+
 def verify(package):
     if os.name!='nt':raise ValueError('Windows artifact verification requires Windows')
     package=Path(package).resolve()
@@ -196,13 +250,14 @@ def verify(package):
         bootstrap(root,data,manifest);bootstrap(root,data,manifest)
         verify_worker_cleanup(root,data)
         verify_cli_ownership(root,data)
+        verify_cli_partial(root,data)
         if history.read_bytes()!=raw:raise ValueError('Original fixture raw changed during packaged lifecycle')
         # An attacker-updated side manifest cannot authorize modified source.
         source=root/'app/speedbench_desktop.py';source.write_bytes(source.read_bytes()+b'\n# fixture tamper\n')
         manifest['files']['app/speedbench_desktop.py']=digest(source)
         (root/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
         if native_check()==0:raise ValueError('Mutable side manifest bypassed native integrity anchor')
-    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, original raw retained. Native window/tray acceptance not included.')
+    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, failed partial JSONL/SQLite/task retention, original raw retained. Native window/tray acceptance not included.')
 
 
 if __name__=='__main__':

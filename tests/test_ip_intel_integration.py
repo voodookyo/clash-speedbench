@@ -49,6 +49,13 @@ class FakeProvider:
 
 
 class IntelligenceIntegrationTest(unittest.TestCase):
+    def test_serial_constructor_registers_its_pool_with_the_cli_owner(self):
+        with tempfile.TemporaryDirectory() as td,mock.patch.object(csb,'make_default_providers',return_value=[]):
+            args=SimpleNamespace(history=str(Path(td)/'h.jsonl'),_owned_intel_pools=[])
+            enricher=csb._IntelEnrichment(args)
+            try:self.assertEqual(args._owned_intel_pools,[enricher])
+            finally:enricher.close()
+
     def test_abort_cancels_queued_queries_and_joins_running_writers(self):
         with tempfile.TemporaryDirectory() as td:
             args=SimpleNamespace(history=str(Path(td)/'h.jsonl'),ip_timeout=1,intel_workers=2)
