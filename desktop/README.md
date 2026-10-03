@@ -116,7 +116,22 @@ A kernel-held, private `backend-owner.lock` coordinates desktop and standalone
 Web using the **same data directory**, even on different ports. Metadata alone
 does not prove a live owner; the lock inode is not deleted. Existing-owner
 startup fails safely instead of attaching to an unverified service. Standalone
-CLI ownership coordination is not yet part of this desktop alpha acceptance.
+CLI now acquires ownership before controller/identity/history work, coordinating
+both the explicit history parent and `SPEEDBENCH_HOME` if different. Close an idle
+backend before starting a direct CLI using its directory; help/invalid arguments
+do not acquire ownership. Different directories are not globally exclusive.
+
+Backend-created benchmark children use a bounded private stdin frame matching
+the actual parent PID, instance, canonical history directory and kernel-held
+owner. No flag or environment variable alone bypasses this check. A separate
+private `benchmark-writer.lock` remains held until child reporting/cleanup ends;
+it blocks a new backend after a parent crash. Parent pipe EOF requests graceful
+cancellation. Neither bootstrap frame nor credentials are logged or put in argv.
+If a failed transport cannot reap the exact child handle within 8 seconds, the
+backend retains that handle, blocks new tasks and reports incomplete cleanup.
+There is no arbitrary PID/process-name kill. Lock files remain after release;
+metadata is not a substitute for the kernel lock. Forced termination does not
+guarantee a final partial report; all-phase cancellation acceptance is pending.
 
 Desktop theme/profile/mode/favorites and notification choice live in private
 `ui-preferences.json` with an explicit non-secret whitelist. Browser Web UI

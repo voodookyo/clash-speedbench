@@ -339,7 +339,8 @@ class ConnectionTest(ControllerFixture):
                 return {"proxies": {"GLOBAL": {"type": "Selector", "all": ["nodeA"], "now": "nodeA"},
                                     "nodeA": {"type": "Shadowsocks"}}}
             raise AssertionError("unexpected endpoint")
-        with mock.patch.object(csb.MihomoAPI, "get", autospec=True, side_effect=responses), \
+        with mock.patch.dict(os.environ, {"SPEEDBENCH_HOME": self.tmp.name}), \
+                mock.patch.object(csb.MihomoAPI, "get", autospec=True, side_effect=responses), \
                 mock.patch.object(csb.MihomoAPI, "put") as write, \
                 mock.patch.object(sys, "argv", ["clash_speedbench.py", "--workers", "1", "--no-ip"]), \
                 mock.patch.object(csb, "clear_cancel_request"), \

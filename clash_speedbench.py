@@ -765,8 +765,9 @@ _CANCEL_FILE = os.environ.get("SPEEDBENCH_CANCEL_FILE", "")
 
 
 def cancel_requested() -> bool:
-    """面板是否请求中断（哨兵文件出现）。未设置环境变量时恒为 False。"""
-    return bool(_CANCEL_FILE) and os.path.exists(_CANCEL_FILE)
+    """哨兵取消或私有父进程管道断开；独立 CLI 没有隐式父进程监控。"""
+    from speedbench_owner import parent_disconnected
+    return parent_disconnected() or (bool(_CANCEL_FILE) and os.path.exists(_CANCEL_FILE))
 
 
 def clear_cancel_request() -> None:
@@ -792,7 +793,8 @@ def _no_window_kwargs() -> dict:
 
 
 def run_external(cmd, **kwargs):
-    return run_cancellable(cmd,cancel=cancel_requested if _CANCEL_FILE else None,**kwargs)
+    from speedbench_owner import delegated_active
+    return run_cancellable(cmd,cancel=cancel_requested if _CANCEL_FILE or delegated_active() else None,**kwargs)
 
 
 def curl_speed(proxy_url: str, download_url: str, max_time: float,
@@ -1956,7 +1958,7 @@ def main() -> int:
     parser.add_argument("--switch-group", default="",
                         help="配合 --auto-switch 使用，手动指定要切换的策略组名")
     parser.add_argument("--history",
-                        default=str(Path(__file__).resolve().parent / "speedbench-history.jsonl"),
+                        default=str(Path(os.environ.get('SPEEDBENCH_HOME') or Path(__file__).resolve().parent).resolve() / "speedbench-history.jsonl"),
                         help="历史记录 JSONL 路径，默认在脚本目录下")
     parser.add_argument("--no-history", action="store_true",
                         help="不写入历史记录")
@@ -1973,6 +1975,7 @@ def main() -> int:
                         help="并发模式用的完整配置文件路径（含节点凭据），默认自动找 Clash Verge 的运行配置")
     parser.add_argument("--yes", action="store_true",
                         help="不询问确认直接开始")
+    parser.add_argument('--backend-child',action='store_true',help=argparse.SUPPRESS)
     args = parser.parse_args()
     from speedbench_config import ENV as root_env, validate_root, ConfigRootError
     if os.environ.get(root_env):
@@ -2018,6 +2021,16 @@ def main() -> int:
         print("错误：--top-n 至少为 1。", file=sys.stderr)
         return 2
 
+    from speedbench_owner import benchmark_ownership, LeaseError
+    try:
+        with benchmark_ownership(args.history,delegated=args.backend_child):
+            return _execute_benchmark(args,task_config)
+    except LeaseError:
+        print('SpeedBench 数据目录已被占用，或私有任务身份无法核验；未开始测速或写入历史。',file=sys.stderr)
+        return 2
+
+
+def _execute_benchmark(args,task_config):
     # Windows：命令行场景下用户可在控制台按 Ctrl+Break（Python 映射为
     # SIGBREAK）。本文件没有显式 SIGINT handler——Ctrl+C 靠解释器默认把 SIGINT
     # 转成 KeyboardInterrupt；这里给 SIGBREAK 注册同样的转换，让 CTRL_BREAK_EVENT

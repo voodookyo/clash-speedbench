@@ -98,12 +98,14 @@ def read_control(stream):
 def main():
     # Explicit isolated resource/data paths come from the parent environment,
     # not a URL or renderer-controlled shell command.
+    web=None
     try:
         frame=sys.stdin.buffer.readline(4097)
         if not frame.endswith(b'\n') or len(frame)>4096:raise DesktopError('Bootstrap frame too large')
         bootstrap=validate_bootstrap(json.loads(frame))
         import speedbench_web as web
         with BackendLease(web.DATA_HOME) as lease:
+            web.DATA_OWNER=lease
             server=ThreadingHTTPServer(('127.0.0.1',0),web.Handler)
             server.daemon_threads=True
             web.DESKTOP_IDENTITY=public_identity(lease.instance_id)
@@ -157,6 +159,8 @@ def main():
         # Never dump arbitrary input, nonce, env, credentials or exception URL.
         print('Desktop backend startup or ownership failed',file=sys.stderr)
         return 2
+    finally:
+        if web is not None:web.DATA_OWNER=None
 
 
 if __name__=='__main__':raise SystemExit(main())

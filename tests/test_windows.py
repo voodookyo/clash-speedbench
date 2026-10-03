@@ -514,7 +514,9 @@ class SigbreakRegistrationTest(unittest.TestCase):
     FAKE_SIGBREAK = getattr(signal, "SIGBREAK", 21)
 
     def run_main(self, platform):
-        with mock.patch.object(sys, "platform", platform), \
+        with tempfile.TemporaryDirectory() as cli_data, \
+                mock.patch.dict(os.environ, {"SPEEDBENCH_HOME": cli_data}), \
+                mock.patch.object(sys, "platform", platform), \
                 mock.patch.object(signal, "SIGBREAK", self.FAKE_SIGBREAK,
                                   create=True), \
                 mock.patch.object(sys, "argv", ["clash_speedbench.py", "--yes"]), \

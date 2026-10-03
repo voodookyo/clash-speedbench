@@ -103,6 +103,7 @@ DESKTOP_SHUTDOWN = None
 DESKTOP_EXITING = None
 RELEASE_CHECKER = speedbench_releases.ReleaseChecker()
 CONFIG_ROOT = RootChoice(os.environ.get(ROOT_ENV,''))
+DATA_OWNER = None
 
 
 def connect_controller(*args,**kwargs):
@@ -434,6 +435,14 @@ def run_benchmark(params: dict) -> None:
     job_id = params.get('_job_id')
     source_seq = 0
     checkpoint_at = 0
+    proc = None
+    delegation = None
+    unreaped = False
+
+    def close_private_pipe():
+        if delegation is not None and proc is not None and proc.stdin is not None:
+            try:proc.stdin.close()
+            except (OSError,ValueError):pass
 
     def checkpoint():
         try:
@@ -487,6 +496,13 @@ def run_benchmark(params: dict) -> None:
         if job_id:
             env['SPEEDBENCH_JOB_ID'] = job_id
             env['SPEEDBENCH_CANCEL_PRIMED'] = '1'
+        delegation=DATA_OWNER.delegation(HISTORY) if DATA_OWNER is not None else None
+        if delegation is not None:
+            cmd.append('--backend-child')
+            popen_kwargs['stdin']=subprocess.PIPE
+            # Resolve the root before changing subprocess cwd. Relative caller
+            # environment values must not point the child at a different home.
+            env['SPEEDBENCH_HOME']=str(DATA_OWNER.path.parent)
         proc = subprocess.Popen(
             cmd, cwd=str(DATA_HOME), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -496,6 +512,10 @@ def run_benchmark(params: dict) -> None:
         with STATE_LOCK:
             STATE["proc"] = proc
             requested = bool(job_id and STATE.get('cancel_requested',False))
+        if delegation is not None:
+            # Binary frame bypasses platform console encodings. Keep the pipe
+            # open for this task's lifetime; EOF lets the child detect a crash.
+            proc.stdin.buffer.write(delegation);proc.stdin.buffer.flush()
         if requested:
             CANCEL_FILE.write_text('cancel',encoding='utf-8')
         assert proc.stdout is not None
@@ -526,10 +546,19 @@ def run_benchmark(params: dict) -> None:
                     STATE["lines"] = STATE["lines"][-MAX_LINES:]
         STATE["exit_code"] = proc.wait()
     except Exception as e:
+        if delegation is not None and proc is not None:
+            close_private_pipe() # EOF requests graceful cancellation/cleanup.
+            try:proc.wait(timeout=8)
+            except (subprocess.TimeoutExpired,OSError):
+                unreaped=True
+                with STATE_LOCK:
+                    STATE['cleanup_incomplete']=True
+                    STATE['lines'].append('!! 子任务尚未退出；保留进程所有权并禁止启动新任务，不能确认清理成功。')
         with STATE_LOCK:
             STATE["lines"].append(f"!! 启动测速失败: {_redact_runtime_text(e)}")
             STATE["exit_code"] = -1
     finally:
+        close_private_pipe()
         # 测速进程已把本轮结果追加进 jsonl，顺手增量入库；失败不影响面板状态
         try:
             sync_db()
@@ -554,8 +583,19 @@ def run_benchmark(params: dict) -> None:
                 JOBS.transition(job_id,'failed')
             checkpoint()
         with STATE_LOCK:
-            STATE["running"] = False
-            STATE["proc"] = None
+            STATE["running"] = unreaped
+            STATE["proc"] = proc if unreaped else None
+        if unreaped:
+            # Keep the original handle, never look up a possibly reused PID.
+            # This watcher cannot clear a newer task's state or certify worker
+            # cleanup; the fail-closed flag remains until backend restart.
+            def wait_owned_child():
+                try:proc.wait()
+                except OSError:return
+                with STATE_LOCK:
+                    if STATE.get('proc') is proc:
+                        STATE['proc']=None;STATE['running']=False
+            threading.Thread(target=wait_owned_child,daemon=True).start()
 
 
 def cancel_benchmark() -> dict:
@@ -1266,6 +1306,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    global DATA_OWNER
     # Windows 非中文区域设置下 stdout 默认 cp1252，print 中文启动信息会直接
     # UnicodeEncodeError 崩掉面板（CI windows-latest 实测）。只把 errors 钉成
     # replace：GBK 中文控制台行为不变（该编码能表示中文），cp1252 下退化
@@ -1281,7 +1322,10 @@ def main() -> int:
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
     try:
-        with BackendLease(DATA_HOME):return serve_web(args)
+        with BackendLease(DATA_HOME) as lease:
+            DATA_OWNER=lease
+            try:return serve_web(args)
+            finally:DATA_OWNER=None
     except LeaseError:
         print('SpeedBench 数据目录已被占用或无法安全锁定；请先关闭使用同一目录的现有面板。')
         return 2

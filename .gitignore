@@ -16,6 +16,7 @@ web-token
 identity-seed
 .identity-*
 backend-owner.lock
+benchmark-writer.lock
 ui-preferences.json
 .ui-preferences-*
 desktop/target/

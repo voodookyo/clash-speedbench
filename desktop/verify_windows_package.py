@@ -127,6 +127,56 @@ finally:
     if result.returncode!=0:raise ValueError('Bundled worker group cleanup fixture failed')
 
 
+def verify_cli_ownership(root,data):
+    """Actual bundled backend-to-CLI pipe with a fixture measurement body only."""
+    child='''
+import sys
+sys.path.insert(0,sys.argv.pop(1))
+import clash_speedbench as core
+import speedbench_owner as owner
+def execute(args,config):
+    assert owner.delegated_active()
+    from pathlib import Path
+    try:owner.BackendLease(Path(args.history).parent).acquire()
+    except owner.LeaseError:pass
+    else:raise AssertionError('Delegated child did not retain directory ownership')
+    print('fixture-owned-cli',flush=True)
+    return 0
+core._execute_benchmark=execute
+assert core.main()==0
+'''
+    program='''
+import io,os,sys
+from pathlib import Path
+from contextlib import redirect_stderr
+import speedbench_web as web
+import clash_speedbench as core
+from speedbench_owner import BackendLease
+history=Path(os.environ['SPEEDBENCH_HOME'])/'speedbench-history.jsonl'
+original=history.read_bytes()
+with BackendLease(history.parent) as lease:
+    web.DATA_OWNER=lease;web.HISTORY=history
+    web.connect_controller=lambda *a,**k:None
+    web.sync_db=lambda:None
+    web.benchmark_command=lambda params:[sys.executable,'-B','-E','-s','-u','-c',sys.argv[1],str(Path(web.SCRIPT).parent),'--yes','--history',str(history)]
+    web.run_benchmark({})
+    assert web.STATE['exit_code']==0 and not web.STATE['running']
+    assert 'fixture-owned-cli' in web.STATE['lines']
+    assert lease.instance_id not in str(web.STATE['lines'])
+    core.connect_controller=lambda *a,**k:(_ for _ in ()).throw(AssertionError('Must not connect'))
+    sys.argv=['clash_speedbench.py','--yes','--history',str(history)]
+    with redirect_stderr(io.StringIO()):assert core.main()==2
+web.DATA_OWNER=None
+assert history.read_bytes()==original
+with BackendLease(history.parent):pass
+'''
+    env=dict(os.environ,SPEEDBENCH_HOME=str(data),PATH=str(Path(os.environ['SystemRoot'])/'System32'))
+    env.pop('SPEEDBENCH_VERGE_ROOT',None)
+    result=subprocess.run([str(root/'runtime/python.exe'),'-B','-E','-s','-c',program,child],
+        cwd=root/'app',env=env,capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode!=0:raise ValueError('Bundled private CLI ownership fixture failed')
+
+
 def verify(package):
     if os.name!='nt':raise ValueError('Windows artifact verification requires Windows')
     package=Path(package).resolve()
@@ -145,13 +195,14 @@ def verify(package):
         history=data/'speedbench-history.jsonl';raw=b'{"ts":"fixture-only","results":[]}\n';history.write_bytes(raw)
         bootstrap(root,data,manifest);bootstrap(root,data,manifest)
         verify_worker_cleanup(root,data)
+        verify_cli_ownership(root,data)
         if history.read_bytes()!=raw:raise ValueError('Original fixture raw changed during packaged lifecycle')
         # An attacker-updated side manifest cannot authorize modified source.
         source=root/'app/speedbench_desktop.py';source.write_bytes(source.read_bytes()+b'\n# fixture tamper\n')
         manifest['files']['app/speedbench_desktop.py']=digest(source)
         (root/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
         if native_check()==0:raise ValueError('Mutable side manifest bypassed native integrity anchor')
-    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, original raw retained. Native window/tray acceptance not included.')
+    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, original raw retained. Native window/tray acceptance not included.')
 
 
 if __name__=='__main__':
