@@ -516,6 +516,8 @@ let searchText = '';
 let expandedNode = null;      // 节点视图中展开详情面板的节点（一次只展开一个）
 let pollTimer = null;         // 测速状态轮询：全局单例，切视图不清除
 let sourceCatalog = {nodes:[],sources:[]}, selectedNodeIds = new Set();
+let rootControls=null;
+let catalogRequestRevision=0;
 let taskClient = null, taskConfig = null, activeTask = null;
 let favIds = new Set();
 try{ favIds=new Set(JSON.parse(lsGet('sb_favs_v2')||'[]')); }catch(e){}
@@ -524,12 +526,14 @@ function nodeUiKey(r){ return r.node_id || r.name; }
 function sourceLabel(r){ return r.subscription_name || (r.source_status==='ambiguous'?'多个来源（无法唯一确认）':r.provider||'来源未知'); }
 
 async function loadSourceCatalog(){
+  const stamp=++catalogRequestRevision;
   const select = document.getElementById('f-source');
   const status = document.getElementById('source-status');
   if(!select || !status) return;
   const selected = select.value || '';
   try{
     const catalog = await getJSON('/api/catalog');
+    if(stamp!==catalogRequestRevision) return;
     sourceCatalog = catalog;
     if(typeof SBTasks!=='undefined'){
       const migrated=SBTasks.migrateFavorites([...favs],catalog.nodes||[],[...favIds]);
@@ -550,7 +554,7 @@ async function loadSourceCatalog(){
       ? `已核验 ${(catalog.nodes||[]).length} 个节点 · ${unknown} 个来源不唯一/未知。未加载订阅不会自动切换。`
       : '订阅目录暂不可核验，仍可测速已加载节点；来源不会被猜测填入。';
     renderNodePicker(); updateTaskBudget();
-  }catch(e){ status.textContent='订阅目录读取失败；请确认 Verge 已运行。'; }
+  }catch(e){ if(stamp===catalogRequestRevision)status.textContent='订阅目录读取失败；请确认 Verge 已运行。'; }
 }
 
 /* ==================== 表格行渲染（节点/历史/订阅三视图复用） ==================== */
@@ -1128,6 +1132,7 @@ async function loadCurrent(){
 
 /* ==================== 测速控制 ==================== */
 function setRunUi(running){
+  if(rootControls) rootControls.setBusy(running);
   document.getElementById('btn-run').disabled = running;
   document.getElementById('btn-cancel').style.display = running ? '' : 'none';
   document.getElementById('prog-wrap').style.display = running ? 'flex' : 'none';
@@ -1909,6 +1914,12 @@ async function boot(){
   init();
   initPreferenceTransfer();
   initReleaseSettings();
+  if(typeof SBConfigRoot!=='undefined')rootControls=SBConfigRoot.init({document,fetch,token:SB_TOKEN,confirm:confirmModal,onChanged:async()=>{
+    ++catalogRequestRevision;selectedNodeIds.clear();sourceCatalog={version:2,status:'refreshing',sources:[],nodes:[]};
+    document.getElementById('f-source').value='';renderNodePicker();updateTaskBudget();
+    await loadSourceCatalog();await loadCurrent();renderNodePicker();updateTaskBudget();
+    if(sourceCatalog.status==='refreshing') throw Error('Catalogue unavailable');
+  }});
   route();
   renderTable();      // latestData=null → 骨架屏，loadLatest 完成后替换
   updateSortArrows('th.sort', sortKey, sortAsc);

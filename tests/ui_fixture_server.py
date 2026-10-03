@@ -4,6 +4,7 @@ Run explicitly (not unittest discovery): python -m tests.ui_fixture_server
 All synthetic rows are labelled fixture. This is never a production fallback.
 """
 import argparse
+import sys
 import tempfile
 import threading
 import time
@@ -21,17 +22,25 @@ class FixtureServer(ThreadingHTTPServer):
 
 
 def main():
+    if hasattr(sys.stdout,'reconfigure'):sys.stdout.reconfigure(encoding='utf-8')
     parser=argparse.ArgumentParser()
     parser.add_argument('--port',type=int,default=8964)
     parser.add_argument('--desktop-preferences',action='store_true',
                         help='Simulate the WebView preference path in a browser; NOT native GUI acceptance')
     parser.add_argument('--release-status',choices=('ok','timeout'),default='ok',
                         help='Synthetic release metadata, never queries GitHub')
+    parser.add_argument('--config-root-fixture',action='store_true',help='Print a synthetic local layout for root-selection UI QA')
     args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='speedbench-ui-fixture-') as folder:
         web.DATA_HOME=Path(folder)
         web.HISTORY=Path(folder)/'fixture.jsonl'
         web.CANCEL_FILE=Path(folder)/'cancel-request'
+        from speedbench_config import RootChoice
+        web.CONFIG_ROOT=RootChoice()
+        if args.config_root_fixture:
+            from tests.test_config_root import layout
+            fixture_root=layout(folder)
+            print('Synthetic configuration layout: '+str(fixture_root),flush=True)
         if args.desktop_preferences: web.DESKTOP_IDENTITY={'version':'1.1.0-alpha.1'}
         class FixtureReleaseChecker:
             def check(self,current):
@@ -48,7 +57,7 @@ def main():
             dict(subscription_id=source,name='界面验证 fixture <订阅>',loaded=True),
             dict(subscription_id='subscription_v2_'+'b'*32,name='fixture 未加载订阅',loaded=False)],nodes=nodes)
         web.get_current=lambda:dict(ok=True,now=nodes[0]['runtime_name'],group='fixture 策略组')
-        web.connect_controller=lambda:None
+        web.connect_controller=lambda *a,**k:None
         web.LEAK_BASIC_LOOKUP=lambda ip:None
         web.switch_node=lambda name:dict(ok=True,now=name,group='fixture 策略组')
         def run(params):

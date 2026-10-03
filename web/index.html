@@ -220,6 +220,13 @@
     <!-- ============ IP Intelligence 设置 ============ -->
     <section id="view-settings" style="display:none">
       <div class="card"><h2>界面与连接</h2><label for="f-theme">主题</label><select id="f-theme"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><p class="muted">基础测速自动连接本机 Clash Verge，不需要第三方 IP 风控 API Key。下方可选 Key 只用于扩展画像。</p><div id="pending-favorites" class="muted"></div></div>
+      <div class="card" id="config-root-settings"><h2>Verge 配置根目录</h2>
+        <p class="muted">默认自动发现。便携或自定义安装可明确选择包含 clash-verge.yaml、profiles.yaml 和 profiles 子目录的本机绝对路径；不要粘贴配置内容或密钥。只读固定配置布局，不提供任意文件读取。</p>
+        <label for="config-root-path">自定义目录（留空表示自动发现）</label><input id="config-root-path" type="text" autocomplete="off" spellcheck="false" maxlength="2048" placeholder="例如 C:\Users\用户名\AppData\Roaming\io.github.clash-verge-rev.clash-verge-rev">
+        <div class="leak-actions"><button class="mini" id="btn-config-preview">预览配置目录</button><button id="btn-config-apply" disabled>确认应用目录</button><button class="mini" id="btn-config-auto">恢复自动发现</button></div>
+        <p id="config-root-status" class="muted" role="status" aria-live="polite">正在读取本次目录选择…</p>
+        <p class="muted">选择仅驻留本次后端内存，不进 localStorage、偏好导出或测速历史；重启恢复默认（若需固定启动目录可设置 SPEEDBENCH_VERGE_ROOT）。运行和清理期间不能更改。自定义目录失效不会回退到其他目录；切换后将清除待测选择，保留历史／收藏，来源与连接必须重新核验。</p>
+      </div>
       <div id="desktop-settings" class="card" hidden><h2>桌面客户端</h2><label class="chk"><input type="checkbox" id="f-notifications"> 任务完成通知（默认关闭；仅发送模式、状态和节点数量）</label><p class="muted">通知是否显示还取决于系统设置。窗口关闭后任务继续，可从托盘重新打开；退出会先取消并清理任务。</p></div>
       <div class="card" id="release-settings"><h2>官方版本与手动升级</h2>
         <p id="release-status" class="muted" role="status" aria-live="polite">正在读取本地版本；不会自动联网检查。</p>
@@ -306,6 +313,7 @@
 <script src="/static/tasks.js"></script>
 <script src="/static/preferences.js"></script>
 <script src="/static/releases.js"></script>
+<script src="/static/config-root.js"></script>
 <script src="/static/view.js"></script>
 <script src="/static/app.js"></script>
 </body>

@@ -25,7 +25,7 @@ except ImportError:from package_windows import package_path, STAGE
 def bootstrap(root,data,manifest):
     env=dict(os.environ,SPEEDBENCH_HOME=str(data),PATH=str(Path(os.environ['SystemRoot'])/'System32'))
     for key in list(env):
-        if key.upper().startswith('PYTHON') or key.startswith(('SPEEDBENCH_IP','SPEEDBENCH_SCAMALYTICS')):env.pop(key)
+        if key.upper().startswith('PYTHON') or key.startswith(('SPEEDBENCH_IP','SPEEDBENCH_SCAMALYTICS')) or key=='SPEEDBENCH_VERGE_ROOT':env.pop(key)
     python=root/'runtime/python.exe'
     process=subprocess.Popen([str(python),'-B','-E','-s','-u',str(root/'app/speedbench_desktop.py')],
         cwd=data,env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
@@ -60,7 +60,15 @@ def bootstrap(root,data,manifest):
             response=connection.getresponse();data_status=json.loads(response.read())
             if response.status!=200 or data_status.get('automatic_import') is not False or Path(data_status.get('data_home','')).resolve()!=data.resolve():
                 raise ValueError('Packaged data guidance mismatch')
-            for module in ('preferences.js','releases.js'):
+            connection.request('GET','/api/config-root',headers=auth)
+            response=connection.getresponse();root_info=json.loads(response.read())
+            if response.status!=200 or root_info.get('mode')!='auto' or root_info.get('persistence')!='session':
+                raise ValueError('Packaged configuration root leaked across sessions')
+            connection.request('POST','/api/config-root/preview',json.dumps({'root':'../CANARY-config'}),
+                headers={**auth,'Content-Type':'application/json'})
+            response=connection.getresponse();body=response.read()
+            if response.status!=400 or b'CANARY-config' in body:raise ValueError('Packaged configuration root accepted unsafe path')
+            for module in ('preferences.js','releases.js','config-root.js'):
                 connection.request('GET','/static/'+module)
                 response=connection.getresponse();body=response.read()
                 if (response.status!=200 or 'application/javascript' not in response.getheader('Content-Type','') or

@@ -41,6 +41,29 @@ recorded in manifest and `build-provenance.json`. A source-dirty build must not
 be mislabeled as an official Release. Update pinned runtimes deliberately for
 security maintenance; recheck upstream hashes, tests and packages.
 
+## Explicit Verge root selection
+
+Shared Settings accepts a local absolute Verge configuration directory through
+authenticated preview/confirm endpoints. Only the fixed `clash-verge.yaml`,
+`profiles.yaml`, `profiles/` layout is checked; preview does not prove controller
+connection or subscription attribution. There is no generic file read/export
+endpoint and no native folder picker yet. UNC/Windows mapped network drives,
+out-of-root file links and oversized fixed documents are rejected.
+
+Controller discovery, catalogue attribution and worker configuration use the
+same root; accepted jobs carry a private frozen snapshot, not a command-line
+argument or persisted task setting. Active/cancelling/cleanup jobs prevent root
+changes. A broken explicit root fails closed, never falling back to another
+controller or directory. Changing roots clears the pending node selection;
+history and favorites survive, but IDs in another root namespace are not guessed.
+
+The choice is backend-session memory only, never localStorage or exported
+preferences/history. Reloading the page preserves it; restart reads the startup
+`SPEEDBENCH_VERGE_ROOT` environment override or uses automatic discovery.
+Resetting to auto affects this backend only, not that environment variable.
+`SPEEDBENCH_HOME` selects the SpeedBench data directory, not the Verge root.
+Keep paths/configuration private when sharing diagnostics.
+
 ## Build (developer machine only)
 
 Node 24.20, Rust 1.97 and platform Tauri build dependencies are development

@@ -420,6 +420,33 @@ $env:MIHOMO_SECRET = '你的secret'
 3 次 application-level probe，不改变 Phase 1/Phase 2 和单流测速逻辑。Windows、macOS、Linux
 均保持 Python 3.9/3.12 与标准库运行，不需要 `pip install`；PyYAML 仍只是可选配置解析 fallback。
 
+## 自定义 Verge 配置根目录（开发版）
+
+默认自动发现保持不变。便携、自定义安装或多配置环境可在共享 Web／桌面设置中输入本机
+**绝对目录**，先预览固定布局，再确认应用。要求目录内存在 `clash-verge.yaml`、
+`profiles.yaml` 和 `profiles/`；不支持 UNC／Windows 映射网络盘、越界文件链接或超限文件。
+预览只检查布局，不代表已经连接或订阅来源核验成功。没有通用文件读取／导出 API，
+程序不会修改 Verge 配置，也没有新增原生文件选择器。
+
+应用后控制器、订阅目录和测速 worker 使用同一根目录；任务接受时冻结此选择，运行、取消
+及清理期间禁止更改。无效自定义目录**不会悄悄回退**到默认目录或另一个控制器，必须修正
+目录或明确点击“恢复自动发现”。切换目录清除当前待测选择；历史、收藏和原始记录不删除。
+稳定 ID 还依赖配置根目录命名空间与私有种子，不同根目录的旧 ID 不会强行匹配。
+
+界面选择仅驻留本次后端内存；刷新页面保留，重启后重新读取启动设置。不进入 localStorage、
+偏好导出、任务配置、JSONL 或 SQLite。需要固定启动目录时，由用户在启动环境设置
+`SPEEDBENCH_VERGE_ROOT`（不要放入订阅配置内容或密钥），例如 PowerShell 当前会话：
+
+```powershell
+$env:SPEEDBENCH_VERGE_ROOT = 'C:\本机\Verge配置目录'
+python speedbench_web.py
+```
+
+相同变量也适用于直接 CLI 和桌面后端；自定义根目录指定后，CLI 的 `--config-file` 必须
+与该目录的 `clash-verge.yaml` 一致，否则测速前报错。恢复自动发现只影响当前后端，不修改
+启动环境变量；下次启动仍读取该变量。`SPEEDBENCH_HOME` 是 SpeedBench **数据目录**，
+不是 Verge 配置根目录，两者不要混淆。
+
 ## License
 
 [MIT](LICENSE)
