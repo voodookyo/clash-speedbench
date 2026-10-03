@@ -138,6 +138,29 @@ CREATE TABLE IF NOT EXISTS leak_audits (
 );
 CREATE INDEX IF NOT EXISTS idx_leak_audits_created_at
     ON leak_audits(created_at DESC);
+CREATE TABLE IF NOT EXISTS subscription_sources (
+    subscription_id TEXT PRIMARY KEY,
+    current_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_identities (
+    node_id TEXT PRIMARY KEY,
+    identity_version INTEGER NOT NULL,
+    identity_strength TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_origins (
+    node_result_id INTEGER NOT NULL REFERENCES node_results(id),
+    subscription_id TEXT NOT NULL REFERENCES subscription_sources(subscription_id),
+    name_snapshot TEXT NOT NULL,
+    source_status TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY(node_result_id, subscription_id)
+);
+CREATE INDEX IF NOT EXISTS idx_node_origins_subscription ON node_origins(subscription_id);
 """
 
 # 旧库就地升级时要补的列（新库的 SCHEMA 已包含，_ensure_columns 对其为 no-op）
@@ -149,6 +172,8 @@ _EXTRA_COLUMNS = {
         ("probe_failures", "INTEGER"), ("probe_success_rate", "REAL"),
         ("probe_loss_pct", "REAL"), ("network_score", "REAL"),
         ("ip_quality_score", "REAL"), ("ip_grade", "TEXT"),
+        ("node_id", "TEXT"), ("identity_version", "INTEGER"),
+        ("identity_strength", "TEXT"), ("source_status", "TEXT"),
     ],
     "ip_profiles": [("region", "TEXT"), ("city", "TEXT")],
     # These entries make an interrupted/experimental migration repairable as
@@ -188,6 +213,7 @@ def _open(db_path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     _ensure_columns(conn)
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_node_results_identity ON node_results(node_id)')
     return conn
 
 
@@ -471,6 +497,43 @@ def _insert_ip_intel(conn, run_id, result):
         )
 
 
+def _insert_source_origins(conn, node_result_id, run_id, r):
+    node_id = r.get('node_id')
+    if (not isinstance(node_id, str) or not re.fullmatch(r'node_v2_[0-9a-f]{32}', node_id)
+            or r.get('identity_version') != 2):
+        return
+    strength = 'strong' if r.get('identity_strength') == 'strong' else 'weak'
+    status = r.get('source_status')
+    status = status if status in ('verified', 'ambiguous', 'unknown') else 'unknown'
+    ts = conn.execute('SELECT ts FROM runs WHERE id=?', (run_id,)).fetchone()[0]
+    conn.execute('UPDATE node_results SET node_id=?,identity_version=2,identity_strength=?,source_status=? WHERE id=?',
+                 (node_id, strength, status, node_result_id))
+    conn.execute('INSERT INTO node_identities VALUES (?,2,?,?,?) ON CONFLICT(node_id) DO UPDATE SET last_seen=max(last_seen,excluded.last_seen),first_seen=min(first_seen,excluded.first_seen)',
+                 (node_id, strength, ts, ts))
+    memberships = r.get('subscriptions')
+    if status == 'unknown' or not isinstance(memberships, list):
+        return
+    allowed_ids = r.get('subscription_ids')
+    allowed_ids = allowed_ids if isinstance(allowed_ids, list) else []
+    for membership in memberships[:1000]:
+        if not isinstance(membership, dict):
+            continue
+        source_id = membership.get('subscription_id')
+        if (not isinstance(source_id, str) or
+                not re.fullmatch(r'subscription_v2_[0-9a-f]{32}', source_id) or
+                source_id not in allowed_ids):
+            continue
+        name = _db_text(membership.get('name'), '未命名订阅')
+        kind = membership.get('kind')
+        kind = kind if kind in ('remote','local','provider','unknown') else 'unknown'
+        conn.execute('INSERT INTO subscription_sources VALUES (?,?,?,?,?) ON CONFLICT(subscription_id) DO UPDATE SET current_name=CASE WHEN excluded.last_seen>=last_seen THEN excluded.current_name ELSE current_name END,last_seen=max(last_seen,excluded.last_seen),first_seen=min(first_seen,excluded.first_seen)',
+                     (source_id, name, kind, ts, ts))
+        # Source evidence contains fixed diagnostics, never raw configuration.
+        evidence = ['Exact local connection definition match']
+        conn.execute('INSERT OR IGNORE INTO node_origins VALUES (?,?,?,?,?)',
+                     (node_result_id, source_id, name, status, json.dumps(evidence)))
+
+
 def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
     name = str(r.get("name") or "")
     # A staged/new serializer may include only ``intel_v4``/``intel_v6`` and
@@ -485,7 +548,7 @@ def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
     exit_ipv4 = _family_ip(r, 4) or candidate_ips.get(4)
     exit_ipv6 = _family_ip(r, 6) or candidate_ips.get(6)
     # 旧行缺 node_key/fail_reason/provider 等新字段时落 ""，保持可聚合
-    conn.execute(
+    inserted = conn.execute(
         "INSERT INTO node_results(run_id, name, proto, provider, node_key,"
         " latency_ms, jitter_ms, connect_ms, median_mbps, best_mbps, multi_mbps,"
         " sample_mb, score, stars, status, fail_reason, tags)"
@@ -509,7 +572,8 @@ def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
          _db_int(r.get("probe_failures")), _db_number(r.get("probe_success_rate")),
          _db_number(r.get("probe_loss_pct")), _db_number(r.get("network_score")),
          _db_number(r.get("ip_quality_score")), _db_text(r.get("ip_grade") or r.get("grade")),
-         exit_ipv4, exit_ipv6))
+          exit_ipv4, exit_ipv6))
+    _insert_source_origins(conn, inserted.lastrowid, run_id, r)
     ip = r.get("ip")
     if isinstance(ip, dict) and ip:
         # 旧格式（v0.2 及更早）的 ip 没有 ok 字段：按 exit_ip 是否存在推断查询成功
@@ -629,7 +693,7 @@ def all_runs(db_path) -> list:
         conn.close()
 
 
-def node_series(db_path, name: str, days: int = 30, node_key: str = "") -> list:
+def node_series(db_path, name: str, days: int = 30, node_key: str = "", node_id: str = "") -> list:
     """某节点最近 days 天逐次测速序列（时间升序）。
 
     ts 是 ISO 本地时间字符串，字典序即时间序，直接与 cutoff 比较。
@@ -637,7 +701,9 @@ def node_series(db_path, name: str, days: int = 30, node_key: str = "") -> list:
     """
     days = max(1, min(int(days), 3650))
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-    if node_key:
+    if node_id:
+        where, params = 'n.node_id = ?', (node_id, since)
+    elif node_key:
         where, params = "n.node_key = ?", (node_key, since)
     else:
         where, params = "n.name = ?", (name, since)
@@ -738,7 +804,7 @@ def _reputation_worsened(previous, current):
     return False
 
 
-def ip_reputation_changes(db_path, name: str, node_key: str = "") -> list:
+def ip_reputation_changes(db_path, name: str, node_key: str = "", node_id: str = "") -> list:
     """Return the deduplicated IP/reputation timeline for one node.
 
     The legacy ``ip_changes`` API intentionally keeps its old, small shape.
@@ -750,7 +816,9 @@ def ip_reputation_changes(db_path, name: str, node_key: str = "") -> list:
     conn = _open(db_path)
     try:
         conn.row_factory = sqlite3.Row
-        if node_key:
+        if node_id:
+            where, params = 'n.node_id = ?', (node_id,)
+        elif node_key:
             where, params = "n.node_key = ?", (node_key,)
         else:
             where, params = "n.name = ?", (name,)
@@ -967,6 +1035,70 @@ def _median_or_none(vals: list, ndigits: int):
     """非空数值列表的中位数（round 到 ndigits 位）；空列表返回 None。"""
     vals = [v for v in vals if v is not None]
     return round(statistics.median(vals), ndigits) if vals else None
+
+
+def source_summary(db_path, days=30, subscription_id=None):
+    """Versioned origins, keeping legacy unknowns separate and honest coverage.
+
+    Ambiguous membership is included in each possible source and explicitly
+    counted. Consumers must not sum these source totals as unique global nodes.
+    """
+    days = max(1, min(int(days), 3650))
+    since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+    conn = _open(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            'SELECT n.*,r.ts,o.subscription_id,o.name_snapshot,o.source_status AS origin_status,s.current_name '
+            'FROM node_results n JOIN runs r ON r.id=n.run_id '
+            'LEFT JOIN node_origins o ON o.node_result_id=n.id '
+            'LEFT JOIN subscription_sources s ON s.subscription_id=o.subscription_id '
+            'WHERE r.ts>=? ORDER BY r.id,n.id', (since,)).fetchall()
+    finally:
+        conn.close()
+    groups = {}
+    for row in rows:
+        sid = row['subscription_id'] or ''
+        if subscription_id is not None and sid != subscription_id:
+            continue
+        # Old provider labels are not verified subscriptions. They retain their
+        # own bucket instead of being silently attached to today's source.
+        legacy = (row['provider'] or '') if not sid else ''
+        key = (sid, legacy, bool(row['node_id']))
+        group = groups.setdefault(key, dict(subscription_id=sid,
+            name=row['current_name'] if sid else legacy or ('来源未知' if row['node_id'] else '历史来源未知'),
+            source_status='verified' if sid else 'unknown' if row['node_id'] else 'legacy_unknown',
+            rows=[], runs=set(), nodes=set(), ambiguous_node_count=0, last_ts=''))
+        group['rows'].append(row)
+        group['runs'].add(row['run_id'])
+        group['nodes'].add(row['node_id'] or ('legacy', row['name']))
+        if row['origin_status'] == 'ambiguous':
+            group['ambiguous_node_count'] += 1
+            group['source_status'] = 'ambiguous'
+        group['last_ts'] = max(group['last_ts'], row['ts'])
+    result = []
+    for group in groups.values():
+        rows = group.pop('rows')
+        count = len(rows)
+        # Missing old probe data is neither success nor failure. Report known
+        # probe coverage separately, never silently classify unknown as offline.
+        probed = [r for r in rows if (r['probe_attempts'] and r['probe_successes'] is not None)
+                  or r['latency_ms'] is not None]
+        online = sum((r['probe_successes'] > 0 if r['probe_attempts'] and r['probe_successes'] is not None
+                      else True) for r in probed)
+        attempted = sum(r['sample_mb'] is not None or r['median_mbps'] is not None for r in rows)
+        successful = sum(r['median_mbps'] is not None and r['median_mbps'] > 0 for r in rows)
+        scores = [r['network_score'] for r in rows if r['network_score'] is not None]
+        run_count, node_count = len(group.pop('runs')), len(group.pop('nodes'))
+        result.append(dict(group, run_count=run_count, node_count=node_count,
+            probe_online_ratio=round(online/len(probed),4) if probed else None,
+            probe_coverage=round(len(probed)/count,4), bandwidth_coverage=round(attempted/count,4),
+            bandwidth_success_ratio=round(successful/attempted,4) if attempted else None,
+            median_mbps=_median_or_none([r['median_mbps'] for r in rows],3),
+            latency_ms=_median_or_none([r['latency_ms'] for r in rows],1),
+            avg_network_score=round(statistics.fmean(scores),1) if scores else None))
+    result.sort(key=lambda item: (item['last_ts'],item['name']), reverse=True)
+    return result
 
 
 def subscription_summary(db_path, days: int = 30) -> list:

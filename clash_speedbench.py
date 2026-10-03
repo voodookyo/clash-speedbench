@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import speedbench_controller as controller_config
+import speedbench_sources as source_catalog
 
 from speedbench_ip_intel import (
     IpIntelCache,
@@ -546,6 +547,7 @@ class Result:
     ip_quality_score: Optional[float] = None
     ip_grade: Optional[str] = None
     dual_stack_inconsistent: bool = False
+    origin: Optional[dict] = None          # safe, versioned source/identity fields
 
 
 def detect_controller(secret: str, explicit: Optional[str]) -> Tuple[str, bool]:
@@ -1682,6 +1684,7 @@ def result_to_dict(r: Result) -> dict:
     return {
         "name": r.name,
         "provider": r.provider,
+        **source_catalog.result_origin(r.origin),
         "node_key": r.node_key,
         "proto": r.proto,
         "latency_ms": r.latency_ms,
@@ -1776,6 +1779,9 @@ def auto_switch_best(api: MihomoAPI, proxies: Dict[str, dict],
 
 def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]) -> int:
     """Shared reporting: box table + CSV + history + optional auto-switch."""
+    origins = getattr(args, 'source_origins', {})
+    for result in results:
+        source_catalog.apply_origin(result, origins.get(result.name))
     if not results:
         print("没有产生有效测速结果。")
         return 0
@@ -1831,6 +1837,10 @@ def main() -> int:
     parser.add_argument("--exclude", default=r"(?i)(剩余|流量|到期|官网|套餐|公告|倍率|traffic|expire)",
                         help="排除名称匹配此正则的节点")
     parser.add_argument("--provider", help="只测试指定 provider-name（精确匹配）")
+    parser.add_argument("--subscription-id", action="append", default=[],
+                        help="只测指定已验证订阅 ID，可重复指定；不切换/下载订阅")
+    parser.add_argument("--node-id", action="append", default=[],
+                        help="只测指定当前节点身份 ID，可重复指定")
     parser.add_argument("--mb", type=int, default=None,
                         help="单轮请求数据量 MB（1~95）；不指定时先 ~1MB 预热估速，"
                              "再自适应 10/30/60/95MB（目标单样本 2-4 秒）")
@@ -1923,6 +1933,17 @@ def main() -> int:
 
     proxies: Dict[str, dict] = proxy_data.get("proxies", {})
     leaves = leaf_nodes(proxies)
+    catalog = source_catalog.discover_catalog(
+        api, os.environ.get('SPEEDBENCH_HOME') or str(Path(args.history).resolve().parent),
+        config_file=args.config_file, snapshot=proxies)
+    args.source_origins = {n['runtime_name']: n for n in catalog['nodes']}
+    if args.subscription_id or args.node_id:
+        known_sources = {s['subscription_id'] for s in catalog['sources'] if s['loaded']}
+        known_nodes = {n['node_id'] for n in catalog['nodes']}
+        if (not set(args.subscription_id).issubset(known_sources) or
+                not set(args.node_id).issubset(known_nodes)):
+            print('来源/节点身份已失效或未加载，请刷新目录；不会切换订阅。', file=sys.stderr)
+            return 1
 
     # Filters
     include_re = re.compile(args.include) if args.include else None
@@ -1930,6 +1951,11 @@ def main() -> int:
 
     candidates = []
     for name, info in leaves.items():
+        origin = args.source_origins.get(name, {})
+        if args.subscription_id and not set(args.subscription_id).intersection(origin.get('subscription_ids', [])):
+            continue
+        if args.node_id and origin.get('node_id') not in args.node_id:
+            continue
         if include_re and not include_re.search(name):
             continue
         if exclude_re and exclude_re.search(name):
@@ -1981,6 +2007,9 @@ def main() -> int:
         try:
             results = run_pool(candidates, proto_by_name, args, main_api=api,
                                provider_by_name=provider_by_name)
+        except source_catalog.SourceSelectionChanged as e:
+            print(str(e), file=sys.stderr)
+            return 1
         except WorkerUnavailable as e:
             print(f"并发模式不可用：{e}\n回退到串行模式。", file=sys.stderr)
         else:

@@ -39,6 +39,7 @@ import speedbench_ip_intel  # noqa: E402
 import speedbench_leak  # noqa: E402
 import speedbench_tray  # noqa: E402
 import speedbench_controller  # noqa: E402
+import speedbench_sources  # noqa: E402
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到
@@ -357,6 +358,10 @@ def run_benchmark(params: dict) -> None:
         cmd += ["--rounds", str(int(params["rounds"]))]
     if params.get("auto_switch"):
         cmd += ["--auto-switch"]
+    for source_id in params.get('subscription_ids', []):
+        cmd += ['--subscription-id', source_id]
+    for node_id in params.get('node_ids', []):
+        cmd += ['--node-id', node_id]
 
     with STATE_LOCK:
         STATE["running"] = True
@@ -447,10 +452,43 @@ def cancel_benchmark() -> dict:
         return {"ok": False, "msg": f"中断失败: {e}"}
 
 
-def do_switch(name: str) -> dict:
+def get_catalog(api=None, snapshot=None):
+    try:
+        api = api if api is not None else connect_controller()
+        return speedbench_sources.discover_catalog(api, HISTORY.parent, snapshot=snapshot)
+    except Exception:
+        return dict(version=2, status='controller_unavailable', sources=[], nodes=[])
+
+
+def _check_source_selection(params):
+    if not isinstance(params, dict):
+        return False
+    for key, prefix in (('subscription_ids','subscription'), ('node_ids','node')):
+        values = params.get(key, [])
+        if (not isinstance(values, list) or len(values) > 1000 or
+                any(not isinstance(x,str) or not re.fullmatch(prefix+r'_v2_[0-9a-f]{32}', x) for x in values)):
+            return False
+    if params.get('subscription_ids') or params.get('node_ids'):
+        catalog = get_catalog()
+        sources = {s['subscription_id'] for s in catalog['sources'] if s['loaded']}
+        nodes = {n['node_id'] for n in catalog['nodes']}
+        if not set(params.get('subscription_ids', [])).issubset(sources):
+            return False
+        if not set(params.get('node_ids', [])).issubset(nodes):
+            return False
+    return True
+
+
+def do_switch(name: str, node_id: str = '') -> dict:
     try:
         api = connect_controller()
         proxies = api.get("/proxies").get("proxies", {})
+        if node_id:
+            catalog = get_catalog(api, snapshot=proxies)
+            matches = [n for n in catalog['nodes'] if n['node_id'] == node_id]
+            if len(matches) != 1 or matches[0]['runtime_name'] not in proxies:
+                return {'ok': False, 'msg': '节点身份已失效，请刷新目录后重试'}
+            name = matches[0]['runtime_name']
         graph = build_selectable_graph(proxies)
         group = pick_switch_group(proxies, graph, name, "GLOBAL")
         if not group:
@@ -692,6 +730,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(latest_record())
         elif path == "/api/current":
             self._json(get_current())
+        elif path == '/api/catalog':
+            self._json(get_catalog())
+        elif path == '/api/sources/history':
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sync_db()
+            self._json(speedbench_db.source_summary(db_path(), days=_days_param(qs),
+                subscription_id=qs.get('subscription_id', [None])[0]))
         elif path == "/api/history":
             self._json(slim_history())
         elif path == "/api/ip-intel/status":
@@ -711,18 +756,20 @@ class Handler(BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             name = qs.get("name", [""])[0]
             key = qs.get("key", [""])[0]
-            if not name and not key:
+            node_id = qs.get('node_id', [''])[0]
+            if not name and not key and not node_id:
                 self._json({"ok": False, "msg": "缺少 name 参数"}, 400)
                 return
             days = _days_param(qs)
             sync_db()
             self._json({
                 "series": speedbench_db.node_series(db_path(), name, days=days,
-                                                    node_key=key),
+                                                    node_key=key, node_id=node_id),
                 "ip_changes": (speedbench_db.ip_changes(db_path(), name)
                                if name else []),
-                "ip_reputation_changes": _load_ip_reputation_changes(
-                    name=name, node_key=key),
+                "ip_reputation_changes": (speedbench_db.ip_reputation_changes(
+                    db_path(), name, node_id=node_id) if node_id else
+                    _load_ip_reputation_changes(name=name, node_key=key)),
             })
         elif path == "/api/subscriptions":
             # 订阅维度汇总：按 provider 聚合近 N 天的可用率/速度/评分
@@ -781,14 +828,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._reject("已有测速任务进行中", 409)
                 return
             params = self._read_body()
+            if not _check_source_selection(params):
+                self._json({'ok': False, 'msg': '来源/节点选择无效或未加载，请刷新目录'}, 400)
+                return
             threading.Thread(target=run_benchmark, args=(params,), daemon=True).start()
             self._json({"ok": True})
         elif path == "/api/switch":
-            name = str(self._read_body().get("name", ""))
-            if not name:
+            body = self._read_body()
+            if not isinstance(body, dict):
+                self._json({'ok':False,'msg':'请求格式无效'},400)
+                return
+            name = str(body.get("name", ""))
+            node_id = body.get('node_id', '')
+            if not isinstance(node_id, str) or len(node_id) > 80:
+                self._json({'ok':False,'msg':'节点身份无效'},400)
+                return
+            if not name and not node_id:
                 self._json({"ok": False, "msg": "缺少节点名"}, 400)
                 return
-            self._json(do_switch(name))
+            self._json(do_switch(name, node_id=node_id) if node_id else do_switch(name))
         elif path == "/api/run/cancel":
             self._json(cancel_benchmark())
         elif path == "/api/ip-intel/settings":
