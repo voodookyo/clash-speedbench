@@ -34,6 +34,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.parse
@@ -47,7 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import speedbench_controller as controller_config
 import speedbench_sources as source_catalog
 import speedbench_tasks
-from speedbench_process import run_cancellable
+from speedbench_process import run_cancellable, cancellation_scope, current_cancellation, SocketCancellation
 from speedbench_progress import ProgressEmitter, DownloadCounter, ProbeObserver, phase, publish_result, measure, emit_metric, milestone
 from speedbench_jobs import safe_probe_sources
 
@@ -358,13 +359,19 @@ class MihomoAPI:
                 conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80,
                                                   timeout=self.timeout)
 
+        resp=None
+        monitor=SocketCancellation(conn,current_cancellation() if self.pipe_name is None else None)
         try:
-            conn.request(method, path, body=body, headers=headers)
-            resp = conn.getresponse()
-            raw = resp.read()
+            with monitor:
+                conn.request(method, path, body=body, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+                monitor.check()
         except (OSError, http.client.HTTPException) as e:
+            monitor.check()
             raise ApiError(controller_config.redact_text(f"{method} {path}: {e}", (self.secret,))) from None
         finally:
+            if resp is not None:resp.close()
             conn.close()
 
         if resp.status in (401, 403):
@@ -402,7 +409,10 @@ class MihomoAPI:
     def proxy_delay(self, name: str, url: str, timeout_ms: int) -> Optional[int]:
         params = urllib.parse.urlencode({"url": url, "timeout": timeout_ms})
         try:
-            result = self.get(self.encoded_proxy_path(name) + "/delay?" + params)
+            # Only the read-only probe is cancellable. Restoration/selection
+            # calls outside this scope must still run after cancellation.
+            with cancellation_scope(cancel_requested):
+                result = self.get(self.encoded_proxy_path(name) + "/delay?" + params)
             return int(result["delay"])
         except Exception:
             return None
@@ -798,7 +808,12 @@ def _no_window_kwargs() -> dict:
 
 def run_external(cmd, **kwargs):
     from speedbench_owner import delegated_active
-    return run_cancellable(cmd,cancel=cancel_requested if _CANCEL_FILE or delegated_active() else None,**kwargs)
+    channel=cancel_requested if _CANCEL_FILE or delegated_active() else None
+    scoped=current_cancellation()
+    if scoped is not None:
+        callback=lambda:scoped() or (channel is not None and channel())
+    else:callback=channel
+    return run_cancellable(cmd,cancel=callback,**kwargs)
 
 
 def curl_speed(proxy_url: str, download_url: str, max_time: float,
@@ -967,7 +982,9 @@ def probe_latency(api: MihomoAPI, name: str, timeout_ms: int,
         for index in range(requested):
             if cancel_requested() or (cancel is not None and cancel()):raise KeyboardInterrupt
             if on_attempt is not None:on_attempt()
-            try:d=api.proxy_delay(name,DEFAULT_DELAY_URL,timeout_ms)
+            try:
+                with cancellation_scope(cancel):
+                    d=api.proxy_delay(name,DEFAULT_DELAY_URL,timeout_ms)
             except Exception:d=None
             try:
                 value=float(d)
@@ -1446,6 +1463,7 @@ class _IntelEnrichment:
 
     def __init__(self, args: Any):
         self.args=args
+        self._cancelled=threading.Event()
         history_value = getattr(args, "history", None)
         history = Path(history_value) if history_value else Path(__file__).with_name(
             "speedbench-history.jsonl"
@@ -1469,7 +1487,7 @@ class _IntelEnrichment:
     def _query_one(self, ip: str) -> IpIntelligence:
         self._observe('intel_cache',dict(counters={'unique_ips':1}))
         provider_results = self.cache.query_many(
-            ip, self.providers, max_workers=1
+            ip, self.providers, max_workers=1,cancel=lambda:self._cancelled.is_set() or cancel_requested()
         )
         return aggregate_ip_intelligence(ip, provider_results)
 
@@ -1510,6 +1528,7 @@ class _IntelEnrichment:
 
     def close(self) -> None:
         """Cancel unstarted queries and join cache writers before lease release."""
+        self._cancelled.set()
         for future in self.futures.values():future.cancel()
         self.finish()
 

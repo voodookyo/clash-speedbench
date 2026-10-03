@@ -396,6 +396,83 @@ with BackendLease(history.parent):pass
     if result.returncode!=0:raise ValueError('Bundled CLI intelligence/cache/milestone fixture failed')
 
 
+def verify_cli_socket_cancel(root,data):
+    """Bundled controller socket read aborted via actual private cancel file."""
+    fixture=data/'socket-cancel-fixture';fixture.mkdir()
+    child='''
+import sys,threading,http.server
+from pathlib import Path
+sys.path.insert(0,sys.argv.pop(1))
+import clash_speedbench as core
+from speedbench_progress import phase
+def execute(args,config):
+    started=threading.Event();release=threading.Event()
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self,*args):pass
+        def do_GET(self):
+            self.send_response(200);self.send_header('Content-Length','100')
+            self.send_header('Connection','close');self.end_headers()
+            self.wfile.write(b'{');self.wfile.flush();started.set();release.wait(3)
+        def do_PUT(self):
+            self.rfile.read(int(self.headers.get('Content-Length','0')))
+            self.send_response(200);self.send_header('Content-Length','2')
+            self.end_headers();self.wfile.write(b'{}')
+    server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);server.daemon_threads=False
+    service=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.01});service.start()
+    def cancel():
+        if started.wait(2):Path(core._CANCEL_FILE).write_text('fixture',encoding='utf-8')
+    canceller=threading.Thread(target=cancel);canceller.start()
+    api=core.MihomoAPI('http://127.0.0.1:'+str(server.server_port),timeout=2)
+    phase(args,'probing')
+    try:
+        try:core.observed_probe(api,'socket partial fixture',5000,args,source='serial',metric='delay',proto='ss')
+        finally:
+            # Cancel scope must end before restoration writes, even though
+            # the real cancellation sentinel still exists.
+            assert api.put('/config',{'mode':'rule'})=={}
+    finally:
+        release.set();server.shutdown();server.server_close();service.join(2);canceller.join(2)
+core._execute_benchmark=execute
+raise SystemExit(core.main())
+'''
+    program='''
+import os,sys,json,sqlite3
+from pathlib import Path
+from contextlib import closing
+import speedbench_web as web
+from speedbench_owner import BackendLease
+from speedbench_tasks import resolve_config
+history=Path(os.environ['SPEEDBENCH_HOME'])/'speedbench-history.jsonl'
+original=b'{"ts":"fixture-original", "results": []}\\n';history.write_bytes(original)
+job=web.JOBS.create(resolve_config())
+with BackendLease(history.parent) as lease:
+    web.DATA_OWNER=lease;web.HISTORY=history;web.connect_controller=lambda *a,**k:None
+    web.benchmark_command=lambda params:[sys.executable,'-B','-E','-s','-u','-c',sys.argv[1],str(Path(web.SCRIPT).parent),
+        '--yes','--no-ip','--history',str(history),'--output',str(history.parent/'partial.csv')]
+    web.run_benchmark({'_job_id':job})
+    assert web.STATE['exit_code']==130 and not web.STATE['running'] and not web.STATE['cleanup_incomplete']
+    rows=history.read_text(encoding='utf-8').splitlines();assert len(rows)==2 and history.read_bytes().startswith(original)
+    task=web.speedbench_db.task_snapshot(web.db_path(),job)
+    assert task['status']=='cancelled' and task['partial'] and len(task['results'])==1
+    row=task['results'][0];assert row['probe_attempts']==0 and row['probe_loss_pct'] is None
+    assert row['latency_ms'] is None and row['ip_quality_score'] is None
+    assert row['probe_sources']['serial']['started']==1 and row['probe_sources']['serial']['status']=='partial'
+    assert row['measurement_scope']['probe']=='partial'
+    assert task['metrics']['delay']['attempts']==1 and task['metrics']['delay']['successes']==0
+    assert set(task['milestones'])=={'cleanup_complete'}
+    assert task['run_id'] is not None
+    with closing(sqlite3.connect(web.db_path())) as connection:
+        assert [r[0] for r in connection.execute('SELECT raw FROM runs ORDER BY id')]==rows
+web.DATA_OWNER=None
+with BackendLease(history.parent):pass
+'''
+    env=dict(os.environ,SPEEDBENCH_HOME=str(fixture),PATH=str(Path(os.environ['SystemRoot'])/'System32'))
+    env.pop('SPEEDBENCH_VERGE_ROOT',None)
+    result=subprocess.run([str(root/'runtime/python.exe'),'-B','-E','-s','-c',program,child],
+        cwd=root/'app',env=env,capture_output=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode!=0:raise ValueError('Bundled CLI socket cancellation and restore fixture failed')
+
+
 def verify(package):
     if os.name!='nt':raise ValueError('Windows artifact verification requires Windows')
     package=Path(package).resolve()
@@ -418,13 +495,14 @@ def verify(package):
         verify_cli_partial(root,data)
         verify_cli_probe_partial(root,data)
         verify_cli_intel_metrics(root,data)
+        verify_cli_socket_cancel(root,data)
         if history.read_bytes()!=raw:raise ValueError('Original fixture raw changed during packaged lifecycle')
         # An attacker-updated side manifest cannot authorize modified source.
         source=root/'app/speedbench_desktop.py';source.write_bytes(source.read_bytes()+b'\n# fixture tamper\n')
         manifest['files']['app/speedbench_desktop.py']=digest(source)
         (root/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
         if native_check()==0:raise ValueError('Mutable side manifest bypassed native integrity anchor')
-    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, failed download and cancelled per-sample probe JSONL/SQLite/task retention and observed metrics, actual intelligence coordinator/cache with fake API, five persisted milestones, original raw retained. Native window/tray acceptance not included.')
+    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, failed download and cancelled per-sample probe JSONL/SQLite/task retention and observed metrics, actual intelligence coordinator/cache with fake API, five persisted milestones, actual sentinel/socket cancellation without blocking restore or inventing failed samples, original raw retained. Native window/tray acceptance not included.')
 
 
 if __name__=='__main__':

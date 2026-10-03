@@ -243,8 +243,16 @@ Shadowsocks/ss spelling does not duplicate a row; it is not a stable identity or
 permission to switch. No SQLite schema or runtime dependency is added.
 
 Main probe-pool cancellation stops unstarted nodes and subsequent samples, then
-joins active calls. It does not actively abort every controller transport or
-guarantee a hard total cancellation deadline. The portable-package fixture
+joins active calls. Scoped TCP/Unix controller probe/readiness reads now poll
+their own nonblocking socket without losing buffered HTTP/TLS data or repeating
+requests. Restoration writes outside that scope are not blocked by cancellation.
+DNS interruption stops queued domains, propagates local stop to owned curl
+calls and joins them; the initiating ordinary error is not masked by sibling
+abort. Worker startup/readiness check cancellation before claiming ready.
+Closing intelligence skips subsequent providers while retaining and joining
+current query/cache writers. Windows named-pipe I/O, connection/TLS establishment
+and provider urllib still retain original timeouts/system behavior; no universal
+hard cancellation deadline is claimed. The portable-package fixture
 also exercises the actual bundled probe primitive with synthetic values and
 an interrupt, checking cancelled partial JSONL/SQLite/task metrics, raw-history
 preservation and ownership release without contacting Clash or third parties.
@@ -270,3 +278,13 @@ cache, provider parser and report through backend-to-CLI delegation with a fake
 transport: two nodes/same exit, cold then hot cache, one API call, persisted
 milestones and no canary Key in public state/history/cache/CSV. It does not
 exercise native GUI lifecycle, real bandwidth performance or paid APIs.
+
+The packaged socket fixture uses an ephemeral loopback HTTP observer (not Verge)
+and the actual CLI cancel file. A stalled Connection: close body is interrupted,
+restoration PUT remains possible, and task/JSONL/SQLite retain a partial invoked
+probe with zero completed samples (failure rate N/A), confirmed cleanup and
+unchanged original raw. The owned server/threads are joined, no real node or
+external network is queried. Implementation uses standard-library nonblocking
+socket I/O and Executor shutdown, per the Python documentation:
+https://docs.python.org/3/library/socket.html and
+https://docs.python.org/3/library/concurrent.futures.html .

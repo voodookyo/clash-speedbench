@@ -1403,7 +1403,7 @@ class IpIntelCache:
 
     def query_many(self, ip: str, providers: Sequence[Any],
                    max_workers: int = 4,
-                   now: Optional[float] = None) -> Dict[str, ProviderResult]:
+                   now: Optional[float] = None, cancel=None) -> Dict[str, ProviderResult]:
         """Query each provider once for one IP, with cache/single-flight."""
         unique: Dict[str, Any] = {}
         for provider in providers:
@@ -1411,19 +1411,25 @@ class IpIntelCache:
         if not unique:
             return {}
         workers = max(1, min(int(max_workers), len(unique)))
-        if workers == 1:
-            return {name: self.get_or_query(provider, ip, now=now)
-                    for name, provider in unique.items()}
         out: Dict[str, ProviderResult] = {}
+        if workers == 1:
+            for name,provider in unique.items():
+                if cancel is not None and cancel():break
+                out[name]=self.get_or_query(provider,ip,now=now)
+            return out
+        def query(provider):
+            if cancel is not None and cancel():return None
+            return self.get_or_query(provider,ip,now=now)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             pending = {
-                pool.submit(self.get_or_query, provider, ip, None, now): name
+                pool.submit(query,provider): name
                 for name, provider in unique.items()
             }
             for future in as_completed(pending):
                 name = pending[future]
                 try:
-                    out[name] = future.result()
+                    value=future.result()
+                    if value is not None:out[name]=value
                 except Exception as exc:
                     out[name] = self._error_result(
                         name, ip, "error", _sanitize_error(exc, self.secrets)

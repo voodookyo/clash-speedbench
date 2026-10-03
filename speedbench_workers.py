@@ -59,6 +59,7 @@ from speedbench_progress import DownloadCounter, phase, publish_result, measure,
 import time
 import copy
 import queue
+from speedbench_process import cancellation_scope
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -893,6 +894,7 @@ def build_hosts(proxies: List[dict]) -> Dict[str, str]:
     provider is enabled.  IPv4/IPv6 ipify exit discovery stays required in
     either mode.
     """
+    if cancel_requested():raise KeyboardInterrupt
     ip_api_enabled = load_provider_config().ip_api_enabled
     required_domains = tuple(
         domain for domain in TEST_DOMAINS
@@ -904,17 +906,40 @@ def build_hosts(proxies: List[dict]) -> Dict[str, str]:
         if srv and not _is_ip(srv):
             domains.add(srv)
     hosts: Dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for domain, ip in zip(domains, pool.map(doh_resolve, domains)):
-            if ip:
-                hosts[domain] = ip
+    stopped=threading.Event();failure_lock=threading.Lock();failures=[]
+    def cancelled():return stopped.is_set() or cancel_requested()
+    def resolve(domain,*args):
+        try:
+            with cancellation_scope(cancelled):
+                if cancelled():raise KeyboardInterrupt
+                return doh_resolve(domain,*args)
+        except BaseException as error:
+            with failure_lock:
+                if not failures:failures.append(error)
+                stopped.set()
+            raise
+    pool=ThreadPoolExecutor(max_workers=8);pending={}
+    try:
+        pending={domain:pool.submit(resolve,domain) for domain in domains}
+        for domain,future in pending.items():
+            ip=future.result()
+            if ip:hosts[domain]=ip
+    except BaseException as error:
+        stopped.set()
+        for future in pending.values():future.cancel()
+        # A sibling abort must not disguise the initiating resolver failure
+        # as user cancellation. Without a recorded initiating error, preserve
+        # the owner/main-thread exception instead.
+        with failure_lock:original=failures[0] if failures else error
+        raise original from None
+    finally:pool.shutdown(wait=True,cancel_futures=True)
     # Pin the IPv4 endpoint normally and pin the IPv6-only endpoint when an
     # AAAA record is available.  A missing AAAA is normal and does not affect
     # the required IPv4 worker hosts.
-    api4 = doh_resolve("api.ipify.org", "A")
+    api4 = resolve("api.ipify.org", "A")
     if api4:
         hosts["api.ipify.org"] = api4
-    api6 = doh_resolve("api6.ipify.org", "AAAA")
+    api6 = resolve("api6.ipify.org", "AAAA")
     if api6:
         hosts["api6.ipify.org"] = api6
     missing = [d for d in required_domains if d not in hosts]
@@ -997,6 +1022,7 @@ class Worker:
         # prevent cancellation from terminating the process promptly.
         try:
             with self._stop_lock:
+                if cancel_requested():raise KeyboardInterrupt
                 if self._stopped:
                     raise WorkerUnavailable("worker startup cancelled")
                 deadline, mix_port = self._initialize_unlocked()
@@ -1050,6 +1076,7 @@ class Worker:
     def _wait_until_ready(self, deadline: float, mix_port: int) -> None:
         """Poll readiness without holding the lifecycle lock."""
         while time.time() < deadline:
+            if cancel_requested():raise KeyboardInterrupt
             with self._stop_lock:
                 if self._stopped:
                     raise WorkerUnavailable("worker startup cancelled")
@@ -1060,7 +1087,8 @@ class Worker:
             if proc.poll() is not None:
                 raise WorkerUnavailable(f"worker 进程启动后立即退出（端口 {mix_port}）")
             try:
-                api.get("/version")
+                with cancellation_scope(lambda:self._stopped or cancel_requested()):
+                    api.get("/version")
             except Exception:
                 with self._stop_lock:
                     if self._stopped:
@@ -1068,6 +1096,7 @@ class Worker:
                 time.sleep(0.25)
                 continue
             with self._stop_lock:
+                if cancel_requested():raise KeyboardInterrupt
                 if self._stopped:
                     raise WorkerUnavailable("worker startup cancelled")
             return
