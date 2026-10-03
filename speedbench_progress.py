@@ -2,6 +2,7 @@
 import hashlib
 import copy
 import json
+import math
 import os
 import re
 import sys
@@ -44,6 +45,33 @@ class ResultJournal:
 def retain_result(args,result):
     journal=getattr(args,'_result_journal',None)
     if journal is not None:journal.remember(result)
+
+
+class DownloadCounter:
+    """Observed request attempts and returned bytes, safe for same-node streams.
+
+    Start before invoking curl; finish only when that invocation returns. An
+    interrupted request is an attempt, but its unreported bytes stay unknown.
+    This counter never substitutes the requested sample budget for traffic.
+    """
+    def __init__(self,args,result,counts):
+        self.args,self.result,self.counts=args,result,counts
+        self.lock=threading.Lock()
+
+    def start(self):
+        with self.lock:
+            self.counts['attempts']+=1
+            self.result.measurement_scope=dict(self.result.measurement_scope or {},bandwidth='partial')
+            retain_result(self.args,self.result)
+
+    def finish(self,speed,size):
+        with self.lock:
+            self.counts['successes']+=int(speed is not None)
+            if isinstance(size,(int,float)) and not isinstance(size,bool) and math.isfinite(size) and size>=0:
+                known=round(size*1_000_000)
+                self.result.download_bytes=(self.result.download_bytes or 0)+known
+                self.counts['bytes']+=known
+            retain_result(self.args,self.result)
 
 
 class ProgressEmitter:

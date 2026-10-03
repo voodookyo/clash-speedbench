@@ -221,3 +221,12 @@ console explicitly says results were not persisted. Forced termination, an
 unwritable disk, or repeated interruptions cannot guarantee final persistence.
 The packaged fixture checks backend-to-CLI failed partial JSONL/SQLite/task
 retention, not real network performance or native GUI lifecycle.
+
+Observed download counters include returned warmup, single-stream, and
+same-node multi-stream samples even without a progress transport. An interrupted
+curl invocation counts as an attempt, not a success; unreported bytes are never
+replaced with its request budget. Serial fallback now emits delay, download,
+restore and whole CSV/JSONL summary spans, while worker fallback probes have
+separate counters. Overlapping cumulative spans are not additive elapsed time.
+The packaged failed-task fixture verifies metric persistence alongside raw
+history; this is not a same-coverage real bandwidth performance comparison.

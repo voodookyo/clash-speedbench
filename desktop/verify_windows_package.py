@@ -188,6 +188,9 @@ from speedbench_progress import publish_result
 def execute(args,config):
     row=core.Result(name='fixture node',provider='',proto='ss',latency_ms=20,
         speeds_mbps=[30.0],median_mbps=30.0,best_mbps=30.0,status='ok')
+    with core.measure(args,'download') as counts:
+        counter=core.DownloadCounter(args,row,counts)
+        counter.start();counter.finish(30.0,.25)
     publish_result(args,'node_measurement',row,phase_name='measuring')
     return 3
 core._execute_benchmark=execute
@@ -218,6 +221,9 @@ with BackendLease(history.parent) as lease:
     assert record['results'][0]['median_mbps']==30.0 and record['results'][0]['ip_quality_score'] is None
     task=web.speedbench_db.task_snapshot(web.db_path(),job)
     assert task['status']=='failed' and task['partial'] and task['results'][0]['median_mbps']==30.0
+    assert task['results'][0]['download_bytes']==250000
+    assert task['metrics']['download']['attempts']==1 and task['metrics']['download']['successes']==1
+    assert task['metrics']['download']['bytes']==250000 and task['metrics']['summary']['duration_ms']>=0
     assert task['run_id'] is not None
     with closing(sqlite3.connect(web.db_path())) as connection:
         assert [r[0] for r in connection.execute('SELECT raw FROM runs ORDER BY id')]==rows
@@ -257,7 +263,7 @@ def verify(package):
         manifest['files']['app/speedbench_desktop.py']=digest(source)
         (root/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
         if native_check()==0:raise ValueError('Mutable side manifest bypassed native integrity anchor')
-    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, failed partial JSONL/SQLite/task retention, original raw retained. Native window/tray acceptance not included.')
+    print('Windows artifact acceptance OK: native integrity/tamper, bundled Python without PATH, private bootstrap, Origin, restart/preferences, local version/data guidance and shared settings assets, bundled worker cleanup group leaves unrelated fixture process alive, private backend-to-CLI delegation and direct CLI exclusion, failed partial JSONL/SQLite/task retention and observed metrics, original raw retained. Native window/tray acceptance not included.')
 
 
 if __name__=='__main__':

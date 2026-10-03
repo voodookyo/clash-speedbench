@@ -55,7 +55,7 @@ import sys
 import tempfile
 import threading
 from speedbench_sources import apply_origin
-from speedbench_progress import phase, publish_result, measure
+from speedbench_progress import DownloadCounter, phase, publish_result, measure
 import time
 import copy
 import queue
@@ -1161,18 +1161,20 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
     assert worker.api is not None
     probe_stats: Optional[ProbeStats] = None
     if latency is None:
-        try:
-            raw = probe_latency(
-                worker.api, name, args.delay_timeout,
-                count=_probe_count_from_args(args),
+        with measure(args,'probe') as counts:
+            try:
+                raw = probe_latency(
+                    worker.api, name, args.delay_timeout,
+                    count=_probe_count_from_args(args),
+                )
+            except TypeError:
+                # Keep tiny legacy test doubles/callers that only accept three
+                # positional arguments working during the transition.
+                raw = probe_latency(worker.api, name, args.delay_timeout)
+            probe_stats = _coerce_probe_stats(
+                raw, attempts=_probe_count_from_args(args)
             )
-        except TypeError:
-            # Keep tiny legacy test doubles/callers that only accept three
-            # positional arguments working during the transition.
-            raw = probe_latency(worker.api, name, args.delay_timeout)
-        probe_stats = _coerce_probe_stats(
-            raw, attempts=_probe_count_from_args(args)
-        )
+            counts.update(attempts=probe_stats.attempts,successes=probe_stats.successes)
         latency, jitter = probe_stats
     if latency is None:
         result = Result(name=name, provider="", proto=proto, latency_ms=None,
@@ -1232,20 +1234,12 @@ def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
     mb = args.mb
     max_time = args.max_time
     r.download_bytes = 0
-    counter_lock = threading.Lock()
-    def add_sample(counts,speed,size):
-        with counter_lock:
-            counts['attempts'] += 1
-            counts['successes'] += int(speed is not None)
-            if isinstance(size,(int,float)) and math.isfinite(size) and size>=0:
-                known = round(size*1_000_000)
-                r.download_bytes += known
-                counts['bytes'] += known
     if mb is None:
         with measure(args,'warmup') as counts:
-            if getattr(args,'progress',None) is not None:
+            if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None:
+                counter=DownloadCounter(args,r,counts)
                 rough = warmup_speed(worker.proxy_url,min(3.0,args.max_time),
-                                     on_sample=lambda speed,size:add_sample(counts,speed,size))
+                    on_attempt=counter.start,on_sample=counter.finish)
             else:
                 rough = warmup_speed(worker.proxy_url, min(3.0, args.max_time))
         mb, max_time = adaptive_sample(rough, args.max_time)
@@ -1260,13 +1254,14 @@ def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
         url = (DEFAULT_DOWNLOAD_URL.format(bytes=byte_count)
                + f"&measId={int(time.time()*1000)}-p2-{round_i}")
         with measure(args,'download') as counts:
+            counter=DownloadCounter(args,r,counts);counter.start()
             speed, status, c_ms, _sz = curl_speed(
                 proxy_url=worker.proxy_url,
                 download_url=url,
                 max_time=max_time,
                 connect_timeout=min(3.0, max_time),
             )
-            add_sample(counts,speed,_sz)
+            counter.finish(speed,_sz)
         statuses.append(status)
         if r.connect_ms is None and c_ms is not None:
             r.connect_ms = c_ms
@@ -1283,7 +1278,8 @@ def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
 
     if getattr(args, "multi", False):
         with measure(args,'download') as counts:
-            extra = {'on_sample':lambda speed,size:add_sample(counts,speed,size)} if getattr(args,'progress',None) is not None else {}
+            counter=DownloadCounter(args,r,counts)
+            extra = dict(on_attempt=counter.start,on_sample=counter.finish) if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
             r.multi_mbps = multi_stream_speed(worker.proxy_url, mb * 1_000_000,
                                               max_time, min(3.0, max_time),**extra)
 
@@ -1426,6 +1422,8 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     latency_map: Dict[str, ProbeStats] = {}
     phase(args,'probing')
     published_probe = set()
+    delay_counts=None
+    delay_metric_lock=threading.Lock()
     def publish_probe(name,stats,idx,count):
         r = Result(name=name,provider=(provider_by_name or {}).get(name,''),proto=proto_by_name.get(name,''),
                    latency_ms=stats.latency_ms,speeds_mbps=[],median_mbps=None,best_mbps=None,
@@ -1433,28 +1431,34 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         _apply_probe_stats(r,stats)
         apply_origin(r,getattr(args,'source_origins',{}).get(name))
         publish_result(args,'node_probe',r,phase_name='probing',completed=idx,total=count)
-        published_probe.add(name)
+        with delay_metric_lock:
+            if delay_counts is not None and name not in published_probe:
+                delay_counts['attempts']+=stats.attempts
+                delay_counts['successes']+=stats.successes
+            published_probe.add(name)
     if main_api is not None:
         print(f"Phase 1 粗筛 · 延迟探测: 经主实例 /delay 并发测 {total} 个节点"
               f"（Clash Verge ping 同口径，不切换节点）…")
         try:
-            try:
-                callback = {'on_result':publish_probe} if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
-                with measure(args,'delay') as counts:
+            callback = {'on_result':publish_probe} if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
+            with measure(args,'delay') as counts:
+                delay_counts=counts
+                try:
                     latency_map = probe_latency_pool(
                         main_api, [str(p.get("name")) for p in selected],
                         args.delay_timeout,
                         probe_count=_probe_count_from_args(args),
                         **callback,
                     )
-                    counts['attempts'] = sum(s.attempts for s in latency_map.values() if isinstance(s,ProbeStats))
-                    counts['successes'] = sum(s.successes for s in latency_map.values() if isinstance(s,ProbeStats))
-            except TypeError:
-                # Preserve compatibility with older injected pool functions.
-                latency_map = probe_latency_pool(
-                    main_api, [str(p.get("name")) for p in selected],
-                    args.delay_timeout,
-                )
+                except TypeError:
+                    # Preserve compatibility with older injected pool functions.
+                    latency_map = probe_latency_pool(
+                        main_api, [str(p.get("name")) for p in selected],
+                        args.delay_timeout,
+                    )
+                stats=[_coerce_probe_stats(s,attempts=_probe_count_from_args(args)) for s in latency_map.values()]
+                counts.update(attempts=sum(s.attempts for s in stats),successes=sum(s.successes for s in stats))
+            delay_counts=None
         except KeyboardInterrupt:
             print("\n\n收到 Ctrl+C，停止测速……")
             raise

@@ -46,7 +46,7 @@ import speedbench_controller as controller_config
 import speedbench_sources as source_catalog
 import speedbench_tasks
 from speedbench_process import run_cancellable
-from speedbench_progress import ProgressEmitter, phase, publish_result, measure
+from speedbench_progress import ProgressEmitter, DownloadCounter, phase, publish_result, measure
 
 from speedbench_ip_intel import (
     IpIntelCache,
@@ -867,10 +867,11 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
 WARMUP_BYTES = 1_000_000  # ~1MB 预热请求，用于估粗速度
 
 
-def warmup_speed(proxy_url: str, connect_timeout: float, on_sample=None) -> Optional[float]:
+def warmup_speed(proxy_url: str, connect_timeout: float, on_sample=None, on_attempt=None) -> Optional[float]:
     """~1MB 轻量下载估粗速度（Mbps），供自适应样本大小参考；失败返回 None。"""
     url = (DEFAULT_DOWNLOAD_URL.format(bytes=WARMUP_BYTES)
            + f"&measId=warmup-{int(time.time()*1000)}")
+    if on_attempt is not None:on_attempt()
     mbps, _, _, size = curl_speed(proxy_url, url, max_time=5.0,
                                connect_timeout=connect_timeout)
     if on_sample is not None:
@@ -898,11 +899,12 @@ def adaptive_sample(rough_mbps: Optional[float],
 
 
 def multi_stream_speed(proxy_url: str, byte_count: int, max_time: float,
-                       connect_timeout: float, streams: int = 4, on_sample=None) -> Optional[float]:
+                       connect_timeout: float, streams: int = 4, on_sample=None, on_attempt=None) -> Optional[float]:
     """同一节点 streams 路并发 curl，合计带宽 Mbps（峰值参考）；全部失败返回 None。"""
     def one(i: int) -> Optional[float]:
         url = (DEFAULT_DOWNLOAD_URL.format(bytes=byte_count)
                + f"&measId=multi-{int(time.time()*1000)}-{i}")
+        if on_attempt is not None:on_attempt()
         mbps, _, _, size = curl_speed(proxy_url, url, max_time, connect_timeout)
         if on_sample is not None:
             on_sample(mbps,size)
@@ -1819,6 +1821,11 @@ def append_history(results: List[Result], path: Path, mb: Optional[int], rounds:
 
 
 def save_partial_report(args,status):
+    with measure(args,'summary'):
+        return _save_partial_report(args,status)
+
+
+def _save_partial_report(args,status):
     """One failure/cancel export under the CLI lease, never new measurement.
 
     Only completed snapshots are retained. Missing work is not unreachable,
@@ -1903,6 +1910,11 @@ def auto_switch_best(api: MihomoAPI, proxies: Dict[str, dict],
 
 
 def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]) -> int:
+    with measure(args,'summary'):
+        return _report(results,args,api,proxies)
+
+
+def _report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]) -> int:
     """Shared reporting: box table + CSV + history + optional auto-switch."""
     origins = getattr(args, 'source_origins', {})
     for result in results:
@@ -1936,8 +1948,7 @@ def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]
                         partial=partial,status='cancelled' if partial else 'completed')
             if getattr(args,'progress',None) is not None:
                 task['job_id'] = args.progress.job_id
-        with measure(args,'summary'):
-            args._history_saved=append_history(results, Path(args.history), args.mb, args.rounds, out,task=task)
+        args._history_saved=append_history(results, Path(args.history), args.mb, args.rounds, out,task=task)
     if args.auto_switch and not getattr(args,'cancelled',False) and not cancel_requested():
         graph = build_selectable_graph(proxies)
         auto_switch_best(api, proxies, graph, args.root_group, results, args.switch_group)
@@ -2335,10 +2346,13 @@ def _execute_benchmark(args,task_config):
                 publish_result(args,'node_probe',res,phase_name='probing')
                 continue
 
-            probe = probe_latency(
-                api, name, args.delay_timeout,
-                count=_probe_count_from_args(args),
-            )
+            with measure(args,'delay') as counts:
+                probe = probe_latency(
+                    api, name, args.delay_timeout,
+                    count=_probe_count_from_args(args),
+                )
+                stats=_coerce_probe_stats(probe,attempts=_probe_count_from_args(args))
+                counts.update(attempts=stats.attempts,successes=stats.successes)
             latency, jitter = probe
             partial = Result(name=name,provider=str(info.get('provider-name','')),
                              proto=str(info.get('type','')),latency_ms=latency,speeds_mbps=[],
@@ -2351,8 +2365,12 @@ def _execute_benchmark(args,task_config):
             # 带宽采样：--mb 未显式指定时先 ~1MB 预热估速，再自适应样本大小
             mb = args.mb
             max_time = args.max_time
+            partial.download_bytes=0
             if mb is None:
-                rough = warmup_speed(proxy_url, min(3.0, args.max_time))
+                with measure(args,'warmup') as counts:
+                    counter=DownloadCounter(args,partial,counts)
+                    rough = warmup_speed(proxy_url, min(3.0, args.max_time),
+                        on_attempt=counter.start,on_sample=counter.finish)
                 mb, max_time = adaptive_sample(rough, args.max_time)
 
             speeds = []
@@ -2364,12 +2382,15 @@ def _execute_benchmark(args,task_config):
                 # Add cache-busting measId even though Cloudflare's __down is dynamic.
                 byte_count = mb * 1_000_000
                 url = DEFAULT_DOWNLOAD_URL.format(bytes=byte_count) + f"&measId={int(time.time()*1000)}-{idx}-{round_i}"
-                speed, st, c_ms, _sz = curl_speed(
-                    proxy_url=proxy_url,
-                    download_url=url,
-                    max_time=max_time,
-                    connect_timeout=min(3.0, max_time),
-                )
+                with measure(args,'download') as counts:
+                    counter=DownloadCounter(args,partial,counts);counter.start()
+                    speed, st, c_ms, _sz = curl_speed(
+                        proxy_url=proxy_url,
+                        download_url=url,
+                        max_time=max_time,
+                        connect_timeout=min(3.0, max_time),
+                    )
+                    counter.finish(speed,_sz)
                 statuses.append(st)
                 if connect_ms is None and c_ms is not None:
                     connect_ms = c_ms
@@ -2379,14 +2400,15 @@ def _execute_benchmark(args,task_config):
                 partial.speeds_mbps=list(speeds)
                 partial.median_mbps=statistics.median(speeds) if speeds else None
                 partial.best_mbps=max(speeds) if speeds else None
-                partial.download_bytes=(partial.download_bytes or 0)+round(max(0,_sz or 0)*1_000_000)
                 partial.measurement_scope=dict(mode=args.mode or 'legacy',bandwidth='partial')
                 publish_result(args,'node_measurement',partial,phase_name='measuring')
 
             multi = None
             if args.multi:
-                multi = multi_stream_speed(proxy_url, mb * 1_000_000, max_time,
-                                           min(3.0, max_time))
+                with measure(args,'download') as counts:
+                    counter=DownloadCounter(args,partial,counts)
+                    multi = multi_stream_speed(proxy_url, mb * 1_000_000, max_time,
+                        min(3.0,max_time),on_attempt=counter.start,on_sample=counter.finish)
             partial.multi_mbps=multi
             partial.measurement_scope=dict(mode=args.mode or 'legacy',bandwidth='completed' if speeds else 'failed')
             publish_result(args,'node_measurement',partial,phase_name='measuring')
@@ -2464,17 +2486,19 @@ def _execute_benchmark(args,task_config):
         args.cancelled=True
         print("\n\n收到 Ctrl+C，停止测速并恢复原配置……")
     finally:
-        restore_groups(api, saved_groups)
-        if mode_changed:
-            try:
-                api.patch("/configs", {"mode": original_mode})
-            except Exception as e:
-                print(f"⚠️ 恢复原模式失败，请手动切回 {original_mode}: {e}", file=sys.stderr)
+        with measure(args,'restore'):
+            restore_groups(api, saved_groups)
+            if mode_changed:
+                try:
+                    api.patch("/configs", {"mode": original_mode})
+                except Exception as e:
+                    print(f"⚠️ 恢复原模式失败，请手动切回 {original_mode}: {e}", file=sys.stderr)
 
     # Enrichment was submitted while the serial network work was in progress;
     # only now wait for the deduplicated provider jobs and recompute Overall.
     phase(args,'enriching')
-    finish_intelligence_enrichment(intel_enricher, results)
+    with measure(args,'provider'):
+        finish_intelligence_enrichment(intel_enricher, results)
 
     if getattr(args,'cancelled',False):
         return 130
