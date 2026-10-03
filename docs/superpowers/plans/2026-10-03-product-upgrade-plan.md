@@ -63,3 +63,4 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 - B3 已接新模式动态队列/限定 IP 范围/带宽串行；修复 --no-ip 混合成功遗漏、worker 启动失败丢失主探测数据。新模式全生命周期取消/部分结果保存尚待 B4/B5 验收，不勾选。
 - B4/B5 已接独立出口发布、任务历史与实际字节，仍需全部阶段清理与迁移验收；B6/B7、C/D 尚未完整完成。此前检查点见 ../reports/2026-10-03-jobs-and-shared-ui.md；不构成真实耗时提速结论。
 - D1/D2 本机实现与独立 Windows 包验证通过，见 ../reports/2026-10-03-desktop-packaging-checkpoint.md。桌面 alpha 已有 unsigned Windows NSIS/便携包，不能称 GUI 生命周期或 macOS/Linux 已验收。桌面/独立 Web 同目录所有权已验证；直接 CLI 和不同目录的全局协调仍未完成。D3–D8 不勾选，待完整要求满足。
+- 最新冻结源码 5c1f796：三版 Windows Python 全量各 725 tests，OK (skipped=7)，Rust 7 tests；Windows NSIS/便携包重新构建并解压验收，包含下载目标历史提示与 worker 清理重试。最新包及 SHA-256 见桌面报告；未 push 或替换用户安装。

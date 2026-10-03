@@ -7,14 +7,16 @@
 - 473ebf6：数据目录内核锁、桌面私有后端、非敏感偏好持久化、受限外链请求及共享界面环境标识。
 - ab7467b：Tauri 2 客户端、固定运行时、依赖锁、完整性与许可证、原生包配置及桌面 CI。
 - c4d9d10：解压后的 Windows 产物独立验收、按源码修订隔离产物、澄清本地写 token 与 provider Key 的区别。
-- 产物固定源码：`c4d9d10a52ae840bcb180666c4eda107efb1a94e`，构建时 `source_dirty=false`。
+- 6b86ced：生产候选选择接入同强身份近 7 天带宽提示，不建库/迁移/复制为本次成绩；过期、未来时间、弱身份、旧格式或查询预算超时降级。
+- 5c1f796：worker terminate/kill 后确认退出再移除临时配置，清理失败可重试；单独安全异常不触发串行测量回退。
+- 最新产物固定源码：`5c1f79644c5e115152b1978dac097f1393ea0f5f`，构建时 `source_dirty=false`。早期 c4d9d10 包保留，但不包含后续两项修复。
 - 桌面版本 `1.1.0-alpha.1`，运行时 CPython `3.14.8`，平台 `windows-x86_64`。核心稳定版入口与 legacy 测速默认未改为桌面 alpha。
-- 当前包目录 `dist/desktop-artifacts/c4d9d10a52ae/`，二进制未提交 Git；旧忽略目录内的包不是本次交付证据。
+- 当前包目录 `dist/desktop-artifacts/5c1f79644c5e/`，二进制未提交 Git；其他修订的包不是本次最新交付证据。
 
 | 文件 | 字节 | SHA-256 |
 |---|---:|---|
-| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12744387 | 83e22d9f04d941cb10d9896fe6691059c0fb0d3339b115b73ae3ec784e3e005d |
-| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15714017 | 8b94179f6f09258048378ae28650a041d9ab3f933633d182f61c2a7c21f98013 |
+| Clash SpeedBench_1.1.0-alpha.1_x64-setup.exe | 12742795 | addef5fb55cda097cde6ac53e6133c6aa74c10077f6556361e5bfcfcf96ad617 |
+| Clash-SpeedBench-1.1.0-alpha.1-windows-x86_64-portable.zip | 15715968 | dfe10b009f1cc63503033bd5bbe9d051c3baba337750a29d7dd7ab188aa8276b |
 
 SHA-256 已额外通过 PowerShell `Get-FileHash` 与 build-provenance.json 核对。包 **unsigned**，自动更新禁用；WebView2 是系统组件，不是单文件免运行时承诺。
 
@@ -42,9 +44,10 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 
 ## 已执行验证
 
-- Windows Python 3.14.7：`python -m unittest discover -s tests -v`，706 tests，OK (skipped=7)，16.158s。
-- Windows Python 3.9.25：同一全量命令，706 tests，OK (skipped=7)，15.815s。
-- Windows Python 3.12：同一全量命令，706 tests，OK (skipped=7)，15.404s。
+- Windows Python 3.14.7：`python -m unittest discover -s tests -v`，725 tests，OK (skipped=7)，30.636s。
+- Windows Python 3.9.25：同一全量命令，725 tests，OK (skipped=7)，29.737s。
+- Windows Python 3.12：同一全量命令，725 tests，OK (skipped=7)，30.830s。三轮并行，因此耗时不是性能比较证据。
+- 清理专项首次通过而全量报 3 个异常类型错误：既有平台测试 reload worker 模块，新增测试持有旧异常类。改为通过模块解析类，再独立全量重跑以上三版全部通过；未放宽生产异常或跳过测试。
 - Rust：`cargo test --locked --offline --manifest-path desktop/src-tauri/Cargo.toml`，7 tests 通过；实际临时中文/空格/emoji 路径、无 Python PATH、重复目录所有权、原 raw 保持、Job Object 子孙进程回收且不影响独立进程。
 - Windows Tauri Release/NSIS 构建成功；`python desktop/package_windows.py`、`verify_windows_package.py`、`collect_artifacts.py` 成功。
 - 独立产物验收实际解压 ZIP，再验证原生完整性/篡改、内置 Python 启动、私有握手、Origin 拒绝、两轮起停、偏好跨重启、旧 raw 不改。没有创建窗口，因此不把它称为 GUI 验收。
@@ -56,5 +59,5 @@ Windows 自有 backend 在接收启动许可前加入 Job Object；关闭对象�
 - Windows 原生窗口/WebView2 缺失路径、托盘/通知、重复启动、休眠、活跃任务退出、安装器交互与升级验收。当前会话原生 GUI 自动化不可用，不用构建成功或浏览器截图代替。
 - macOS Intel/Apple Silicon 和 Linux 原生构建、安装、运行、信号及依赖验收；只有配置和有界资源 fixture，不能称兼容性已通过。
 - 首次旧历史路径发现/导入、显式非敏感偏好导出导入、可信官方版本比较与手动升级流程、直接 CLI 与目录所有权协调。
-- B 的生产历史候选提示/目标策略、全阶段取消/清理预算、同覆盖性能实测；C 的配置根目录选择、更多前端职责拆分和完整错误/页面矩阵。
+- B 的完整目标策略、全阶段取消/清理预算与剩余失败传播、同覆盖性能实测；下载历史提示已接入并通过 fixture，但不构成真实提速证据。C 的配置根目录选择、更多前端职责拆分和完整错误/页面矩阵。
 - 整体规格逐项完成审计和最终交付。因此不标记完整升级已完成，也不建议覆盖现有稳定安装。
