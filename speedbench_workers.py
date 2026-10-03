@@ -99,6 +99,10 @@ class WorkerUnavailable(RuntimeError):
     pass
 
 
+class WorkerCleanupError(RuntimeError):
+    """Owned resources remain; must not trigger a serial fallback measurement."""
+
+
 class VirtualDefaultRoute(WorkerUnavailable):
     """默认路由落在虚拟隧道接口（全局 TUN/其他 VPN）时抛出：worker 模式拒绝启动。
     继承 WorkerUnavailable，main() 走同一条「并发不可用 -> 回退串行」路径。"""
@@ -945,6 +949,8 @@ class Worker:
         # shard_loop 的 finally 可能并发/重复调用，必须只真正执行一次
         self._stop_lock = threading.Lock()
         self._stopped = False
+        self._process_reaped = False
+        self._cleanup_done = False
 
     def start(self) -> None:
         # Serialize only resource initialization with stop().  Phase 1
@@ -1031,20 +1037,35 @@ class Worker:
 
     def stop(self) -> None:
         with self._stop_lock:
-            if self._stopped:
+            if self._cleanup_done:
                 return
+            # Prevent startup immediately, but do not claim that cleanup
+            # succeeded until the owned process is reaped and config removed.
+            # An incomplete stop remains retryable under this same lock.
             self._stopped = True
-            if self.proc and self.proc.poll() is None:
+            if self.proc and not self._process_reaped:
                 try:
-                    self.proc.terminate()
-                    self.proc.wait(timeout=3)
-                except Exception:
-                    try:
-                        self.proc.kill()
-                    except Exception:
-                        pass
+                    if self.proc.poll() is None:
+                        try:
+                            self.proc.terminate()
+                            self.proc.wait(timeout=3)
+                        except (OSError, subprocess.TimeoutExpired):
+                            # kill is asynchronous too; wait before touching
+                            # files a running Mihomo might still be reading.
+                            try:
+                                self.proc.kill()
+                            except OSError:
+                                pass  # A raced exit is confirmed by wait.
+                            self.proc.wait(timeout=3)
+                    self._process_reaped = True
+                except (OSError, subprocess.TimeoutExpired):
+                    raise WorkerCleanupError('Temporary worker process cleanup incomplete') from None
             if self.dir:
-                self.dir.cleanup()
+                try:
+                    self.dir.cleanup()
+                except OSError:
+                    raise WorkerCleanupError('Temporary worker configuration cleanup incomplete') from None
+            self._cleanup_done = True
 
     def select(self, name: str) -> None:
         assert self.api is not None
