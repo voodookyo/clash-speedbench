@@ -49,18 +49,51 @@ class FakeProvider:
 
 
 class IntelligenceIntegrationTest(unittest.TestCase):
+    def test_abort_cancels_queued_queries_and_joins_running_writers(self):
+        with tempfile.TemporaryDirectory() as td:
+            args=SimpleNamespace(history=str(Path(td)/'h.jsonl'),ip_timeout=1,intel_workers=2)
+            gate=threading.Event();both_started=threading.Event();closed=threading.Event()
+            lock=threading.Lock();started=[]
+            def query(ip):
+                with lock:
+                    started.append(ip)
+                    if len(started)==2:both_started.set()
+                gate.wait(3)
+                return None
+            with mock.patch.object(csb,'make_default_providers',return_value=[]):
+                enricher=csb._IntelEnrichment(args)
+            enricher._query_one=query
+            thread=None
+            try:
+                for ip in ('192.0.2.1','192.0.2.2','192.0.2.3'):enricher.submit_ip(ip)
+                self.assertTrue(both_started.wait(2))
+                queued=enricher.futures['192.0.2.3']
+                cancelled=threading.Event();queued.add_done_callback(lambda f:cancelled.set())
+                def close():enricher.close();closed.set()
+                thread=threading.Thread(target=close);thread.start()
+                self.assertTrue(cancelled.wait(2));self.assertTrue(queued.cancelled())
+                self.assertFalse(closed.is_set()) # Running writers remain owned.
+                gate.set();thread.join(3)
+                self.assertTrue(closed.is_set());self.assertEqual(len(started),2)
+                enricher.close() # Finished-pool cleanup is idempotent.
+            finally:
+                gate.set()
+                if thread:thread.join(3)
+                enricher.close()
+
     def test_same_exit_ip_is_submitted_once_and_cached(self):
         with tempfile.TemporaryDirectory() as td:
             fake = FakeProvider()
             args = SimpleNamespace(
                 history=str(Path(td) / "history.jsonl"), no_ip=False,
-                ip_timeout=1, intel_workers=2,
+                ip_timeout=1, intel_workers=2, _owned_intel_pools=[],
             )
             first = result("A", ipv4="203.0.113.40")
             second = result("B", ipv4="203.0.113.40")
             with mock.patch.object(csb, "make_default_providers", return_value=[fake]):
                 enricher = csb.start_intelligence_enrichment([first, second], args)
                 self.assertIsNotNone(enricher)
+                self.assertEqual(args._owned_intel_pools,[enricher])
                 enricher.submit_result(first)
                 enricher.submit_result(second)
                 csb.finish_intelligence_enrichment(enricher, [first, second])

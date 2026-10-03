@@ -119,6 +119,48 @@ print('done',flush=True)
             with owner.BackendLease(folder):pass
             self.assertFalse(history.exists())
 
+    def test_completed_child_exits_cleanly_while_parent_pipe_is_still_open(self):
+        program='''
+import sys
+import clash_speedbench as core
+core._execute_benchmark=lambda args,config:0
+sys.argv=['clash_speedbench.py','--yes','--backend-child','--history',sys.argv[1]]
+raise SystemExit(core.main())
+'''
+        with tempfile.TemporaryDirectory() as folder,owner.BackendLease(folder) as lease:
+            history=Path(folder)/'h.jsonl'
+            process=subprocess.Popen([sys.executable,'-u','-c',program,str(history)],
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            try:
+                process.stdin.write(lease.delegation(history));process.stdin.flush()
+                # Do not communicate()/close stdin before wait: the parent
+                # remains alive on normal completion, not just on EOF cancel.
+                process.wait(timeout=7)
+                process.stdin.close();process.stdin=None
+                stdout,stderr=process.communicate(timeout=3)
+                self.assertEqual(process.returncode,0,stderr)
+                self.assertFalse(history.exists())
+            finally:
+                if process.poll() is None:process.kill();process.wait(timeout=3)
+                for stream in (process.stdin,process.stdout,process.stderr):
+                    if stream:stream.close()
+
+    def test_intelligence_pool_is_closed_before_releasing_cli_lease_on_failure(self):
+        with tempfile.TemporaryDirectory() as folder,mock.patch.dict(os.environ,{},clear=True):
+            enricher=mock.Mock()
+            def close():
+                with self.assertRaises(owner.LeaseError):owner.BackendLease(folder).acquire()
+            enricher.close.side_effect=close
+            def execute(args,config):
+                args._owned_intel_pools.append(enricher)
+                raise ValueError('fixture body')
+            with mock.patch('sys.argv',['clash_speedbench.py','--yes','--history',str(Path(folder)/'h.jsonl')]), \
+                    mock.patch.object(core,'_execute_benchmark',side_effect=execute):
+                with self.assertRaisesRegex(ValueError,'fixture body'):core.main()
+            enricher.close.assert_called_once()
+            with owner.BackendLease(folder):pass
+
     def test_default_history_honors_home_and_hidden_flag_requires_private_pipe(self):
         with tempfile.TemporaryDirectory() as folder, \
                 mock.patch.dict(os.environ,{'SPEEDBENCH_HOME':folder},clear=True), \

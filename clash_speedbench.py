@@ -1470,6 +1470,11 @@ class _IntelEnrichment:
         finally:
             self.pool.shutdown(wait=True)
 
+    def close(self) -> None:
+        """Cancel unstarted queries and join cache writers before lease release."""
+        for future in self.futures.values():future.cancel()
+        self.pool.shutdown(wait=True)
+
     def apply(self, results: List[Result]) -> None:
         for result in results:
             _apply_intelligence(result, self.values)
@@ -1495,6 +1500,8 @@ def start_intelligence_enrichment(results: List[Result], args: Any) -> Optional[
     except Exception:
         # Cache/provider setup is optional and must never abort network tests.
         return None
+    owned=getattr(args,'_owned_intel_pools',None)
+    if owned is not None:owned.append(enricher)
     for result in results:
         enricher.submit_result(result)
     if not enricher.futures:
@@ -2022,9 +2029,12 @@ def main() -> int:
         return 2
 
     from speedbench_owner import benchmark_ownership, LeaseError
+    args._owned_intel_pools=[]
     try:
         with benchmark_ownership(args.history,delegated=args.backend_child):
-            return _execute_benchmark(args,task_config)
+            try:return _execute_benchmark(args,task_config)
+            finally:
+                for enricher in args._owned_intel_pools:enricher.close()
     except LeaseError:
         print('SpeedBench 数据目录已被占用，或私有任务身份无法核验；未开始测速或写入历史。',file=sys.stderr)
         return 2

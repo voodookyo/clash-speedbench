@@ -134,11 +134,29 @@ def _owner_held(stream):
         raise
 
 
+def _read_private_pipe(stream, *, line=False):
+    # Never hold BufferedReader's Python lock in a daemon waiting on stdin.
+    # A normally completed child may exit while the parent keeps stdin open;
+    # buffered read() would make CPython abort at interpreter shutdown. Raw
+    # descriptor reads also leave extra bytes visible to the EOF watcher.
+    try:descriptor=stream.fileno()
+    except (OSError,AttributeError):descriptor=None
+    if descriptor is None:return stream.readline(32769) if line else stream.read(1)
+    if not line:return os.read(descriptor,1)
+    data=bytearray()
+    while len(data)<32769:
+        item=os.read(descriptor,1)
+        if not item:break
+        data.extend(item)
+        if item==b'\n':break
+    return bytes(data)
+
+
 def _read_delegation(stream):
     if stream.isatty():raise LeaseError('Private benchmark pipe required')
     received=queue.Queue(maxsize=1)
     def read():
-        try:received.put(stream.readline(32769))
+        try:received.put(_read_private_pipe(stream,line=True))
         except Exception:received.put(b'')
     threading.Thread(target=read,daemon=True).start()
     raw=received.get(timeout=5)
@@ -186,7 +204,7 @@ def benchmark_ownership(history, *, delegated=False, stream=None):
                         raise LeaseError('Backend ownership no longer matches')
                 event=threading.Event();_parent_event=event
                 def watch():
-                    try:stream.read(1)
+                    try:_read_private_pipe(stream)
                     except Exception:pass
                     event.set() # EOF, unexpected command or broken pipe all cancel
                 threading.Thread(target=watch,daemon=True).start()
