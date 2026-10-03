@@ -1,0 +1,122 @@
+# Desktop alpha development and acceptance
+
+The desktop shell is **1.1.0-alpha.1**, not a published stable release. It is a
+real Tauri 2 WebView window around the existing Python/curl/Mihomo engine. The
+legacy CLI/Web launchers stay available. No pip package is needed at runtime.
+The current native acceptance evidence is Windows only; merely providing
+macOS/Linux build jobs is not proof that those packages run successfully.
+
+## Packages and system requirements
+
+- Windows x86-64: EXE plus `app/`, `runtime/`, `manifest.json`; portable ZIP and
+  NSIS per-user installer. **Keep the complete directory**. Not a single-file
+  runtime-free executable. Windows 10/11, system curl and Microsoft WebView2
+  are required. The installer offers the official WebView2 downloaded
+  bootstrapper if missing (Internet required). Portable/offline systems need
+  WebView2 already installed. The Python runtime is bundled, not system PATH.
+- macOS: separate Intel/Apple Silicon CPython runtime and app/DMG configuration;
+  minimum declared desktop OS 14.0. System curl required. Native build/run and
+  Gatekeeper acceptance are still pending; unsigned is not notarized.
+- Linux: x86-64/aarch64 runtime and Debian packaging, built against Ubuntu 22.04.
+  GTK3, WebKitGTK 4.1, appindicator, curl and compatible glibc required. Other
+  distributions are not automatically compatible. Native acceptance pending.
+
+All current packages are **unsigned**. No automatic update plugin is enabled.
+Official release links support manual upgrade; there is no silent download or
+unverified self-update. Runtime artifact URLs and SHA-256 are fixed in
+`runtime-lock.json`. Version/platform/runtime/source revision/dirty status are
+recorded in manifest and `build-provenance.json`. A source-dirty build must not
+be mislabeled as an official Release. Update pinned runtimes deliberately for
+security maintenance; recheck upstream hashes, tests and packages.
+
+## Build (developer machine only)
+
+Node 24.20, Rust 1.97 and platform Tauri build dependencies are development
+tools, not end-user requirements. Dependency locks must be used. Example from
+the repository root on Windows (use `npm.cmd` if PowerShell blocks npm.ps1):
+
+```powershell
+npm.cmd ci --prefix desktop --ignore-scripts
+cargo fetch --locked --manifest-path desktop/src-tauri/Cargo.toml
+python desktop/prepare_resources.py --target windows-x86_64
+cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+npm.cmd --prefix desktop run tauri -- build --ci --no-sign -- --locked
+python desktop/package_windows.py
+python desktop/collect_artifacts.py --target windows-x86_64
+```
+
+Stage in a fresh checkout when changing platform/runtime. Scripts refuse stale
+unexpected source files, changed cached hashes, traversal and external archive
+links. ZIP/native outputs live under ignored `dist/`/`target/`, not Git. Portable
+packaging refuses to overwrite an existing verified ZIP. Rust embeds the
+manifest: changing the JSON beside the EXE cannot authorize altered code.
+`--verify-package` is a Windows read-only diagnostic (exit 0/2), does not start
+WebView/backend and validates the complete package next to that executable.
+
+No user history, seed, controller/provider key, logs or subscription config is
+copied into resources. Project license, CPython runtime license and locked Rust
+dependency license notices are included. Five native CI build jobs coexist with
+the existing six Python 3.9/3.12 jobs; they do not publish Releases.
+
+## Lifecycle and privacy
+
+Private inherited stdin/stdout bootstrap validates app/version/protocol,
+parent/child PID, instance ID and fresh nonce, then verifies authenticated HTTP
+identity on a random `127.0.0.1` port. Nonce/write token never enter argv, URLs,
+logs, localStorage or response payloads. Provider credentials remain solely in
+Python. The renderer has **no generic shell, filesystem or remote IPC grant**.
+Navigation/new-window restrictions and a CSP apply to the shared UI; only the
+two fixed ipify exit endpoints are allowed as cross-origin browser fetches.
+
+Window close hides to tray; tray offers open/status/cancel/exit. Exit requests
+cancel/cleanup before backend shutdown. Timeout is a failure, not clean success.
+Windows Job Object owns the backend and descendants before bootstrap; no global
+process-name kill. POSIX uses a dedicated process group and parent EOF cleanup;
+platform crash/forced-signal acceptance is still pending.
+
+A kernel-held, private `backend-owner.lock` coordinates desktop and standalone
+Web using the **same data directory**, even on different ports. Metadata alone
+does not prove a live owner; the lock inode is not deleted. Existing-owner
+startup fails safely instead of attaching to an unverified service. Standalone
+CLI ownership coordination is not yet part of this desktop alpha acceptance.
+
+Desktop theme/profile/mode/favorites and notification choice live in private
+`ui-preferences.json` with an explicit non-secret whitelist. Browser Web UI
+continues localStorage; the desktop cannot read another browser's preferences.
+No provider/controller Key is persistable there. Notifications default off and
+contain only mode/status/node count; system notification visibility still needs
+native manual acceptance. Corrupt preferences are preserved, not reset silently.
+
+Desktop OS external actions accept **only four symbolic choices**: BrowserLeaks
+DNS, DNSLeakTest, official Releases, and this instance's loopback browser-audit
+page. Only Rust opens these fixed URLs; there is no arbitrary URL/path/command.
+The browser-audit page is the sole fixed loopback HTTP exception to HTTPS links.
+Requests are bounded, expire and get a private acknowledgement. An opened URL
+is not a successful leak audit. WebView audits are labeled separately from
+Chrome/Edge/Firefox; missing WebRTC capabilities mean **unable to confirm**.
+DNS remains guided, with no scraping/system-config claim of leak safety.
+
+## Data, migration and rollback
+
+Windows uses `%APPDATA%\ClashSpeedBench`, macOS uses
+`~/Library/Application Support/ClashSpeedBench`, Linux uses the platform data
+directory plus `ClashSpeedBench`. `SPEEDBENCH_HOME` explicitly selects another
+directory; relative values are resolved before starting the backend. Testing
+uses temporary data and never replaces the user's Downloads installation.
+
+Close every writer before upgrade/backup. Preserve JSONL, SQLite (or a consistent
+SQLite backup including in-flight WAL), `identity-seed` and `ui-preferences.json`.
+Do not upload the seed or credentials as diagnostics. New tables/columns are
+additive; old raw JSONL/`runs.raw` are not rewritten. Stable IDs need the same
+private seed. Old-name-only rows stay legacy/unknown, not guessed subscription
+history. User-controlled import/export/first-run directory guidance are still
+pending; do not copy whole browser profiles or imply automatic migration.
+
+Use tray Exit and wait for cleanup **before** reinstalling. NSIS replaces its
+default force-close policy with a read-only Restart Manager check: running app
+or unverifiable ownership aborts install/uninstall, including silent mode. The
+hook has been compiled; interactive installer/race acceptance remains pending.
+Portable replacement likewise must be done only after exit. Rollback restores
+the old installation after a backup without deleting newer raw history. Never
+run old/new writers simultaneously; legacy source entry remains a fallback,
+not evidence of native platform acceptance.

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Clash SpeedBench",
+  "version": "1.1.0-alpha.1",
+  "identifier": "com.voodookyo.clash-speedbench",
+  "build": { "frontendDist": "../startup" },
+  "app": {
+    "windows": [],
+    "security": {
+      "capabilities": [],
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["../../speedbench.ico"],
+    "resources": { "resources/": "" },
+    "windows": { "webviewInstallMode": { "type": "downloadBootstrapper", "silent": false }, "nsis": { "installMode": "currentUser", "installerHooks": "installer-hooks.nsh" } }
+  }
+}

@@ -5,6 +5,12 @@
 
 当前版本：**v1.0.1**。网络质量、IP 质量和客户端环境泄漏是三个彼此独立的维度。
 
+> 开发分支正在实施四阶段升级：可靠订阅来源/稳定节点 ID、quick/standard/deep/ip
+> 任务模式、实时任务中心和共享界面、Tauri 桌面客户端。桌面 **1.1.0-alpha.1**
+> 已进入本地 Windows 构建验证，尚未作为稳定 Release 发布。完整资源包自带固定
+> Python；测速仍使用标准库 + 系统 curl/Mihomo。[桌面构建、数据迁移与限制](desktop/README.md)。
+> macOS/Linux 原生运行、完整桌面交互及四阶段最终验收仍未完成，不能把构建配置视为已兼容。
+
 > English: A zero-dependency companion benchmark for a *running* Clash Verge Rev / Mihomo
 > instance — real per-node download Mbps, multi-source exit-IP intelligence and
 > reputation, application-level stability probes, a composite network/IP view,

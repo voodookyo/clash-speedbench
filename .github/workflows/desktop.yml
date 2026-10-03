@@ -1,0 +1,68 @@
+name: desktop-build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: Desktop / ${{ matrix.runtime }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            runtime: windows-x86_64
+          - os: macos-15-intel
+            runtime: macos-x86_64
+          - os: macos-15
+            runtime: macos-aarch64
+          - os: ubuntu-22.04
+            runtime: linux-x86_64
+          - os: ubuntu-22.04-arm
+            runtime: linux-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.20.0'
+      - name: Linux desktop dependencies
+        if: startsWith(matrix.os, 'ubuntu-')
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libdbus-1-dev patchelf curl
+      - name: Fixed Rust build toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal
+      - name: Shared frontend and resource fixture tests (no external measurement)
+        run: python -m unittest tests.test_task_ui_js tests.test_source_js tests.test_resume_js tests.test_profiles_js tests.test_desktop_resources -v
+      - name: Stage and verify pinned Python runtime
+        run: cargo +1.97.0 fetch --locked --manifest-path desktop/src-tauri/Cargo.toml
+      - name: Copy explicit resources and licenses
+        run: python desktop/prepare_resources.py --target ${{ matrix.runtime }}
+      - name: Locked desktop dependencies
+        run: npm ci --prefix desktop --ignore-scripts
+      - name: Native ownership/private bootstrap tests
+        run: cargo +1.97.0 test --locked --manifest-path desktop/src-tauri/Cargo.toml
+      - name: Build unsigned desktop packages
+        env:
+          RUSTUP_TOOLCHAIN: '1.97.0'
+        run: npm --prefix desktop run tauri -- build --ci --no-sign -- --locked
+      - name: Windows portable package
+        if: matrix.runtime == 'windows-x86_64'
+        run: python desktop/package_windows.py
+      - name: Collect verifiable build artifacts
+        run: python desktop/collect_artifacts.py --target ${{ matrix.runtime }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speedbench-desktop-${{ matrix.runtime }}-unsigned
+          path: dist/desktop-artifacts/
+          if-no-files-found: error
+          retention-days: 14
