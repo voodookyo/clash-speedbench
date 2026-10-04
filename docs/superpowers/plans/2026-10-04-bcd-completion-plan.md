@@ -9,6 +9,8 @@
 - 在 valid committed HEAD 上尝试 `long-code --write` 的隔离候选策略子任务。路由选择 K3/Claude，但实际执行立即返回 `Not logged in`，无写入。read-only 健康记录不能证明 write harness 已登录；禁止修全局认证、直接写源树或自动创建 baseline。后续实现暂由 Codex 执行。
 - 无 eligible `normal-code --write`；不使用 UNVERIFIED/manual-only 组合。完成可审阅的改动后，按当前健康状态使用本地只读审阅路由，不把外部建议视为最终结论。
 
+2026-10-04 后续更新：用户明确通知路由已更新，并指定继续使用 normal-code。已重新核验 registry/routes/policy/health，normal-code 六个 OpenCode 候选均有 VERIFIED 隔离写入记录、GREEN 健康且在 write allowlist 内；先用该路由做本批只读审阅。前述无写路由结论是更新前的执行记录，不再作为当前限制。后续写委派在当前实现完成检查并本地提交后从有效 HEAD 启动，继续禁止直接写源树／自动 merge、commit、push。
+
 ## 执行顺序及完成门槛
 
 | 批次 | 具体工作 | 最小实现与验证 | 完成依赖 |
@@ -38,6 +40,7 @@
 - [x] 目标候选、最终推荐与 CLI/共享 JS 公式对拍；同覆盖性能仍待验。
 - [x] 串行逐次确认与固定身份范围；偏好往返及隔离浏览器专项。
 - [x] 30／100／300 节点相同覆盖调度 fixture，冷/热缓存、70% 失败及 IPv6 不可用；Python3.14/3.12 本机运行。真实流量和原生平台不在此项证据范围。
+- [x] 显式历史目录预览／冲突检查／合并、私有一致备份、幂等及受保护撤回；中断恢复先于启动写入。临时目录、HTTP、真实 Python backend 子进程、共享浏览器与 Python3.14/3.12 全量回归；原生迁移和断电门槛另列。
 - [ ] B 实现与全部验收。
 - [ ] C 实现与全部验收。
 - [ ] D 实现与全部验收。

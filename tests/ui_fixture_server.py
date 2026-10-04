@@ -4,6 +4,7 @@ Run explicitly (not unittest discovery): python -m tests.ui_fixture_server
 All synthetic rows are labelled fixture. This is never a production fallback.
 """
 import argparse
+from contextlib import ExitStack
 import sys
 import tempfile
 import threading
@@ -30,10 +31,19 @@ def main():
     parser.add_argument('--release-status',choices=('ok','timeout'),default='ok',
                         help='Synthetic release metadata, never queries GitHub')
     parser.add_argument('--config-root-fixture',action='store_true',help='Print a synthetic local layout for root-selection UI QA')
+    parser.add_argument('--history-import-fixture',action='store_true',help='Own temporary data and print a synthetic history source for import UI QA')
     args=parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix='speedbench-ui-fixture-') as folder:
+    with tempfile.TemporaryDirectory(prefix='speedbench-ui-fixture-') as folder, ExitStack() as stack:
         web.DATA_HOME=Path(folder)
         web.HISTORY=Path(folder)/'fixture.jsonl'
+        if args.history_import_fixture:
+            from speedbench_owner import BackendLease
+            from tests.test_history_transfer import ledger
+            web.DATA_OWNER=stack.enter_context(BackendLease(web.DATA_HOME))
+            web.HISTORY=web.DATA_HOME/'speedbench-history.jsonl'
+            old=web.DATA_HOME/'旧历史 空格';old.mkdir()
+            ledger(old,'2026-10-01T01:00:00',whitespace=True)
+            print('Synthetic history source: '+str(old),flush=True)
         web.CANCEL_FILE=Path(folder)/'cancel-request'
         from speedbench_config import RootChoice
         web.CONFIG_ROOT=RootChoice()

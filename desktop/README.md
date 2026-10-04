@@ -168,7 +168,25 @@ private seed. Old-name-only rows stay legacy/unknown, not guessed subscription
 history. Settings now expose the current data directory and the existence of
 JSONL/SQLite, without opening raw history or automatically importing other
 directories. A detected source-directory history is a hint, not permission to
-copy it. This guidance is not yet an in-app history directory picker/importer.
+copy it. Settings now also accepts an explicitly chosen local absolute history
+directory. Close all programs using that source, preview the counts/conflicts,
+then confirm the merge. It reads only the fixed JSONL/SQLite filenames; JSONL
+is authoritative when both exist. The original source is unchanged. Matching
+timestamps/task IDs with different content block import; repeated identical
+imports are no-ops. Old active task snapshots become interrupted/partial.
+
+Before merging, private `history-import-backups` saves the destination JSONL,
+a consistent SQLite snapshot, preferences and seed. Source preferences, seed
+and provider caches are excluded. Raw text and existing database IDs survive;
+time-based history queries sort by actual instant, with naive legacy timestamps
+interpreted in the current machine's timezone. Keep all private backups local.
+Preview expires after ten minutes or any observed data change. Settings can
+undo the latest import only while destination files still match the completed
+transaction; it refuses to erase newer data. Startup reconciles a known pending
+transaction before other data writes. Unknown intervening changes or missing
+backup files stop recovery; preserve the directory/backup and resolve the
+reported conflict before restarting. Do not delete the pending receipt to
+bypass the guard. Native package and power-loss acceptance remain pending.
 
 For UI preferences, open Settings in the original browser at its original
 SpeedBench address, choose **Export non-secret preferences**, copy the JSON,
@@ -185,8 +203,9 @@ new shared Web UI in the same browser/host/port to expose the existing local
 preferences. Do not inspect or copy arbitrary browser profile files. Desktop
 imports use an authenticated, atomic backend patch; browser storage failures
 attempt to restore the old whitelist values and never report partial success.
-History directory import and full first-run migration acceptance are still
-pending; do not copy whole browser profiles or imply automatic migration.
+History import has temporary-directory, real HTTP and browser acceptance;
+full native first-run migration acceptance remains pending. Do not copy whole
+browser profiles or imply automatic migration.
 
 Use tray Exit and wait for cleanup **before** reinstalling. NSIS replaces its
 default force-close policy with a read-only Restart Manager check: running app

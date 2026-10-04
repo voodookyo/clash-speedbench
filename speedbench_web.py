@@ -46,6 +46,7 @@ from speedbench_jobs import JobStore, JobError, TERMINAL, _result as safe_job_re
 from speedbench_progress import PREFIX, parse_record
 from speedbench_owner import BackendLease, LeaseError
 from speedbench_preferences import Preferences, PreferenceError
+from speedbench_transfer import HistoryTransfer, TransferError, PENDING as IMPORT_PENDING
 import speedbench_releases
 from speedbench_config import ENV as ROOT_ENV, RootChoice, validate_root, ConfigRootError
 
@@ -105,6 +106,21 @@ DESKTOP_EXITING = None
 RELEASE_CHECKER = speedbench_releases.ReleaseChecker()
 CONFIG_ROOT = RootChoice(os.environ.get(ROOT_ENV,''))
 DATA_OWNER = None
+_TRANSFER = None
+
+
+def history_transfer():
+    global _TRANSFER
+    home = DATA_HOME.resolve()
+    if _TRANSFER is None or _TRANSFER.home != home:
+        _TRANSFER = HistoryTransfer(home)
+    return _TRANSFER
+
+
+def recover_history_import():
+    """Run under the existing backend lease, before any startup data writes."""
+    with _DB_SYNC_LOCK:
+        return history_transfer().recover(DATA_OWNER)
 
 
 def connect_controller(*args,**kwargs):
@@ -309,7 +325,7 @@ def write_token_file() -> None:
 # 有变化才 import_jsonl（导入本身按 ts 去重，幂等），面板读到的永远是最新数据，
 # mtime 不变时代价只是一次 stat；启动时与 /api/run 结束后再各显式同步一次，
 # 只为让导入问题尽早暴露。
-_DB_SYNC_LOCK = threading.Lock()
+_DB_SYNC_LOCK = threading.RLock()
 _DB_SYNCED = {}  # str(db_path) -> 已同步的 jsonl mtime
 
 # DB 里 provider 为空的行在 API 层展示成这个名字；/api/subscription 回传它时
@@ -997,6 +1013,25 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_host():
             return
         path = urllib.parse.urlparse(self.path).path
+        data_paths = {'/api/latest','/api/history','/api/catalog','/api/node',
+            '/api/source','/api/sources/history','/api/subscriptions','/api/subscription',
+            '/api/preferences','/api/leak/audits','/api/leak/history','/api/tasks'}
+        if path in data_paths or path.startswith('/api/tasks/'):
+            if self._data_busy():return
+            with _DB_SYNC_LOCK:
+                if self._data_busy():return
+                self._get(path)
+        else:
+            self._get(path)
+
+    def _data_busy(self):
+        with STATE_LOCK:
+            busy = STATE.get('importing') or STATE.get('import_failed')
+        if busy:
+            self._reject('历史导入或恢复尚未结束，请保留私有备份并等待恢复',409)
+        return bool(busy)
+
+    def _get(self, path):
         if path in ("/", "/index.html"):
             self._serve_index()
         elif path in STATIC_FILES:
@@ -1037,6 +1072,13 @@ class Handler(BaseHTTPRequestHandler):
                     alternate=alternate,
                     backup_names=['speedbench-history.jsonl','speedbench-history.db','ui-preferences.json','identity-seed']))
             except (OSError,RuntimeError,ValueError):self._json({'ok':False,'msg':'数据目录状态暂不可用；未修改任何文件'},503)
+        elif path == '/api/history-import/status':
+            if not self._check_post():return
+            if self._data_busy():return
+            try:
+                with _DB_SYNC_LOCK:self._json(dict(ok=True,**history_transfer().status()))
+            except (TransferError,OSError,ValueError):
+                self._json({'ok':False,'msg':'私有导入记录暂不可用，请保留备份'},503)
         elif path == '/api/desktop/state':
             if not self._check_post():return
             if DESKTOP_ACTIONS is None:self._reject('not a desktop backend',404);return
@@ -1152,6 +1194,46 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_post():
             return
         path = urllib.parse.urlparse(self.path).path
+        if path in ('/api/history-import/preview','/api/history-import/apply','/api/history-import/rollback'):
+            self._history_import(path)
+        elif path in ('/api/preferences','/api/leak/audit','/api/leak/save','/api/leak/evaluate','/api/switch'):
+            if self._data_busy():return
+            with _DB_SYNC_LOCK:
+                if self._data_busy():return
+                self._post(path)
+        else:
+            self._post(path)
+
+    def _history_import(self, path):
+        action = path.rsplit('/',1)[-1]
+        key = {'preview':'directory','apply':'token','rollback':'backup_id'}[action]
+        body = self._read_body(strict=True)
+        if not isinstance(body,dict) or set(body)!={key} or not isinstance(body[key],str):
+            self._json({'ok':False,'msg':'导入请求字段无效'},400);return
+        with STATE_LOCK:
+            if (STATE['running'] or STATE.get('cleanup_incomplete') or STATE.get('importing') or
+                    STATE.get('import_failed') or DATA_OWNER is None or
+                    (DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set())):
+                self._json({'ok':False,'msg':'目录未由本实例持有，或任务／导入／恢复仍在进行'},409);return
+            STATE['importing']=True
+        try:
+            with _DB_SYNC_LOCK:
+                service=history_transfer()
+                if HISTORY.resolve()!=service.home/'speedbench-history.jsonl':
+                    raise TransferError('历史位置不符合本实例固定数据目录')
+                operation=getattr(service,action)
+                self._json(operation(body[key],DATA_OWNER))
+                if action!='preview':_DB_SYNCED.pop(str(db_path()),None)
+        except TransferError as error:
+            self._json({'ok':False,'msg':str(error)},409)
+        except (OSError,ValueError,RuntimeError):
+            self._json({'ok':False,'msg':'无法安全完成导入或恢复；请保留私有备份'},409)
+        finally:
+            with STATE_LOCK:
+                STATE['importing']=False
+                STATE['import_failed']=(DATA_HOME/IMPORT_PENDING).exists()
+
+    def _post(self, path):
         if path in ('/api/config-root','/api/config-root/preview'):
             body=self._read_body(strict=True)
             if not isinstance(body,dict) or set(body)!={'root'}:
@@ -1161,7 +1243,8 @@ class Handler(BaseHTTPRequestHandler):
                 if path.endswith('/preview'):
                     self._json(dict(ok=True,path=root or None,mode='custom' if root else 'auto',connection_verified=False));return
                 with STATE_LOCK:
-                    if STATE['running'] or STATE.get('cleanup_incomplete',False) or (DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set()):
+                    if (STATE['running'] or STATE.get('cleanup_incomplete',False) or STATE.get('importing') or
+                            STATE.get('import_failed') or (DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set())):
                         self._json({'ok':False,'msg':'任务或清理仍在进行，不能更改配置目录'},409);return
                     choice=CONFIG_ROOT.apply(root)
                 self._json(dict(ok=True,**choice))
@@ -1175,7 +1258,7 @@ class Handler(BaseHTTPRequestHandler):
             if DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set():
                 self._json({'ok':False,'msg':'客户端正在退出，不能开始新任务'},409);return
             with STATE_LOCK:
-                busy = STATE["running"]
+                busy = STATE["running"] or STATE.get('importing') or STATE.get('import_failed')
                 cleanup_incomplete=STATE.get('cleanup_incomplete',False)
                 root,root_revision=CONFIG_ROOT.snapshot()
             if cleanup_incomplete:
@@ -1202,7 +1285,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({'ok':False,'msg':'配置目录已改变，请刷新目录后重试'},409);return
                 if DESKTOP_EXITING is not None and DESKTOP_EXITING.is_set():
                     self._json({'ok':False,'msg':'客户端正在退出，不能开始新任务'},409);return
-                if STATE['running']:
+                if STATE['running'] or STATE.get('importing') or STATE.get('import_failed'):
                     self._reject('已有测速任务进行中',409)
                     return
                 if STATE.get('cleanup_incomplete',False):
@@ -1307,6 +1390,7 @@ class Handler(BaseHTTPRequestHandler):
             try:self._json({'ok':True,'request_id':DESKTOP_ACTIONS.request(body)},202)
             except ValueError:self._json({'ok':False,'msg':'桌面操作无效或队列已满'},400)
         elif path == "/api/quit":
+            if self._data_busy():return
             if callable(DESKTOP_SHUTDOWN):
                 if DESKTOP_EXITING is not None:
                     with STATE_LOCK:DESKTOP_EXITING.set()
@@ -1347,9 +1431,13 @@ def main() -> int:
     except LeaseError:
         print('SpeedBench 数据目录已被占用或无法安全锁定；请先关闭使用同一目录的现有面板。')
         return 2
+    except TransferError:
+        print('历史导入恢复未完成；请保留数据目录和 history-import-backups，停止新写入并检查私有备份。')
+        return 2
 
 
 def serve_web(args):
+    recover_history_import()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{server.server_port}"
     try:

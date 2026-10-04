@@ -37,6 +37,9 @@ label.chk { display: inline; color: var(--fg); font-size: 13px; cursor: pointer;
 input[type=text], input[type=number] { background: var(--input); color: var(--fg);
   border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; width: 180px; }
 input[type=number] { width: 80px; }
+#history-import-directory { display:block; width:100%; margin:6px 0 10px; }
+#data-guide label.chk { display:block; }
+#history-import-status { white-space:pre-line; overflow-wrap:anywhere; }
 select { background: var(--input); color: var(--fg); border: 1px solid var(--border);
   border-radius: 6px; padding: 6px 10px; }
 input:focus { outline: none; border-color: var(--accent); }

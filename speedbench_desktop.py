@@ -106,6 +106,7 @@ def main():
         import speedbench_web as web
         with BackendLease(web.DATA_HOME) as lease:
             web.DATA_OWNER=lease
+            web.recover_history_import()
             server=ThreadingHTTPServer(('127.0.0.1',0),web.Handler)
             server.daemon_threads=True
             web.DESKTOP_IDENTITY=public_identity(lease.instance_id)
@@ -128,11 +129,11 @@ def main():
                     if shutdown_started.is_set():return
                     shutdown_started.set()
                 with web.STATE_LOCK:
-                    exiting.set();busy=web.STATE['running']
+                    exiting.set();busy=web.STATE['running'] or web.STATE.get('importing')
                 if busy:web.cancel_benchmark()
                 deadline=time.monotonic()+25
                 while time.monotonic()<deadline:
-                    with web.STATE_LOCK:busy=web.STATE['running']
+                    with web.STATE_LOCK:busy=web.STATE['running'] or web.STATE.get('importing')
                     if not busy:break
                     time.sleep(.1)
                 # A failed cleanup is not presented as success. The parent has

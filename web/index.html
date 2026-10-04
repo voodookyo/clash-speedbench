@@ -234,10 +234,16 @@
         <p class="muted">仅在点击时查询 GitHub 官方 API，不携带任何 SpeedBench 密钥或历史。只检查正式版本，不检查 alpha 更新；查询失败不表示已是最新版本。不会下载、安装或自动降级。</p>
         <ol class="muted"><li>先停止测速、退出新旧程序，备份下方列出的数据与私有身份种子。</li><li>在官方 Release 选择对应平台／架构的包，并按 SHA-256 核对文件；校验和不等于数字签名，unsigned 包仍可能触发系统警告。</li><li>手动升级，沿用原数据目录；回退前另行备份，不删除新历史，也不要同时运行两个写入程序。</li></ol>
       </div>
-      <div class="card" id="data-guide"><h2>数据位置与迁移指引</h2>
+      <div class="card" id="data-guide"><h2>数据位置与历史导入</h2>
         <p id="data-status" class="muted" role="status">正在读取本实例数据位置…</p>
-        <p class="muted">程序不会自动搬动或覆盖其他目录。升级／回退前先退出测速及旧程序，再备份 JSONL、SQLite、ui-preferences.json 和 identity-seed；种子属于私有备份，不能上传或放入下方偏好 JSON。其他数据目录的迁移仍需按 README 操作，不会读取浏览器 profile。</p>
+        <p class="muted">首次使用新目录时，可明确选择旧数据目录并预览。导入只合并历史与任务快照，保留原始记录及稳定 ID；同一时间戳或任务身份的不同内容会阻止导入。源目录的偏好、身份种子和缓存不会迁入；未匹配当前目录的收藏仍需人工确认。</p>
         <button class="mini" id="btn-data-refresh">刷新数据位置</button>
+        <label for="history-import-directory">旧 SpeedBench 数据目录（本机绝对路径）</label>
+        <input id="history-import-directory" type="text" autocomplete="off" spellcheck="false" placeholder="选择含 speedbench-history.jsonl 或 .db 的目录">
+        <label class="chk"><input id="history-import-closed" type="checkbox"> 我已关闭使用旧目录的新旧 SpeedBench 程序</label>
+        <div class="leak-actions"><button class="mini" id="btn-history-preview">预览历史导入</button><button id="btn-history-import" disabled>确认合并历史</button><button class="mini" id="btn-history-rollback" disabled>撤回最近一次导入</button></div>
+        <p id="history-import-status" class="muted" role="status" aria-live="polite" tabindex="-1">尚未预览；不会自动读取或导入旧目录。</p>
+        <p class="muted">导入前会在本实例 history-import-backups 中保存私有的 JSONL、一致 SQLite、偏好及身份种子备份，不要上传。预览有效期为十分钟；任何数据变化都需重新预览。撤回仅限本次导入后没有新数据的情况。旧记录没有时区时按本机时区解释。</p>
       </div>
       <div class="card" id="preference-transfer"><h2>显式迁移界面偏好</h2>
         <p class="muted">在旧浏览器中导出，复制到桌面后预览并确认导入。仅含主题、目标／模式和收藏；不含 API Key、写 token、控制器信息、路径、历史或身份种子。收藏合并，无法匹配的收藏保留待确认；不同数据目录的稳定 ID 未必匹配。</p>

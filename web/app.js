@@ -18,6 +18,7 @@ async function post(url, body){
 
 async function getJSON(url){
   const r = await fetch(url);
+  if(r.ok===false) throw new Error('本实例暂时无法读取该数据');
   return r.json();
 }
 
@@ -497,8 +498,10 @@ function championOf(rec){
 }
 
 async function loadHistory(){
+  const selectedStamp=histData[histSelRun]?.ts;
   try{ histData = await getJSON('/api/history'); }
   catch(e){ histData = []; toast('读取历史记录失败', false); }
+  if(selectedStamp) histSelRun=histData.findIndex(r=>r.ts===selectedStamp);
   histLoaded = true;
   if(histData.length && (histSelRun<0 || histSelRun>=histData.length)){
     histSelRun = histData.length-1;   // 默认最新一轮 + 冠军节点
@@ -1482,18 +1485,30 @@ function showTask(task){
   renderTable();renderBoard();
   if(!running){histLoaded=false;subsLoaded=false;}
 }
+let taskListRevision=0,taskDetailRevision=0,selectedTaskHistoryId='';
+function clearTaskHistory(){
+  ++taskDetailRevision;selectedTaskHistoryId='';
+  const detail=document.getElementById('task-detail');
+  if(detail){detail.hidden=true;detail.innerHTML='';}
+}
 async function loadTasks(){
   const list=document.getElementById('task-list');
   if(!list || typeof SBTasks==='undefined') return;
+  const revision=++taskListRevision;
   try{
     const data=await getJSON('/api/tasks');
+    if(revision!==taskListRevision) return;
+    if(selectedTaskHistoryId && !(data.tasks||[]).some(t=>t.job_id===selectedTaskHistoryId)) clearTaskHistory();
     list.innerHTML=(data.tasks||[]).map(t=>`<button class="task-history-item mini" data-job-id="${esc(t.job_id)}"><b>${esc(taskLabels[t.status]||t.status)}</b><span>${esc(t.mode)} · ${esc(t.started_at)} · ${t.elapsed_ms==null?'耗时未知':(t.elapsed_ms/1000).toFixed(1)+'s'}</span></button>`).join('')||'<p class="muted">暂无任务。选择订阅与模式，开始一次测速。</p>';
-  }catch(e){list.textContent='无法读取任务历史，请检查本地数据目录权限后刷新。';}
+  }catch(e){if(revision===taskListRevision) list.textContent='无法读取任务历史，请检查本地数据目录权限后刷新。';}
 }
 async function showTaskHistory(id){
   if(!/^job_[0-9a-f]{32}$/.test(id)) return;
+  const revision=++taskDetailRevision;
   const task=await getJSON('/api/tasks/'+id), detail=document.getElementById('task-detail');
+  if(revision!==taskDetailRevision || historyImportBusy) return;
   if(!task || task.job_id!==id){toast('任务已失效，请刷新',false);return;}
+  selectedTaskHistoryId=id;
   detail.hidden=false;
   const metrics=Object.entries(task.metrics||{}).map(([phase,m])=>`<tr><td>${esc(phase)}</td><td>${(m.duration_ms/1000).toFixed(2)}s</td><td>${m.successes}/${m.attempts}</td><td>${(m.bytes/1000000).toFixed(2)} MB</td></tr>`).join('');
   detail.innerHTML=`<h2>${esc(taskLabels[task.status]||task.status)}</h2><p class="muted">${esc(task.mode)} · ${task.partial?'部分结果':'完整任务'} · 重叠阶段耗时不可直接相加。流量仅统计已报告的 curl 实际字节。</p><div class="table-wrap"><table><thead><tr><th>阶段</th><th>耗时</th><th>成功/尝试</th><th>已报告实际下载</th></tr></thead><tbody>${metrics||emptyRow('旧记录无阶段耗时',4)}</tbody></table></div><div class="table-wrap"><table><thead><tr><th>#</th><th>节点</th><th>延迟</th><th>带宽</th><th>Network</th><th>IP Grade</th><th>IP 类型</th><th>风险</th><th>标签</th><th></th></tr></thead><tbody>${(task.results||[]).map((r,i)=>rowHtml(r,i,{readonly:true,favs:new Set()})).join('')||emptyRow('任务尚未返回节点结果',10)}</tbody></table></div>`;
@@ -1520,6 +1535,81 @@ async function loadDataGuide(){
     status.textContent=`本实例数据目录：${info.data_home}\nJSONL：${info.history.jsonl_path}（${info.history.jsonl_exists?'已有文件，沿用该位置':'尚无文件'}）\nSQLite：${info.history.database_path}（${info.history.database_exists?'已有文件':'尚无文件'}）`+
       (info.alternate?.jsonl_exists?`\n另发现源码目录同名 JSONL 文件：${info.alternate.path}；未核验内容，没有自动导入。`:'');
   }catch(e){status.textContent='无法读取数据位置；没有重置或迁移文件。请检查本实例连接。';}
+}
+let pendingHistoryImport=null,historyImportBusy=false,historyImportBackup=null;
+function historyImportButtons(){
+  const directory=document.getElementById('history-import-directory');if(!directory) return;
+  const closed=document.getElementById('history-import-closed');
+  directory.disabled=historyImportBusy;closed.disabled=historyImportBusy;
+  document.getElementById('btn-history-preview').disabled=historyImportBusy;
+  document.getElementById('btn-history-import').disabled=historyImportBusy || !closed.checked ||
+    !pendingHistoryImport?.can_apply || directory.value.trim()!==pendingHistoryImport.directory;
+  document.getElementById('btn-history-rollback').disabled=historyImportBusy || !historyImportBackup;
+}
+async function loadHistoryImportStatus(){
+  try{
+    const r=await fetch('/api/history-import/status',{headers:{'X-SpeedBench-Token':SB_TOKEN}});
+    const info=await r.json();historyImportBackup=info.ok && info.can_rollback?info.backup_id:null;
+    if(info.ok && info.pending) document.getElementById('history-import-status').textContent='有未完成的导入，请保留私有备份并重启以恢复；恢复前不能开始新任务。';
+  }catch(e){historyImportBackup=null;}
+  historyImportButtons();
+}
+async function previewHistoryImport(){
+  if(historyImportBusy) return;
+  const directory=document.getElementById('history-import-directory').value.trim();
+  const status=document.getElementById('history-import-status');
+  pendingHistoryImport=null;historyImportBusy=true;historyImportButtons();
+  status.textContent='正在只读预览所选目录…';
+  try{
+    const info=await post('/api/history-import/preview',{directory});
+    if(!info.ok){status.textContent=info.msg || '无法预览；请检查本机路径与源程序是否已退出。';return;}
+    pendingHistoryImport={...info,directory};
+    status.textContent=`源目录：${info.source}\n本实例：${info.destination}\n新增历史 ${info.new_runs} 轮，已有相同记录 ${info.duplicate_runs} 轮，新增任务 ${info.new_tasks} 项，冲突 ${info.conflicts} 项。`+
+      (info.ignored_database_runs?`\n源目录以 JSONL 为准，SQLite 另有 ${info.ignored_database_runs} 轮未列入此次导入。`:'')+
+      (info.can_apply?'\n尚未写入。确认源程序已关闭后，可合并历史。':'\n冲突阻止合并，请检查源副本后重新预览。');
+  }catch(e){status.textContent='预览连接失败；没有请求合并。请检查本实例连接后重试。';}
+  finally{historyImportBusy=false;historyImportButtons();}
+}
+async function finishHistoryImport(action){
+  if(historyImportBusy) return;
+  const directory=document.getElementById('history-import-directory').value.trim();
+  if(action==='apply' && (!pendingHistoryImport?.can_apply || directory!==pendingHistoryImport.directory ||
+      !document.getElementById('history-import-closed').checked)) return;
+  if(action==='rollback' && !historyImportBackup) return;
+  const body=action==='apply'?{token:pendingHistoryImport.token}:{backup_id:historyImportBackup};
+  const status=document.getElementById('history-import-status');
+  historyImportBusy=true;pendingHistoryImport=null;historyImportButtons();
+  status.focus?.({preventScroll:true});
+  status.textContent=action==='apply'?'正在保存私有备份并合并历史…':'正在恢复本次导入前的私有备份…';
+  try{
+    const info=await post('/api/history-import/'+action,body);
+    if(!info.ok){status.textContent=info.msg || '操作被拒绝；请保留备份并重新预览。';return;}
+    clearTaskHistory();
+    status.textContent=action==='apply'?`已合并历史 ${info.imported_runs} 轮、任务 ${info.imported_tasks} 项。`+
+      (info.backup_id?'私有备份已保存在本实例数据目录。':'全部记录已存在，无需新增备份。'):'已撤回本次导入，恢复导入前的数据。';
+    await Promise.all([loadDataGuide(),loadLatest(),loadTasks(),...(histLoaded?[loadHistory()]:[])]);
+    if(currentView()==='subs') await loadSubs();
+  }catch(e){status.textContent='操作连接中断，结果尚未确认；请刷新数据位置。不要删除私有备份，重启后会先核验未完成事务。';}
+  finally{
+    historyImportBusy=false;await loadHistoryImportStatus();historyImportButtons();
+    if(document.activeElement===status) document.getElementById('btn-history-preview').focus?.({preventScroll:true});
+  }
+}
+function initHistoryImport(){
+  const directory=document.getElementById('history-import-directory');if(!directory) return;
+  directory.addEventListener('input',()=>{pendingHistoryImport=null;historyImportButtons();
+    document.getElementById('history-import-status').textContent='目录已改变，请重新预览。';});
+  document.getElementById('history-import-closed').addEventListener('change',historyImportButtons);
+  document.getElementById('btn-history-preview').addEventListener('click',previewHistoryImport);
+  document.getElementById('btn-history-import').addEventListener('click',()=>{
+    if(document.getElementById('btn-history-import').disabled) return;
+    confirmModal('确认源目录的新旧 SpeedBench 已退出，并按刚才的预览合并历史？本实例会先保存私有备份；源偏好、身份种子和缓存不会迁入。',()=>finishHistoryImport('apply'));
+  });
+  document.getElementById('btn-history-rollback').addEventListener('click',()=>{
+    if(document.getElementById('btn-history-rollback').disabled) return;
+    confirmModal('确认撤回最近一次历史导入？只恢复这次导入前的备份；如本实例已有新数据，会拒绝撤回。',()=>finishHistoryImport('rollback'));
+  });
+  loadHistoryImportStatus();
 }
 let pendingPreferenceImport=null;
 function transferPreferenceRead(key){
@@ -1601,7 +1691,8 @@ function initPreferenceTransfer(){
     }catch(e){status.textContent='导入格式无效、含非白名单字段或超过限制；没有应用任何内容。';}
   });
   apply.addEventListener('click',()=>confirmModal('确认导入白名单界面选项并合并收藏？不会导入历史、密钥或身份种子，也不会修改当前测速。',applyPreferenceImport));
-  document.getElementById('btn-data-refresh').addEventListener('click',loadDataGuide);
+  document.getElementById('btn-data-refresh').addEventListener('click',()=>{loadDataGuide();loadHistoryImportStatus();});
+  initHistoryImport();
   loadDataGuide();
 }
 function initTaskControls(){

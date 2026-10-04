@@ -94,6 +94,41 @@ class DesktopBridgeTest(unittest.TestCase):
                     {**data,'key':'CANARY-key'},[],{**data,'parent_pid':True}):
             with self.subTest(bad=bad),self.assertRaises(desktop.DesktopError):desktop.validate_bootstrap(bad)
 
+    def test_real_backend_reconciles_pending_history_before_bootstrap_and_db_writes(self):
+        from speedbench_owner import BackendLease
+        from speedbench_transfer import HistoryTransfer, PENDING
+        import speedbench_transfer as transfer
+        from tests.test_history_transfer import ledger
+        for changed in (False,True):
+            with self.subTest(changed=changed),tempfile.TemporaryDirectory() as folder:
+                home=Path(folder)/'中文 home';source=Path(folder)/'old';home.mkdir();source.mkdir()
+                old=ledger(home,'2026-10-01T01:00:00',whitespace=True)
+                ledger(source,'2026-10-02T01:00:00')
+                service=HistoryTransfer(home);original=transfer._atomic
+                def crash(path,data):
+                    if path==home.resolve()/'speedbench-history.db':raise SystemExit('fixture crash')
+                    return original(path,data)
+                with BackendLease(home) as owner:
+                    token=service.preview(str(source),owner)['token']
+                    with mock.patch.object(transfer,'_atomic',side_effect=crash),self.assertRaises(SystemExit):
+                        service.apply(token,owner)
+                if changed:ledger(home,'2026-10-03T01:00:00')
+                before=(home/'speedbench-history.jsonl').read_bytes()
+                env=dict(os.environ,SPEEDBENCH_HOME=str(home))
+                frame=json.dumps({'protocol':1,'parent_pid':os.getpid(),'nonce':'b'*64})+'\n'
+                result=subprocess.run([sys.executable,'-u','speedbench_desktop.py'],input=frame,
+                    capture_output=True,env=env,text=True,encoding='utf-8',timeout=10)
+                self.assertEqual(result.returncode,2 if changed else 0,result.stderr)
+                if changed:
+                    self.assertEqual(result.stdout,'')
+                    self.assertEqual((home/'speedbench-history.jsonl').read_bytes(),before)
+                    self.assertTrue((home/PENDING).exists())
+                    self.assertFalse((home/'speedbench-history.db').exists())
+                else:
+                    self.assertEqual(json.loads(result.stdout)['protocol'],1)
+                    self.assertEqual((home/'speedbench-history.jsonl').read_text().rstrip('\n'),old)
+                    self.assertFalse((home/PENDING).exists())
+
     def test_private_pipe_frame_is_not_a_public_identity_response(self):
         identity=desktop.public_identity('fixture')
         self.assertEqual(identity['app_id'],'com.voodookyo.clash-speedbench')

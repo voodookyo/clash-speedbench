@@ -238,9 +238,29 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
                             HAVING COUNT(*)=1)''')
 
 
+def _run_time(value):
+    """Actual instant for ordering imported runs; old naive times are local.
+
+    Invalid historical timestamps keep their raw text and IDs, sort before
+    known instants, and remain excluded from dated trend windows.
+    """
+    try:
+        if not isinstance(value, str) or len(value) > 64:
+            return None
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def _time_key(value):
+    stamp = _run_time(value)
+    return stamp if stamp is not None else float('-inf')
+
+
 def _open(db_path) -> sqlite3.Connection:
     """打开（必要时创建）历史库并确保表结构存在。WAL：读查询不阻塞导入。"""
     conn = sqlite3.connect(str(db_path), timeout=10)
+    conn.create_function('speedbench_run_time', 1, _run_time)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     _ensure_columns(conn)
@@ -400,7 +420,7 @@ def task_history(db_path, limit=100):
     from contextlib import closing
     with closing(_open(db_path)) as conn:
         return [_task_row(r) for r in conn.execute(
-            'SELECT * FROM task_runs ORDER BY started_at DESC LIMIT ?', (max(1,min(int(limit),1000)),))]
+            'SELECT * FROM task_runs ORDER BY speedbench_run_time(started_at) DESC,job_id DESC LIMIT ?', (max(1,min(int(limit),1000)),))]
 
 
 def task_snapshot(db_path, job_id):
@@ -825,18 +845,18 @@ def latest_run(db_path) -> dict:
     conn = _open(db_path)
     try:
         row = conn.execute(
-            "SELECT raw FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+            "SELECT raw FROM runs ORDER BY speedbench_run_time(ts) DESC,id DESC LIMIT 1").fetchone()
         return json.loads(row[0]) if row else {}
     finally:
         conn.close()
 
 
 def all_runs(db_path) -> list:
-    """全部测速轮次（按写入先后升序，每项与 jsonl 行结构完全一致）。"""
+    """全部测速轮次（实际时间升序，同一时刻按 ID，raw 与旧 ID 不变）。"""
     conn = _open(db_path)
     try:
         return [json.loads(row[0])
-                for row in conn.execute("SELECT raw FROM runs ORDER BY id")]
+                for row in conn.execute("SELECT raw FROM runs ORDER BY speedbench_run_time(ts),id")]
     finally:
         conn.close()
 
@@ -900,6 +920,7 @@ def candidate_history_hints(db_path, node_ids, *, now=None, target_profile='bala
         if not path.is_file():
             return {}
         conn = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.05)
+        conn.create_function('speedbench_run_time', 1, _run_time)
         conn.execute('PRAGMA query_only=ON')
         conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         # One indexed lookup per ID, limited to the newest usable bandwidth
@@ -910,7 +931,7 @@ def candidate_history_hints(db_path, node_ids, *, now=None, target_profile='bala
                  FROM node_results n JOIN runs r ON r.id=n.run_id
                  WHERE n.node_id=? AND n.identity_version=2
                  AND n.identity_strength='strong' AND n.status='ok'
-                 AND n.median_mbps>0 ORDER BY n.id DESC LIMIT 1'''
+                 AND n.median_mbps>0 ORDER BY speedbench_run_time(r.ts) DESC,n.id DESC LIMIT 1'''
         ip_target=target_profile in ('ip','residential')
         if ip_target:
             sql='''SELECT n.run_id,r.ts,n.exit_ipv4,n.exit_ipv6,
@@ -920,7 +941,7 @@ def candidate_history_hints(db_path, node_ids, *, now=None, target_profile='bala
                    WHERE n.node_id=? AND n.identity_version=2 AND n.identity_strength='strong'
                    AND n.status='ok' AND EXISTS(SELECT 1 FROM ip_intel_results i
                      WHERE i.run_id=n.run_id AND i.exit_ip IN (n.exit_ipv4,n.exit_ipv6))
-                   ORDER BY n.id DESC LIMIT 1'''
+                   ORDER BY speedbench_run_time(r.ts) DESC,n.id DESC LIMIT 1'''
         for node_id in ids:
             if time.monotonic() >= deadline:
                 # Do not bias a large task towards the first sorted IDs when
@@ -964,7 +985,7 @@ def candidate_history_hints(db_path, node_ids, *, now=None, target_profile='bala
 def node_series(db_path, name: str, days: int = 30, node_key: str = "", node_id: str = "") -> list:
     """某节点最近 days 天逐次测速序列（时间升序）。
 
-    ts 是 ISO 本地时间字符串，字典序即时间序，直接与 cutoff 比较。
+    带时区和无时区旧时间都按实际时刻排序；无时区按本机时区解释。
     node_key 非空时改按 node_key 匹配（订阅改名后仍可续上历史），否则按 name。
     """
     days = max(1, min(int(days), 3650))
@@ -982,8 +1003,8 @@ def node_series(db_path, name: str, days: int = 30, node_key: str = "", node_id:
             "SELECT r.ts, n.median_mbps, n.best_mbps, n.multi_mbps,"
             " n.latency_ms, n.jitter_ms, n.connect_ms, n.score, n.status"
             " FROM node_results n JOIN runs r ON r.id = n.run_id"
-            f" WHERE {where} AND r.ts >= ?"
-            " ORDER BY r.id, n.id",
+            f" WHERE {where} AND speedbench_run_time(r.ts) >= speedbench_run_time(?)"
+            " ORDER BY speedbench_run_time(r.ts),r.id,n.id",
             params).fetchall()
         return [dict(row) for row in rows]
     finally:
@@ -1004,14 +1025,14 @@ def ip_changes(db_path, name: str, node_id: str = '') -> list:
             " p.asn, p.asname, p.kind, p.proxy, p.hosting, p.mobile"
             " FROM ip_profiles p JOIN runs r ON r.id = p.run_id"
             " WHERE p.name = ? AND p.exit_ip IS NOT NULL AND p.exit_ip != ''"
-            " ORDER BY r.id, p.id",
+            " ORDER BY speedbench_run_time(r.ts),r.id,p.id",
             (name,)).fetchall()
         if node_id:
             rows=conn.execute('''SELECT r.ts,p.exit_ip,p.country,p.country_code,p.isp,p.org,
                 p.asn,p.asname,p.kind,p.proxy,p.hosting,p.mobile FROM ip_profiles p
                 JOIN runs r ON r.id=p.run_id JOIN node_results n ON n.id=p.node_result_id
                 WHERE n.node_id=? AND p.exit_ip IS NOT NULL AND p.exit_ip!=''
-                ORDER BY r.id,p.id''',(node_id,)).fetchall()
+                ORDER BY speedbench_run_time(r.ts),r.id,p.id''',(node_id,)).fetchall()
         timeline = []
         last_key = None
         for row in rows:
@@ -1105,7 +1126,7 @@ def ip_reputation_changes(db_path, name: str, node_key: str = "", node_id: str =
             "LEFT JOIN ip_profiles p ON p.id = ("
             "SELECT p2.id FROM ip_profiles p2 WHERE p2.node_result_id=n.id "
             "ORDER BY p2.id LIMIT 1) "
-            f"WHERE {where} ORDER BY r.id, n.id",
+            f"WHERE {where} ORDER BY speedbench_run_time(r.ts),r.id,n.id",
             params,
         ).fetchall()
         intel_by_run_ip = {}
@@ -1327,7 +1348,7 @@ def source_summary(db_path, days=30, subscription_id=None):
             'FROM node_results n JOIN runs r ON r.id=n.run_id '
             'LEFT JOIN node_origins o ON o.node_result_id=n.id '
             'LEFT JOIN subscription_sources s ON s.subscription_id=o.subscription_id '
-            'WHERE r.ts>=? ORDER BY r.id,n.id', (since,)).fetchall()
+            'WHERE speedbench_run_time(r.ts)>=speedbench_run_time(?) ORDER BY speedbench_run_time(r.ts),r.id,n.id', (since,)).fetchall()
     finally:
         conn.close()
     groups = {}
@@ -1349,7 +1370,7 @@ def source_summary(db_path, days=30, subscription_id=None):
         if row['origin_status'] == 'ambiguous':
             group['ambiguous_node_count'] += 1
             group['source_status'] = 'ambiguous'
-        group['last_ts'] = max(group['last_ts'], row['ts'])
+        group['last_ts'] = max(group['last_ts'], row['ts'], key=_time_key)
     result = []
     for group in groups.values():
         rows = group.pop('rows')
@@ -1371,7 +1392,7 @@ def source_summary(db_path, days=30, subscription_id=None):
             median_mbps=_median_or_none([r['median_mbps'] for r in rows],3),
             latency_ms=_median_or_none([r['latency_ms'] for r in rows],1),
             avg_network_score=round(statistics.fmean(scores),1) if scores else None))
-    result.sort(key=lambda item: (item['last_ts'],item['name']), reverse=True)
+    result.sort(key=lambda item: (_time_key(item['last_ts']),item['name']), reverse=True)
     return result
 
 
@@ -1383,7 +1404,7 @@ def source_series(db_path, subscription_id, days=30):
         conn.row_factory=sqlite3.Row
         rows=conn.execute('''SELECT n.*,r.ts,o.name_snapshot FROM node_results n
             JOIN runs r ON r.id=n.run_id JOIN node_origins o ON o.node_result_id=n.id
-            WHERE o.subscription_id=? AND r.ts>=? ORDER BY r.id,n.id''',
+            WHERE o.subscription_id=? AND speedbench_run_time(r.ts)>=speedbench_run_time(?) ORDER BY speedbench_run_time(r.ts),r.id,n.id''',
             (subscription_id,since)).fetchall()
     grouped={}
     for row in rows:
@@ -1421,8 +1442,8 @@ def subscription_summary(db_path, days: int = 30) -> list:
             "SELECT COALESCE(n.provider, ''), n.run_id, r.ts, n.name,"
             " n.status, n.median_mbps, n.latency_ms, n.score"
             " FROM node_results n JOIN runs r ON r.id = n.run_id"
-            " WHERE r.ts >= ?"
-            " ORDER BY r.id, n.id",
+            " WHERE speedbench_run_time(r.ts) >= speedbench_run_time(?)"
+            " ORDER BY speedbench_run_time(r.ts),r.id,n.id",
             (since,)).fetchall()
     finally:
         conn.close()
@@ -1440,7 +1461,7 @@ def subscription_summary(db_path, days: int = 30) -> list:
         g["meds"].append(med)
         g["lats"].append(lat)
         g["scores"].append(score)
-        if ts > g["last_ts"]:
+        if _time_key(ts) > _time_key(g["last_ts"]):
             g["last_ts"] = ts
     out = []
     for provider, g in groups.items():
@@ -1455,7 +1476,7 @@ def subscription_summary(db_path, days: int = 30) -> list:
             "avg_score": round(statistics.fmean(scores), 1) if scores else None,
             "last_ts": g["last_ts"],
         })
-    out.sort(key=lambda d: (d["last_ts"], d["provider"]), reverse=True)
+    out.sort(key=lambda d: (_time_key(d["last_ts"]), d["provider"]), reverse=True)
     return out
 
 
@@ -1472,8 +1493,8 @@ def subscription_series(db_path, provider: str, days: int = 30) -> list:
         rows = conn.execute(
             "SELECT r.id, r.ts, n.status, n.median_mbps, n.latency_ms, n.score"
             " FROM node_results n JOIN runs r ON r.id = n.run_id"
-            " WHERE COALESCE(n.provider, '') = ? AND r.ts >= ?"
-            " ORDER BY r.id, n.id",
+            " WHERE COALESCE(n.provider, '') = ? AND speedbench_run_time(r.ts) >= speedbench_run_time(?)"
+            " ORDER BY speedbench_run_time(r.ts),r.id,n.id",
             (provider or "", since)).fetchall()
     finally:
         conn.close()

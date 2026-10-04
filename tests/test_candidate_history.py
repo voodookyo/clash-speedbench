@@ -52,6 +52,11 @@ class CandidateHistoryTest(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         self.assertNotIn('改名', json.dumps(hints))
 
+    def test_later_import_of_older_data_does_not_replace_recent_hint(self):
+        self.insert(age=1, speed=90)
+        self.insert(age=8, speed=40)
+        self.assertEqual(self.hints()[self.a]['recent_mbps'], 90)
+
     def test_weak_legacy_or_changed_identity_cannot_borrow_hint(self):
         self.insert(strength='weak')
         self.insert(node=self.b, age=0.5, speed=999)
