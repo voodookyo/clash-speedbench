@@ -12,6 +12,7 @@ import json
 import os
 import posixpath
 import re
+import stat
 import sys
 import threading
 import urllib.parse
@@ -90,6 +91,34 @@ def config_paths(platform: Optional[str] = None, environ: Optional[Mapping[str, 
         xdg = env.get("XDG_CONFIG_HOME")
         roots = [Path(xdg) / APP_ID] if xdg and posixpath.isabs(xdg) else [Path(home) / ".config" / APP_ID]
     return [root / "clash-verge.yaml" for root in roots]
+
+
+# Clash Verge's service mode (macOS) exposes mihomo's control API on a per-user
+# IPC socket. The path layout is public upstream interoperability metadata; no
+# directory, user, port or process enumeration is performed here.
+SERVICE_SOCKET_ROOT = Path("/var/run/clash-verge-service")
+
+
+def service_controller_socket(uid: Optional[int] = None) -> Optional[Path]:
+    """Documented current-user service IPC socket, or None when unavailable."""
+    if uid is None:
+        uid = os.getuid() if hasattr(os, "getuid") else None
+    if uid is None:
+        return None
+    return SERVICE_SOCKET_ROOT / "users" / str(uid) / "verge-mihomo.sock"
+
+
+def _owned_socket(path: Path) -> bool:
+    """True only for a real, non-symlink Unix socket owned by the current uid."""
+    try:
+        if path.is_symlink():
+            return False
+        metadata = path.stat()
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(metadata.st_mode):
+        return False
+    return not hasattr(os, "getuid") or metadata.st_uid == os.getuid()
 
 
 def _scalar(raw: str) -> str:
@@ -243,6 +272,10 @@ def discover_targets(platform: Optional[str] = None, config_root: Optional[str] 
     platform = platform or sys.platform
     targets = []
     warnings = []
+    # The service socket belongs to the machine, not to a chosen config root, so
+    # it is only a fallback for the implicit default root. An explicit or
+    # environment-selected root must never silently reach another root's service.
+    default_root = not (config_root if config_root is not None else os.environ.get(ROOT_ENV))
     paths=(config_paths(platform=platform) if config_root is None else
            config_paths(platform=platform,config_root=config_root))
     for runtime in paths:
@@ -275,6 +308,12 @@ def discover_targets(platform: Optional[str] = None, config_root: Optional[str] 
             tcp = local_tcp_base(fields.get("external-controller", ""))
             if tcp:
                 bases.append(tcp)
+            if default_root and platform == "darwin":
+                service = service_controller_socket()
+                if service is not None and _owned_socket(service):
+                    service_base = "unix://" + str(service)
+                    if service_base not in bases:
+                        bases.append(service_base)
             if not bases:
                 warnings.append("本机 Clash Verge 配置未声明可用的本地控制器地址")
             for base in bases:

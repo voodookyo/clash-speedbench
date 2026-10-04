@@ -276,6 +276,15 @@ def discover_catalog(api, data_home, *, config_file='', snapshot=None, config_ro
         unix = document.get('external-controller-unix')
         if isinstance(unix, str) and unix.startswith('/'):
             declared.append('unix://' + unix)
+        # Service mode overrides the generated file's temporary IPC path. Bind
+        # only the standard current-user config to its owner-checked endpoint.
+        effective_root = config_root if config_root is not None else os.environ.get(controller.ROOT_ENV)
+        if controller.sys.platform == 'darwin' and not effective_root:
+            default_paths = controller.config_paths(config_root='')
+            if any(path.resolve() == p.resolve() for p in default_paths):
+                service = controller.service_controller_socket()
+                if service is not None and controller._owned_socket(service):
+                    declared.append('unix://' + str(service))
         if controller.canonical_explicit(base) not in declared:
             unavailable['status'] = 'controller_config_mismatch'
             return unavailable

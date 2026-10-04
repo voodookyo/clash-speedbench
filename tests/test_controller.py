@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -33,6 +34,7 @@ class ControllerFixture(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
         mock.patch.dict(os.environ, {}, clear=True).start()
         self.paths = mock.patch.object(ctl, "config_paths", return_value=[self.path]).start()
+        mock.patch.object(ctl, "service_controller_socket", return_value=None).start()
 
 
 class ScalarTest(unittest.TestCase):
@@ -192,6 +194,149 @@ class DiscoveryTest(ControllerFixture):
         targets, _ = ctl.discover_targets()
         self.assertEqual([(t.base, t.secret) for t in targets],
                          [(BASE, KEY), ("http://127.0.0.1:19098", "other-key")])
+
+
+@unittest.skipUnless(hasattr(os, "getuid") and hasattr(socket, "AF_UNIX"),
+                     "Unix socket fixtures unavailable")
+class ServiceSocketDiscoveryTest(ControllerFixture):
+    """macOS service IPC discovery must be bounded and owner-checked."""
+
+    def make_socket(self, name="verge-mihomo.sock"):
+        path = Path(self.tmp.name) / name
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        self.addCleanup(server.close)
+        self.addCleanup(lambda: path.exists() and path.unlink())
+        return path
+
+    def service_bases(self, targets):
+        return [t.base for t in targets if t.base.startswith("unix://")]
+
+    def test_default_root_discovers_current_user_service_socket(self):
+        service = self.make_socket()
+        with mock.patch.object(ctl, "service_controller_socket", return_value=service):
+            targets, warnings = ctl.discover_targets(platform="darwin")
+        pairs = [(t.base, t.secret) for t in targets]
+        self.assertIn(("unix://" + str(service), KEY), pairs)
+        self.assertIn((BASE, KEY), pairs)
+        self.assertEqual(pairs[-1], ("unix://" + str(service), KEY))
+        self.assertEqual(warnings, [])
+
+    def test_missing_service_socket_is_not_selected(self):
+        missing = Path(self.tmp.name) / "missing.sock"
+        with mock.patch.object(ctl, "service_controller_socket", return_value=missing):
+            targets, _ = ctl.discover_targets(platform="darwin")
+        self.assertEqual(self.service_bases(targets), [])
+
+    def test_ordinary_file_is_not_selected(self):
+        regular = Path(self.tmp.name) / "not-a-socket"
+        regular.write_text("fixture", encoding="utf-8")
+        with mock.patch.object(ctl, "service_controller_socket", return_value=regular):
+            targets, _ = ctl.discover_targets(platform="darwin")
+        self.assertEqual(self.service_bases(targets), [])
+
+    def test_symlink_is_not_selected(self):
+        real = self.make_socket("real.sock")
+        link = Path(self.tmp.name) / "linked.sock"
+        link.symlink_to(real)
+        with mock.patch.object(ctl, "service_controller_socket", return_value=link):
+            targets, _ = ctl.discover_targets(platform="darwin")
+        self.assertEqual(self.service_bases(targets), [])
+
+    def test_foreign_owner_is_not_selected(self):
+        service = self.make_socket()
+        with mock.patch.object(ctl, "service_controller_socket", return_value=service), \
+                mock.patch.object(ctl.os, "getuid", return_value=os.getuid() + 1):
+            targets, _ = ctl.discover_targets(platform="darwin")
+        self.assertEqual(self.service_bases(targets), [])
+
+    def test_custom_root_never_falls_back_to_service_socket(self):
+        service = self.make_socket()
+        with mock.patch.object(ctl, "service_controller_socket", return_value=service):
+            targets, _ = ctl.discover_targets(platform="darwin", config_root=self.tmp.name)
+        self.assertEqual(self.service_bases(targets), [])
+        self.assertEqual([t.base for t in targets], [BASE])
+
+    def test_environment_root_never_falls_back_to_service_socket(self):
+        service = self.make_socket()
+        with mock.patch.dict(os.environ, {ctl.ROOT_ENV: self.tmp.name}), \
+                mock.patch.object(ctl, "service_controller_socket", return_value=service):
+            targets, _ = ctl.discover_targets(platform="darwin")
+        self.assertEqual(self.service_bases(targets), [])
+        self.assertEqual([t.base for t in targets], [BASE])
+
+    def test_explicit_empty_root_is_auto_even_when_startup_environment_is_custom(self):
+        service = self.make_socket()
+        with mock.patch.dict(os.environ, {ctl.ROOT_ENV: self.tmp.name}), \
+                mock.patch.object(ctl, "service_controller_socket", return_value=service):
+            targets, _ = ctl.discover_targets(platform="darwin", config_root="")
+        self.assertIn("unix://" + str(service), self.service_bases(targets))
+
+    def test_web_auto_root_connection_uses_service_after_stale_declared_endpoint(self):
+        service = self.make_socket()
+        base = "unix://" + str(service)
+
+        def fake_get(api, path):
+            if api.controller_base != base:
+                raise csb.ApiError("fixture stale endpoint")
+            self.assertEqual((path, api.secret), ("/version", KEY))
+            return {"version": "fixture"}
+
+        with mock.patch.object(ctl.sys, "platform", "darwin"), \
+                mock.patch.object(ctl, "service_controller_socket", return_value=service), \
+                mock.patch.object(csb.MihomoAPI, "get", autospec=True, side_effect=fake_get):
+            api = csb.connect_controller(config_root="")
+        self.assertEqual(api.controller_base, base)
+
+    def test_only_macos_default_root_adds_service_socket(self):
+        service = self.make_socket()
+        with mock.patch.object(ctl, "service_controller_socket", return_value=service):
+            win, _ = ctl.discover_targets(platform="win32")
+            linux, _ = ctl.discover_targets(platform="linux")
+        self.assertFalse(any(t.base.startswith("unix://") for t in win))
+        self.assertEqual(self.service_bases(linux), [])
+
+    def test_declared_channels_keep_secret_pairing_alongside_service(self):
+        self.path.write_text(CFG + "external-controller-unix: /tmp/verge/stale.sock\n", encoding="utf-8")
+        service = self.make_socket()
+        with mock.patch.object(ctl, "service_controller_socket", return_value=service):
+            targets, warnings = ctl.discover_targets(platform="darwin")
+        pairs = [(t.base, t.secret) for t in targets]
+        self.assertIn(("unix:///tmp/verge/stale.sock", KEY), pairs)
+        self.assertIn(("unix://" + str(service), KEY), pairs)
+        self.assertIn((BASE, KEY), pairs)
+        self.assertEqual(warnings, [])
+
+    def test_explicit_service_endpoint_uses_bound_config_secret(self):
+        service = self.make_socket()
+        base = "unix://" + str(service)
+        discovered = [ctl.ControllerTarget(base, KEY, "verge_config")]
+        seen = []
+
+        def fake_get(api, path):
+            seen.append((api.controller_base, api.secret))
+            return {"version": "fixture"}
+
+        with mock.patch.object(ctl, "discover_targets", return_value=(discovered, [])), \
+                mock.patch.object(csb.MihomoAPI, "get", autospec=True, side_effect=fake_get):
+            api = csb.connect_controller(explicit=base)
+        self.assertEqual((api.controller_base, api.secret), (base, KEY))
+        self.assertEqual(seen, [(base, KEY)])
+
+    def test_manual_secret_keeps_priority_over_service_pairing(self):
+        service = self.make_socket()
+        base = "unix://" + str(service)
+        discovered = [ctl.ControllerTarget(base, KEY, "verge_config")]
+
+        def fake_get(api, path):
+            if api.secret != "manual-key":
+                raise csb.Unauthorized("needs manual key")
+            return {"version": "fixture"}
+
+        with mock.patch.object(ctl, "discover_targets", return_value=(discovered, [])), \
+                mock.patch.object(csb.MihomoAPI, "get", autospec=True, side_effect=fake_get):
+            api = csb.connect_controller(secret="manual-key")
+        self.assertEqual(api.secret, "manual-key")
 
 
 class ConnectionTest(ControllerFixture):
@@ -362,6 +507,7 @@ class WebControllerTest(WebServerCase):
         self.addCleanup(mock.patch.stopall)
         mock.patch.dict(os.environ, {}, clear=True).start()
         mock.patch.object(ctl, "config_paths", return_value=[self.path]).start()
+        mock.patch.object(ctl, "service_controller_socket", return_value=None).start()
         mock.patch.object(csb, "DEFAULT_CONTROLLERS", ()).start()
         self.select = mock.patch.object(csb.MihomoAPI, "select").start()
         mock.patch.object(csb.MihomoAPI, "get", autospec=True, side_effect=self.fake_get).start()

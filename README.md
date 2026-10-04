@@ -365,6 +365,11 @@ SpeedBench 的 CLI、Web 当前节点/切换和测速入口会自动读取本机
 - macOS：`~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/`
 - Linux：`$XDG_CONFIG_HOME/io.github.clash-verge-rev.clash-verge-rev/`，未设置时使用 `~/.config/`。
 
+在 macOS 默认目录下配置可读时，除配置声明的地址外，还会探测当前用户的 Clash Verge
+服务模式 IPC socket `/var/run/clash-verge-service/users/<当前 uid>/verge-mihomo.sock`
+（仅接受当前 uid 拥有的真实非符号链接 socket，使用同一配置文件的密钥）；显式或环境变量
+指定的自定义目录不会回退到该服务 socket。
+
 运行配置不存在时才回退同目录的 `config.yaml`；不能读取/不支持的格式会明确提示，
 仍保留旧版默认地址探测。便携版或自定义配置目录未被自动发现时，可以通过 CLI 的
 `--controller` 指定控制器，并用环境变量提供密钥；Web 仍支持默认地址与 `MIHOMO_SECRET` 回退。

@@ -1,8 +1,11 @@
 """Origin fixtures never contain real subscription URLs or node credentials."""
 import json
+import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from speedbench_sources import build_catalog, canonical_connection, read_catalog, SourceError
 
@@ -185,6 +188,58 @@ class CatalogFileTest(unittest.TestCase):
         self.write('clash-verge.yaml', json.dumps({'proxies':[proxy()]}))
         with mock.patch('speedbench_sources.MAX_BYTES', 512):
             self.assertEqual(read_catalog(self.root, seed=SEED)['status'], 'metadata_unavailable')
+
+
+@unittest.skipUnless(hasattr(os,'getuid') and hasattr(socket,'AF_UNIX'),'Unix sockets unavailable')
+class ServiceControllerCatalogTest(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);(self.root/'profiles').mkdir()
+        self.path=self.root/'clash-verge.yaml'
+        self.path.write_text(json.dumps({'external-controller-unix':'/tmp/fixture-stale.sock',
+            'secret':'CANARY-controller','proxies':[proxy()]}))
+        (self.root/'profiles.yaml').write_text(json.dumps({'items':[
+            dict(uid='fixture',name='fixture source',type='remote',file='a.yaml')]}))
+        (self.root/'profiles/a.yaml').write_text(json.dumps({'proxies':[proxy()]}))
+        self.service=self.root/'current-user.sock'
+        self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);self.sock.bind(str(self.service))
+        self.addCleanup(self.sock.close)
+        self.api=mock.Mock(controller_base='unix://'+str(self.service))
+        self.api.get.side_effect=lambda endpoint:dict(proxies={'节点':{'type':'Shadowsocks'}}) if endpoint=='/proxies' else dict(providers={})
+
+    def catalog(self,**options):
+        import speedbench_controller as ctl
+        from speedbench_sources import discover_catalog
+        with mock.patch.object(ctl.sys,'platform','darwin'), \
+                mock.patch.object(ctl,'config_paths',return_value=[self.path]), \
+                mock.patch.object(ctl,'service_controller_socket',return_value=self.service), \
+                mock.patch.dict(os.environ,{},clear=True):
+            return discover_catalog(self.api,self.root/'data',**options)
+
+    def test_owned_service_socket_binds_only_the_default_generated_config(self):
+        for options in ({},{'config_root':''},{'config_file':str(self.path)}):
+            with self.subTest(options=options):
+                cat=self.catalog(**options)
+                self.assertEqual(cat['status'],'ok');self.assertEqual(cat['nodes'][0]['source_status'],'verified')
+                self.assertNotIn('CANARY',json.dumps(cat))
+
+    def test_custom_root_or_different_explicit_file_cannot_borrow_service_catalog(self):
+        other=self.root/'other.yaml';other.write_text(self.path.read_text())
+        for options in ({'config_root':str(self.root)},{'config_file':str(other)}):
+            with self.subTest(options=options):
+                self.assertEqual(self.catalog(**options)['status'],'controller_config_mismatch')
+
+    def test_service_binding_still_requires_the_current_users_real_socket(self):
+        import speedbench_controller as ctl
+        with mock.patch.object(ctl.os,'getuid',return_value=os.getuid()+1):
+            self.assertEqual(self.catalog()['status'],'controller_config_mismatch')
+        original=self.service
+        self.service=self.root/'link.sock';self.service.symlink_to(original)
+        self.api.controller_base='unix://'+str(self.service)
+        self.assertEqual(self.catalog()['status'],'controller_config_mismatch')
+        self.service=self.root/'regular';self.service.write_text('fixture')
+        self.api.controller_base='unix://'+str(self.service)
+        self.assertEqual(self.catalog()['status'],'controller_config_mismatch')
 
 
 if __name__ == '__main__':
