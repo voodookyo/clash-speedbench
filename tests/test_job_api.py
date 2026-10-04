@@ -22,6 +22,18 @@ class JobApiTest(WebServerCase):
     def create(self):
         return web.JOBS.create(resolve_config({'mode':'quick'}))
 
+    def test_history_retains_target_scoring_inputs_without_private_metadata(self):
+        row={'name':'fixture','score':50,'jitter_ms':4,'multi_mbps':200,
+             'intel_v4':{'ip_quality_score':85,'classification':{'category':'corporate'},'raw':'CANARY'}}
+        web.HISTORY.write_text(json.dumps({'ts':'fixture','task':{'mode':'quick',
+            'target_profile':'download','secret':'CANARY'},'results':[row]})+'\n')
+        status,body=self.request('GET','/api/history');self.assertEqual(status,200)
+        record=json.loads(body)[0];self.assertEqual(record['task'],{'mode':'quick','target_profile':'download'})
+        self.assertEqual(record['results'][0]['jitter_ms'],4)
+        self.assertEqual(record['results'][0]['multi_mbps'],200)
+        self.assertEqual(record['results'][0]['intel_v4']['classification']['category'],'corporate')
+        self.assertNotIn(b'CANARY',body)
+
     def test_serial_task_requires_explicit_boolean_confirmation(self):
         for confirmation in (None,False,'true',1):
             params={'mode':'legacy','workers':1}

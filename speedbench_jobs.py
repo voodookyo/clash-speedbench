@@ -313,7 +313,8 @@ class JobStore:
         def positive(key):
             value=result.get(key)
             return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>0
-        if job['config'].get('mode')=='ip' or job['config'].get('target_profile') in ('ip','residential'):
+        if job['config'].get('target_profile')!='download' and (job['config'].get('mode')=='ip' or
+                job['config'].get('target_profile') in ('ip','residential')):
             quality=result.get('ip_quality_score')
             return (isinstance(quality,(int,float)) and not isinstance(quality,bool) and math.isfinite(quality)
                 and 0<=quality<=100 and result.get('ip_grade') in ('S','A','B','C','D'))

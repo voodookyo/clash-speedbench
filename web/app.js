@@ -76,255 +76,7 @@ const PROFILES = ['all','daily','download','ipclean','residential'];
 let currentProfile = lsGet('sb_profile');
 if(!PROFILES.includes(currentProfile)) currentProfile = 'all';
 
-// IP intelligence can contain one normalized object per address family.  Keep
-// the legacy ip-api object as a fallback only when no structured intelligence
-// is present; in particular, hosting=false alone must never become residential.
-function intelSourcesOf(r){
-  if(!r || typeof r!=='object') return [];
-  const sources = [], seen = new Set();
-  const add = value => {
-    if(!value || typeof value!=='object' || Array.isArray(value) || seen.has(value)) return;
-    if(!Object.keys(value).length) return;
-    seen.add(value); sources.push(value);
-  };
-  add(r.ip_intel); add(r.intel);
-  add(r.intel_v4); add(r.intel_v6);
-  if(r.ip && typeof r.ip==='object') add(r.ip.intel);
-  if(!sources.length && r.ip && typeof r.ip==='object') add(r.ip);
-  return sources;
-}
-
-function intelField(source, names){
-  if(!source || typeof source!=='object') return undefined;
-  const keys = Array.isArray(names) ? names : [names];
-  const nested = [source.ipqs, source.scamalytics, source.ipinfo, source.privacy];
-  for(const key of keys){
-    if(source[key]!==undefined && source[key]!==null && source[key]!=='') return source[key];
-    for(const obj of nested){
-      if(obj && typeof obj==='object' && obj[key]!==undefined && obj[key]!==null && obj[key]!=='')
-        return obj[key];
-    }
-  }
-  return undefined;
-}
-
-function intelNumber(source, names){
-  const value = intelField(source, names);
-  if(value===undefined || value===null || value==='') return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function intelBoolean(source, names){
-  if(!source || typeof source!=='object') return null;
-  const keys = Array.isArray(names) ? names : [names];
-  const nested = [source.ipqs, source.scamalytics, source.ipinfo, source.privacy];
-  let sawFalse = false;
-  const parse = value => {
-    if(value===undefined || value===null || value==='') return null;
-    if(typeof value==='boolean') return value;
-    if(typeof value==='number') return value!==0;
-    if(typeof value==='string'){
-      if(/^true$/i.test(value)) return true;
-      if(/^false$/i.test(value)) return false;
-    }
-    return null;
-  };
-  for(const key of keys){
-    for(const value of [source[key], ...nested.map(obj=>obj && obj[key])]){
-      const parsed = parse(value);
-      if(parsed===true) return true;
-      if(parsed===false) sawFalse = true;
-    }
-  }
-  return sawFalse ? false : null;
-}
-
-function profileRootNumber(r, source, names){
-  const direct = intelNumber(source, names);
-  if(direct!==null) return direct;
-  const aggregate = intelOf(r);
-  const fromAggregate = aggregate && aggregate!==source ? intelNumber(aggregate, names) : null;
-  if(fromAggregate!==null) return fromAggregate;
-  return intelNumber(r, names);
-}
-
-function profileRootGrade(r, source){
-  const direct = intelField(source, ['ip_grade','grade']);
-  if(direct!==undefined) return String(direct).toUpperCase();
-  const aggregate = intelOf(r);
-  const fromAggregate = aggregate && aggregate!==source ? intelField(aggregate, ['ip_grade','grade']) : undefined;
-  if(fromAggregate!==undefined) return String(fromAggregate).toUpperCase();
-  const root = intelField(r, ['ip_grade','grade']);
-  return root===undefined ? '' : String(root).toUpperCase();
-}
-
-const IP_GRADE_SCORE = {S:95, A:85, B:70, C:50, D:20};
-const IP_CATEGORY_RANK = {
-  residential: 7,
-  corporate: 6,
-  mobile: 5.5,
-  residential_proxy: 5,
-  datacenter: 3.5,
-  vpn_proxy: 2,
-  unknown: 0,
-};
-
-function profileRiskScore(r, source){
-  let score = 100, observed = false;
-  const quality = profileRootNumber(r, source, ['ip_quality_score','quality_score']);
-  if(quality!==null){ score=Math.min(score, clamp(quality,0,100)); observed=true; }
-  const grade = IP_GRADE_SCORE[profileRootGrade(r, source)];
-  if(grade!==undefined){ score=Math.min(score, grade); observed=true; }
-
-  const ipqsFraud = intelNumber(source, ['ipqs_fraud_score']);
-  const genericFraud = ipqsFraud===null ? intelNumber(source, ['fraud_score']) : ipqsFraud;
-  if(genericFraud!==null){ score=Math.min(score, 100-clamp(genericFraud,0,100)); observed=true; }
-  const scamFraud = intelNumber(source, ['scamalytics_score','scamalytics_fraud_score']);
-  if(scamFraud!==null){ score=Math.min(score, 100-clamp(scamFraud,0,100)); observed=true; }
-
-  const proxy = intelBoolean(source, ['proxy','is_proxy']);
-  const vpn = intelBoolean(source, ['vpn','is_vpn']);
-  const tor = intelBoolean(source, ['tor','is_tor']);
-  const hosting = intelBoolean(source, ['hosting','is_hosting']);
-  const mobile = intelBoolean(source, ['mobile','is_mobile']);
-  const residentialProxy = intelBoolean(source, ['residential_proxy','is_residential_proxy','is_res_proxy']);
-  const recentAbuse = intelBoolean(source, ['ipqs_recent_abuse','recent_abuse']);
-  const blacklisted = intelBoolean(source, ['scamalytics_blacklisted','blacklisted','is_blacklisted_external']);
-  const datacenter = intelBoolean(source, ['scamalytics_datacenter','datacenter','is_datacenter']);
-  for(const value of [proxy,vpn,tor,hosting,mobile,residentialProxy,recentAbuse,blacklisted,datacenter])
-    if(value!==null) observed=true;
-  if(tor===true) score=Math.min(score,10);
-  if(vpn===true) score=Math.min(score,20);
-  if(proxy===true) score=Math.min(score,25);
-  if(blacklisted===true) score=Math.min(score,20);
-  if(recentAbuse===true) score=Math.min(score,30);
-  if(hosting===true || datacenter===true) score=Math.min(score,45);
-  if(residentialProxy===true) score=Math.min(score,55);
-  if(mobile===true) score=Math.min(score,75);
-
-  const connection = intelField(source, ['connection_type']);
-  if(connection!==undefined){
-    observed=true;
-    if(/data.?center|hosting|server/i.test(String(connection))) score=Math.min(score,45);
-    else if(/mobile|cellular/i.test(String(connection))) score=Math.min(score,75);
-  }
-  const risk = intelField(source, ['scamalytics_risk','risk']);
-  if(risk!==undefined){
-    observed=true;
-    if(/very.?high|high|danger|severe/i.test(String(risk))) score=Math.min(score,35);
-  }
-
-  const cls = String(classificationOf(r, source) || 'unknown').toLowerCase();
-  const classification = source && source.classification && typeof source.classification==='object'
-    ? source.classification : {};
-  const confidenceValue = intelNumber(source, ['confidence']) ?? intelNumber(classification, ['confidence']);
-  if(confidenceValue!==null){
-    observed=true;
-    score=Math.min(score, clamp(confidenceValue,0,100));
-  }
-  if(cls==='unknown' || !cls) score=Math.min(score,35);
-  if(Array.isArray(classification.conflicts) && classification.conflicts.length) score=Math.min(score,35);
-  if(!observed) return 20;  // structured-but-empty/unknown is not a clean IP
-  return Math.round(clamp(score,0,100)*10)/10;
-}
-
-function legacyIpCleanProfileScore(r){
-  const ip = r && r.ip;
-  if(!ip || !ip.ok) return null;
-  if(ip.proxy) return 20;
-  if(ip.hosting) return 50;
-  if(ip.mobile) return 75;
-  // ip-api's all-false result only means that it did not observe a negative
-  // flag.  It is not enough evidence for a clean/reputable IP, so keep this
-  // legacy fallback explicitly below a full score until structured
-  // intelligence is available.
-  return 60;
-}
-
-function ipCleanProfileScore(r){
-  const sources = intelSourcesOf(r);
-  if(!sources.length) return null;
-  const structured = !!(r && (r.ip_intel || r.intel || r.intel_v4 || r.intel_v6 || (r.ip && r.ip.intel)));
-  if(!structured) return legacyIpCleanProfileScore(r);
-  const values = sources.map(source=>profileRiskScore(r, source)).filter(value=>value!==null);
-  return values.length ? Math.min(...values) : 0;
-}
-
-function legacyResidentialProfileScore(r){
-  const ip = r && r.ip;
-  if(!ip || !ip.ok) return null;
-  if(ip.proxy) return 120;
-  if(ip.hosting) return 350 + 45;
-  if(ip.mobile) return 550 + 75;
-  const kind = normKind(ip);
-  // ISP/非托管 is deliberately below structured corporate/consumer evidence:
-  // it is a useful legacy hint, not proof of residential access.
-  if(kind==='ISP/非托管') return 450 + 50;
-  if(kind==='机房托管') return 350 + 45;
-  if(kind==='代理/VPN') return 200 + 20;
-  return 0;
-}
-
-function residentialSourceScore(r, source){
-  const cls = String(classificationOf(r, source) || 'unknown').toLowerCase();
-  const clean = profileRiskScore(r, source);
-  const category = source && source.classification && typeof source.classification==='object'
-    ? source.classification : {};
-  const confidence = intelNumber(source, ['confidence']) ?? intelNumber(category, ['confidence']);
-  const ipqsFraud = intelNumber(source, ['ipqs_fraud_score','fraud_score']);
-  const scamFraud = intelNumber(source, ['scamalytics_score','scamalytics_fraud_score']);
-  const explicitRisk = intelBoolean(source, ['proxy','vpn','tor','ipqs_recent_abuse','recent_abuse',
-                                              'scamalytics_blacklisted','blacklisted'])===true;
-  const highRisk = (cls!=='unknown' && clean!==null && clean<40) ||
-    ipqsFraud!==null && ipqsFraud>=75 || scamFraud!==null && scamFraud>=75 ||
-    explicitRisk;
-  // A high-risk/abuse signal is intentionally below even a clean VPN result.
-  if(highRisk) return 100 + (clean===null ? 0 : clean);
-  let rank = IP_CATEGORY_RANK[cls] || 0;
-  if(cls==='residential') rank = confidence!==null && confidence>=80 ? 7 : 5.8;
-  const suffix = clean===null ? 0 : clean;
-  return rank*100 + suffix;
-}
-
-function residentialProfileScore(r){
-  const sources = intelSourcesOf(r);
-  if(!sources.length) return null;
-  const structured = !!(r && (r.ip_intel || r.intel || r.intel_v4 || r.intel_v6 || (r.ip && r.ip.intel)));
-  if(!structured) return legacyResidentialProfileScore(r);
-  // Use the least favorable address family so a datacenter/abuse IPv6 cannot
-  // silently hide behind a clean IPv4 result.
-  return Math.min(...sources.map(source=>residentialSourceScore(r, source)));
-}
-
-// 各 Profile 的评分公式；返回 null 表示"不通/无数据"，排序时统一沉底
-function profileScore(r){
-  switch(currentProfile){
-    case 'daily': {  // ⚡日常 = 0.5×latScore + 0.3×jitterScore + 0.2×bwScore
-      if(r.latency_ms==null) return null;
-      const lat = 100*clamp((800-r.latency_ms)/(800-80), 0, 1);   // ≤80ms→100，≥800ms→0
-      // 老数据没有 jitter 字段时按中性 50 计，不至于整行沉底
-      const jit = r.jitter_ms==null ? 50
-                  : 100*clamp((200-r.jitter_ms)/(200-10), 0, 1);  // ≤10ms→100，≥200ms→0
-      const bw  = Math.min(r.median_mbps||0, 100);                // min(mbps,100)
-      return 0.5*lat + 0.3*jit + 0.2*bw;
-    }
-    case 'download': {  // 🚀下载 = 0.7×bwScore + 0.3×multiScore
-      if(r.median_mbps==null) return null;
-      const bw = Math.min(r.median_mbps,300)/300*100;             // 300M 封顶
-      const multi = r.multi_mbps ?? r.median_mbps;                // multi 缺失用 median 兜底
-      const ms = Math.min(multi,500)/500*100;                     // 500M 封顶
-      return 0.7*bw + 0.3*ms;
-    }
-    case 'ipclean': {  // 🧼IP = 出口 IP 属性分，取最差标记
-      return ipCleanProfileScore(r);
-    }
-    case 'residential': {  // 🏠住宅优先：多源分类/Grade，未知永远沉底
-      return residentialProfileScore(r);
-    }
-    default: return r.score;  // 综合推荐：后端分数原样
-  }
-}
+function profileScore(r){ return SBProfiles.score(r,currentProfile); }
 
 // 切换评分 Profile：存 localStorage、高亮选中按钮、自动按新 Profile 分数降序
 function setProfile(p){
@@ -360,12 +112,6 @@ function tagHtml(tags){
 }
 
 // 旧历史记录的 kind 取值（住宅/机房/移动）映射到新口径，保证老数据不崩
-const KIND_ALIAS = {'住宅':'ISP/非托管','住宅IP':'ISP/非托管','机房':'机房托管','移动':'移动网络'};
-function normKind(ip){
-  const k = (ip && ip.kind) || '';
-  return KIND_ALIAS[k] || k || '未知';
-}
-
 const INTEL_KIND_LABEL = {
   residential: '住宅 ISP',
   residential_proxy: 'ISP住宅代理',
@@ -375,30 +121,9 @@ const INTEL_KIND_LABEL = {
   vpn_proxy: '代理/VPN',
   unknown: '未知',
 };
-function intelOf(r, preferred){
-  if(preferred && typeof preferred==='object') return preferred;
-  if(!r) return {};
-  const direct = r.ip_intel || r.intel || (r.ip && r.ip.intel);
-  if(direct && typeof direct==='object' && Object.keys(direct).length) return direct;
-  // The serialized Result model keeps one full intelligence object per
-  // address family.  Prefer IPv4 for the compact row, while carrying the
-  // result-level grade/score into the detail renderer.
-  const family = r.intel_v4 || r.intel_v6;
-  if(family){
-    return Object.assign({}, family, {
-      ip_quality_score: r.ip_quality_score ?? family.ip_quality_score,
-      ip_grade: r.ip_grade || family.ip_grade,
-      exit_ipv4: r.exit_ipv4 || family.ip,
-      exit_ipv6: r.exit_ipv6 || (r.intel_v6 && r.intel_v6.ip),
-    });
-  }
-  return (r.ip && typeof r.ip==='object') ? r.ip : {};
-}
-function classificationOf(r, preferred){
-  const x = intelOf(r, preferred);
-  const c = x.classification;
-  return (c && typeof c === 'object' ? c.category : c) || x.category || '';
-}
+function normKind(ip){ return SBProfiles.normKind(ip); }
+function intelOf(r,preferred){ return SBProfiles.intelOf(r,preferred); }
+function classificationOf(r,preferred){ return SBProfiles.classificationOf(r,preferred); }
 function classificationLabel(r){
   const x = intelOf(r), c = classificationOf(r);
   const confidence = x.confidence ?? (x.classification && x.classification.confidence);
@@ -491,6 +216,7 @@ function sortVal(r, k){
 // 通用排序：null（不通/无数据）永远沉底
 function sortRows(rows, key, asc){
   rows.sort((a,b)=>{
+    if(key==='score')return SBProfiles.compare(a,b,currentProfile,asc);
     const va=sortVal(a,key), vb=sortVal(b,key);
     if(va==null && vb==null) return 0;
     if(va==null) return 1;
@@ -720,8 +446,8 @@ function renderBoard(){
   if(!latestData || !latestData.results || !latestData.results.length){ bd.style.display='none'; return; }
   let html = '';
   const favRows = latestData.results.filter(r=>r.node_id?favIds.has(r.node_id):favs.has(r.name))
-    .map(r=>({name:r.name, node_id:r.node_id, sc:profileScore(r), mbps:r.median_mbps}))
-    .sort((a,b)=>(b.sc??-1)-(a.sc??-1));
+    .sort((a,b)=>SBProfiles.compare(a,b,currentProfile))
+    .map(r=>({name:r.name, node_id:r.node_id, sc:profileScore(r), mbps:r.median_mbps}));
   if(favRows.length)
     html += `<div class="board-group"><span class="board-code">⭐ 收藏</span>${favRows.map(boardItem).join('')}</div>`;
   const groups = {};
@@ -730,14 +456,14 @@ function renderBoard(){
     if(sc==null) continue;
     const code = regionOf(r);
     if(!groups[code]) groups[code] = [];
-    groups[code].push({name:r.name, node_id:r.node_id, sc, mbps:r.median_mbps});
+    groups[code].push({...r,sc,mbps:r.median_mbps});
   }
   const codes = Object.keys(groups).sort((a,b)=>{
     const top = c=>Math.max(...groups[c].map(x=>x.sc));
     return top(b)-top(a) || a.localeCompare(b);
   });
   for(const c of codes){
-    const top3 = groups[c].sort((a,b)=>b.sc-a.sc).slice(0,3);
+    const top3 = groups[c].sort((a,b)=>SBProfiles.compare(a,b,currentProfile)).slice(0,3);
     html += `<div class="board-group"><span class="board-code">${esc(c)}</span>${top3.map(boardItem).join('')}</div>`;
   }
   if(!html){ bd.style.display='none'; return; }
@@ -755,8 +481,13 @@ let histSelNode = null, histSelNodeId = '';
 // name 不符时回退 histData
 let nodeTrend = null;
 
-// 一轮测速的冠军：后端综合评分最高者（null 跳过）
+// 新轮次按保存的使用目标及测量覆盖推荐；旧轮次保留综合评分口径。
 function championOf(rec){
+  if(rec.task || (rec.results||[]).some(r=>r.measurement_scope?.mode)){
+    const profile=rec.task?.target_profile||'balanced';
+    return (rec.results||[]).filter(r=>SBProfiles.score(r,profile)!=null)
+      .sort((a,b)=>SBProfiles.compare(a,b,profile))[0]||null;
+  }
   let best = null;
   for(const r of (rec.results||[])){
     if(r.score==null) continue;
@@ -1710,10 +1441,10 @@ async function startTask(){
     const count=body.node_ids.length;
     const scope=document.getElementById('f-source').selectedOptions?.[0]?.textContent||'所选来源';
     await loadCurrent();
-    const text=`改用兼容串行？将对 ${scope} 的最多 ${count} 个已选节点逐个全测${include?'（名称过滤仍生效）':''}，期间临时切 GLOBAL 并调整沿途策略组，会影响当前活动连接。当前：${currentGroup||'尚未确认策略组'} = ${currentNode||'尚未确认节点'}。确认范围已固定，目录变化时会重新核验；结束或取消后尝试恢复原模式和选择，清理失败会明确报告。${body.auto_switch?'另允许结束后切换到综合评分冠军。':''}`;
+    const text=`改用兼容串行？将对 ${scope} 的最多 ${count} 个已选节点逐个全测${include?'（名称过滤仍生效）':''}，期间临时切 GLOBAL 并调整沿途策略组，会影响当前活动连接。当前：${currentGroup||'尚未确认策略组'} = ${currentNode||'尚未确认节点'}。确认范围已固定，目录变化时会重新核验；结束或取消后尝试恢复原模式和选择，清理失败会明确报告。${body.auto_switch?'另允许结束后按本次使用目标切换到已测范围内冠军。':''}`;
     confirmModal(text,()=>{body.allow_serial=true;dispatchTask(body);});
   }else if(body.auto_switch){
-    confirmModal('测速完成后自动切换当前策略组到已测范围内冠军？此操作会改变当前活动节点。',()=>dispatchTask(body));
+    confirmModal('测速完成后按本次使用目标自动切换当前策略组到已测范围内冠军？此操作会改变当前活动节点。',()=>dispatchTask(body));
   }else await dispatchTask(body);
 }
 async function dispatchTask(body){

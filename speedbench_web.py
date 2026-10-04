@@ -65,6 +65,7 @@ STATIC_FILES = {
     '/static/config-root.js': ('config-root.js','application/javascript; charset=utf-8'),
     '/static/releases.js': ('releases.js','application/javascript; charset=utf-8'),
     '/static/preferences.js': ('preferences.js','application/javascript; charset=utf-8'),
+    '/static/profiles.js': ('profiles.js','application/javascript; charset=utf-8'),
     '/static/view.js': ('view.js','application/javascript; charset=utf-8'),
     '/static/tasks.js': ('tasks.js','application/javascript; charset=utf-8'),
     "/static/app.js": ("app.js", "application/javascript; charset=utf-8"),
@@ -368,6 +369,10 @@ def slim_history() -> list:
     for rec in speedbench_db.all_runs(db_path()):
         out.append({
             "ts": rec.get("ts", ""),
+            **({'task':{k:v for k,v in rec['task'].items() if
+                k=='mode' and v in speedbench_tasks.MODES or
+                k=='target_profile' and v in speedbench_tasks.PROFILES}}
+               if isinstance(rec.get('task'),dict) else {}),
             "results": [
                 {
                     "name": r.get("name"),
@@ -378,7 +383,9 @@ def slim_history() -> list:
                     **speedbench_sources.result_origin(r),
                     **{k:v for k,v in safe_job_result(r).items() if k in (
                         'network_score','probe_attempts','probe_successes','probe_failures',
-                        'probe_loss_pct','measurement_scope','exit_status','ip_grade','ip_quality_score')},
+                        'probe_loss_pct','measurement_scope','exit_status','ip_grade','ip_quality_score')+
+                        (('jitter_ms','multi_mbps','intel_v4','intel_v6','ip') if
+                         isinstance(rec.get('task'),dict) or r.get('measurement_scope') else ())},
                 }
                 for r in rec.get("results", [])
             ],

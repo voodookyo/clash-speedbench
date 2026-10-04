@@ -48,6 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import speedbench_controller as controller_config
 import speedbench_sources as source_catalog
 import speedbench_tasks
+import speedbench_profiles
 from speedbench_process import run_cancellable, cancellation_scope, current_cancellation, SocketCancellation, connect_socket
 from speedbench_progress import ProgressEmitter, DownloadCounter, ProbeObserver, phase, publish_result, measure, emit_metric, milestone
 from speedbench_jobs import safe_probe_sources
@@ -1676,7 +1677,12 @@ def clip_disp(s: str, width: int) -> str:
     return "".join(out) + "…"
 
 
-def rank_results(results: List[Result]) -> List[Result]:
+def rank_results(results: List[Result], target_profile='balanced') -> List[Result]:
+    if target_profile!='balanced' or any((r.measurement_scope or {}).get('mode') in
+                                        ('quick','standard','deep','ip') for r in results):
+        pairs=[(result_to_dict(r),r) for r in results]
+        by_identity={id(row):r for row,r in pairs}
+        return [by_identity[id(row)] for row in speedbench_profiles.rank([row for row,_ in pairs],target_profile)]
     def coverage(r):
         scope = r.measurement_scope or {}
         if scope.get('mode') in ('quick','standard','deep'):
@@ -1688,12 +1694,13 @@ def rank_results(results: List[Result]) -> List[Result]:
     )
 
 
-def print_speedbench(results: List[Result], top: int) -> None:
-    ranked = rank_results(results)
+def print_speedbench(results: List[Result], top: int, target_profile='balanced') -> None:
+    ranked = rank_results(results,target_profile=target_profile)
     shown = ranked[:top] if top > 0 else ranked
 
     headers = ["节点", "延迟", "抖动", "建连", "带宽", "Network", "Overall",
                "IP Grade", "IP画像", "应用层失败率", "标签"]
+    if target_profile!='balanced':headers.append('目标分')
 
     def row_of(r: Result) -> List[str]:
         ip_desc = ip_brief(r.ip) if r.ip and r.ip.ok else "-"
@@ -1718,6 +1725,10 @@ def print_speedbench(results: List[Result], top: int) -> None:
         ]
 
     rows = [row_of(r) for r in shown]
+    if target_profile!='balanced':
+        for row,result in zip(rows,shown):
+            value=speedbench_profiles.score(result_to_dict(result),target_profile)
+            row.append('-' if value is None else f'{value:.1f}')
     n = len(headers)
     widths = [disp_width(h) for h in headers]
     for row in rows:
@@ -1744,24 +1755,26 @@ def print_speedbench(results: List[Result], top: int) -> None:
     print("  延迟/抖动/建连单位 ms │ 带宽 = 单流 Mbps（/ 后为 --multi 4 路合计峰值） │ 应用层失败率 = HTTP/HTTPS application-level probe failure rate（非 ICMP packet loss）")
 
 
-def write_csv(results: List[Result], path: Path) -> None:
-    ranked = rank_results(results)
+def write_csv(results: List[Result], path: Path, target_profile='balanced') -> None:
+    ranked = rank_results(results,target_profile=target_profile)
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["rank", "name", "provider", "protocol", "latency_ms", "jitter_ms",
+        headers=["rank", "name", "provider", "protocol", "latency_ms", "jitter_ms",
                     "connect_ms", "median_mbps", "multi_mbps", "best_mbps", "sample_mb",
                     "all_samples_mbps", "network_score", "ip_quality_score", "ip_grade",
                     "score", "stars", "tags", "probe_attempts", "probe_successes",
                     "probe_failures", "probe_success_rate", "probe_loss_pct",
                     "exit_ipv4", "exit_ipv6",
                     "exit_ip", "country", "asn", "asname", "isp", "org",
-                    "ip_kind", "ip_flags", "status"])
+                    "ip_kind", "ip_flags", "status"]
+        if target_profile!='balanced':headers+=['target_profile','target_score']
+        w.writerow(headers)
         for rank, r in enumerate(ranked, 1):
             ip = r.ip if r.ip and r.ip.ok else IpInfo()
             ip_flags = "|".join(f for f, on in (("proxy", ip.proxy),
                                                 ("hosting", ip.hosting),
                                                 ("mobile", ip.mobile)) if on)
-            w.writerow([
+            values=[
                 rank,
                 r.name,
                 r.provider,
@@ -1790,7 +1803,9 @@ def write_csv(results: List[Result], path: Path) -> None:
                 ip.exit_ip, ip.country, ip.asn, ip.asname, ip.isp, ip.org,
                 ip.kind, ip_flags,
                 r.status,
-            ])
+            ]
+            if target_profile!='balanced':values+=[target_profile,speedbench_profiles.score(result_to_dict(r),target_profile)]
+            w.writerow(values)
 
 
 def node_key_of(proto: str, server: str, port, name: str) -> str:
@@ -1883,7 +1898,7 @@ def append_history(results: List[Result], path: Path, mb: Optional[int], rounds:
         "mb": mb,
         "rounds": rounds,
         "csv": str(csv_path) if csv_path else "",
-        "results": [result_to_dict(r) for r in rank_results(results)],
+        "results": [result_to_dict(r) for r in rank_results(results,target_profile=(task or {}).get('target_profile','balanced'))],
     }
     if task:
         # Opt-in task metadata; old CLI/history consumers keep their exact
@@ -1940,7 +1955,7 @@ def _save_partial_report(args,status):
     out=Path(args.output) if args.output else Path(
         f"clash-speedtest-{datetime.now().strftime('%Y%m%d-%H%M%S')}-partial.csv")
     csv_path=None
-    try:write_csv(results,out);csv_path=out
+    try:write_csv(results,out,target_profile=args.target_profile);csv_path=out
     except (OSError,KeyboardInterrupt):
         print('部分 CSV 未完整保存；仍尝试保留 JSONL 历史。',file=sys.stderr)
     task=dict(mode=args.mode or 'legacy',target_profile=args.target_profile,partial=True,status=status)
@@ -1950,7 +1965,7 @@ def _save_partial_report(args,status):
     try:
         retention='已保留' if csv_path is not None or getattr(args,'_history_saved',False) else '仅内存中存在，未持久化'
         print(f'任务 {status}，{len(results)} 个节点的部分结果{retention}；未完成指标不代表网络不可达。')
-        print_speedbench(results,args.top)
+        print_speedbench(results,args.top,target_profile=args.target_profile)
         if csv_path is not None:print(f'部分 CSV 已保存: {csv_path.resolve()}')
     except (OSError,ValueError):pass # Closed console cannot undo committed history.
 
@@ -1969,23 +1984,47 @@ def pick_switch_group(proxies: Dict[str, dict], graph: Dict[str, List[str]],
 
 def auto_switch_best(api: MihomoAPI, proxies: Dict[str, dict],
                      graph: Dict[str, List[str]], root: str,
-                     results: List[Result], group_override: str = "") -> None:
-    ranked = rank_results(results)
+                     results: List[Result], group_override: str = "", target_profile='balanced',
+                     data_home=None, config_file='') -> None:
+    eligible=results
+    if target_profile in ('ip','residential'):
+        eligible=[r for r in results if isinstance(r.ip_quality_score,(int,float)) and
+            not isinstance(r.ip_quality_score,bool) and math.isfinite(r.ip_quality_score) and
+            0<=r.ip_quality_score<=100 and r.ip_grade in ('S','A','B','C','D')]
+    ranked = rank_results(eligible,target_profile=target_profile)
     best = ranked[0] if ranked else None
-    if not best or best.score <= 0:
+    value=speedbench_profiles.score(result_to_dict(best),target_profile) if best else None
+    if value is None or value<=0:
         print("自动切换：没有测出有效节点，保持当前选择。")
         return
-    group = group_override or pick_switch_group(proxies, graph, best.name, root)
+    best_name=best.name
+    if data_home is not None:
+        origin=best.origin or {}
+        if origin.get('identity_strength')!='strong' or not origin.get('node_id'):
+            print('自动切换：冠军身份不可核验，请刷新目录后手动选择。');return
+        try:
+            proxies=api.get('/proxies').get('proxies',{})
+            catalog=source_catalog.discover_catalog(api,data_home,config_file=config_file,snapshot=proxies)
+            matches=[n for n in catalog['nodes'] if n.get('node_id')==origin['node_id'] and
+                     n.get('identity_strength')=='strong']
+            if len(matches)!=1 or matches[0]['runtime_name'] not in proxies:
+                print('自动切换：节点身份或来源已改变，请刷新目录后重新确认。');return
+            best_name=matches[0]['runtime_name'];graph=build_selectable_graph(proxies)
+        except Exception:
+            print('自动切换：无法重新核验节点和策略组，保持当前选择。');return
+    group = group_override or pick_switch_group(proxies, graph, best_name, root)
     if not group:
-        print(f"自动切换：找不到包含 {best.name!r} 的 Selector 组，可用 --switch-group 指定。")
+        print(f"自动切换：找不到包含 {best_name!r} 的 Selector 组，可用 --switch-group 指定。")
         return
+    if data_home is not None and (proxies.get(group,{}).get('type')!='Selector' or best_name not in graph.get(group,[])):
+        print('自动切换：策略组已失效或不包含冠军，请重新确认。');return
     try:
         current = proxies.get(group, {}).get("now")
-        if current == best.name:
-            print(f"自动切换：{group} 已是 {best.name}，无需变更。")
+        if current == best_name:
+            print(f"自动切换：{group} 已是 {best_name}，无需变更。")
             return
-        api.select(group, best.name)
-        print(f"✅ 自动切换：{group} → {best.name}"
+        api.select(group, best_name)
+        print(f"✅ 自动切换：{group} → {best_name}"
               f"（{fmt_speed(best.median_mbps)} Mbps / {fmt_ms(best.latency_ms)} ms / {star_str(best.score)}）")
     except Exception as e:
         print(f"⚠️ 自动切换失败: {e}", file=sys.stderr)
@@ -2009,13 +2048,16 @@ def _report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict
     summary = getattr(args, "mode_summary", "")
     if summary:
         print(f"\n本次模式: {summary}")
-    print_speedbench(results, args.top)
+    target_profile=getattr(args,'target_profile','balanced')
+    print_speedbench(results, args.top,target_profile=target_profile)
     out = Path(args.output) if args.output else Path(
         f"clash-speedtest-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
     )
-    write_csv(results, out)
+    write_csv(results, out,target_profile=target_profile)
     print(f"\nCSV 已保存: {out.resolve()}")
-    if getattr(args,'mode',None) in ('quick','standard','deep'):
+    if target_profile!='balanced':
+        print(f'排序规则：按 {target_profile} 使用目标推荐，优先相同网络覆盖；Overall 与原始指标保持原值。仅推荐已测范围。')
+    elif getattr(args,'mode',None) in ('quick','standard','deep'):
         print('排序规则：优先已完成带宽精测的覆盖范围，再按 Overall 排序；未知 IP 不加分。')
     else:
         print("排序规则：按 Overall（Network + 可用 IP Quality，未知 IP 不加分）从高到低。")
@@ -2024,7 +2066,7 @@ def _report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict
     if not args.no_history:
         task = None
         partial=bool(getattr(args,'cancelled',False) or cancel_requested())
-        if getattr(args,'progress',None) is not None or getattr(args,'mode',None) or partial:
+        if getattr(args,'progress',None) is not None or getattr(args,'mode',None) or partial or target_profile!='balanced':
             task = dict(mode=getattr(args,'mode',None) or 'legacy',
                         target_profile=getattr(args,'target_profile','balanced'),
                         partial=partial,status='cancelled' if partial else 'completed')
@@ -2033,7 +2075,12 @@ def _report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict
         args._history_saved=append_history(results, Path(args.history), args.mb, args.rounds, out,task=task)
     if args.auto_switch and not getattr(args,'cancelled',False) and not cancel_requested():
         graph = build_selectable_graph(proxies)
-        auto_switch_best(api, proxies, graph, args.root_group, results, args.switch_group)
+        strict=bool(getattr(args,'mode',None) or getattr(args,'backend_child',False))
+        with cancellation_scope(cancel_requested):
+            auto_switch_best(api, proxies, graph, args.root_group, results, args.switch_group,
+                target_profile=target_profile,
+                data_home=(os.environ.get('SPEEDBENCH_HOME') or str(Path(args.history).resolve().parent)) if strict else None,
+                config_file=getattr(args,'config_file',''))
     return 130 if getattr(args,'cancelled',False) or cancel_requested() else 0
 
 

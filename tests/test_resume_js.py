@@ -96,6 +96,8 @@ async function fetch(url){
 }
 """
 
+STUB_JS = 'const SBProfiles=require('+json.dumps(str(APP_JS.parent/'profiles.js'))+');\n'+STUB_JS
+
 # 与页面脚本同一词法作用域：boot() 的 resumeRun/loadLatest 都是异步，
 # 先用真 setTimeout 让微任务链跑完，再读 stub 状态
 DRIVER_JS = r"""

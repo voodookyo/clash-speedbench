@@ -11,6 +11,30 @@ MODULE = Path(__file__).resolve().parents[1]/'web'/'tasks.js'
 
 @unittest.skipUnless(NODE,'Node unavailable')
 class TaskUiJsTest(unittest.TestCase):
+    def test_table_and_region_recommendations_prefer_measured_coverage(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));currentProfile='daily';
+            const rows=[{name:'only-probe',latency_ms:1,jitter_ms:1,score:100,
+              measurement_scope:{mode:'quick',bandwidth:'not_selected'}},
+              {name:'measured',latency_ms:150,jitter_ms:50,median_mbps:10,score:30,
+              measurement_scope:{mode:'quick',bandwidth:'completed'}}];
+            latestData={results:rows};sortRows(rows,'score',false);renderBoard();
+            const desc=rows.map(r=>r.name);sortRows(rows,'score',true);
+            console.log(JSON.stringify({order:desc,asc:rows.map(r=>r.name),board:__el('board-body').innerHTML}));})();
+        """)
+        self.assertEqual(out['order'],['measured','only-probe'])
+        self.assertEqual(out['asc'],['measured','only-probe'])
+        self.assertLess(out['board'].index('measured'),out['board'].index('only-probe'))
+
+    def test_history_champion_uses_saved_target_and_keeps_legacy_overall(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));const rows=[
+            {name:'overall',score:90,median_mbps:10},{name:'download',score:40,median_mbps:180}];
+            console.log(JSON.stringify({legacy:championOf({results:rows}).name,
+              saved:championOf({results:rows,task:{target_profile:'download'}}).name}));})();
+        """)
+        self.assertEqual(out,{'legacy':'overall','saved':'download'})
+
     def test_serial_choice_waits_for_every_explicit_confirmation(self):
         out=self.run_app("""
           (async()=>{await new Promise(r=>setTimeout(r,0));
