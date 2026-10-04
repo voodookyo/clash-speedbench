@@ -6,6 +6,7 @@ when connected to the benchmark runner, rather than infer progress from logs.
 """
 import json
 import math
+import ipaddress
 import secrets
 import threading
 import time
@@ -56,6 +57,80 @@ def safe_milestones(value):
     if not isinstance(value,dict):return {}
     return {k:v for k,v in value.items() if k in MILESTONES and
         isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and 0<=v<=1e15}
+
+
+METRIC_TIMESTAMP_KEYS = ('probe', 'bandwidth', 'exit', 'intel', 'network', 'ip_grade')
+MAX_MEASURED_METRICS = 9
+
+
+def safe_metric_updated_at(value):
+    """Whitelisted, finite, non-negative display timestamps only.
+
+    Unknown keys and malformed values (bool/nonfinite/negative) are dropped so
+    no client-supplied metadata can claim an update that did not happen.
+    """
+    if not isinstance(value, dict):
+        return None
+    public = {}
+    for key in METRIC_TIMESTAMP_KEYS:
+        stamp = value.get(key)
+        if type(stamp) is not int or not 0<=stamp<=253402300799999:continue
+        public[key] = stamp
+    return public or None
+
+
+def observed_metric_count(values):
+    """Count finite, valid observed raw dimensions (never derived scores).
+
+    ``values`` is either a serialized result mapping or a Result-like object.
+    Legacy rows lacking every dimension legitimately report zero.
+    """
+    def get(key):
+        if isinstance(values, dict):
+            return values.get(key)
+        return getattr(values, key, None)
+
+    def number(value, minimum, strict=False):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if not minimum<=value<=1e15 or not math.isfinite(value):
+            return False
+        return value > minimum if strict else value >= minimum
+
+    def intel_quality(value):
+        if isinstance(value, dict):
+            return value.get('ip_quality_score')
+        return getattr(value, 'ip_quality_score', None)
+
+    count = 0
+    if number(get('latency_ms'), 0):
+        count += 1
+    if number(get('jitter_ms'), 0):
+        count += 1
+    if number(get('connect_ms'), 0):
+        count += 1
+    if number(get('median_mbps'), 0, strict=True):
+        count += 1
+    if number(get('multi_mbps'), 0, strict=True):
+        count += 1
+    attempts = get('probe_attempts')
+    if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts > 0:
+        if number(get('probe_loss_pct'), 0) and get('probe_loss_pct')<=100:
+            count += 1
+    for key,version in (('exit_ipv4',4),('exit_ipv6',6)):
+        value = get(key)
+        if key=='exit_ipv4' and not value:
+            legacy=get('ip')
+            legacy_ok=legacy.get('ok') is True if isinstance(legacy,dict) else getattr(legacy,'ok',False) is True
+            if legacy_ok:value=legacy.get('exit_ip') if isinstance(legacy,dict) else getattr(legacy,'exit_ip',None)
+        if isinstance(value,str):
+            try:count+=int(ipaddress.ip_address(value).version==version)
+            except ValueError:pass
+    quality = [intel_quality(get('intel_v4')), intel_quality(get('intel_v6'))]
+    if any(number(value,0) and value<=100 for value in quality) and number(get('ip_quality_score'), 0):
+        if get('ip_quality_score') <= 100:
+            count += 1
+    return count
 
 
 def safe_probe_sources(value):
@@ -143,7 +218,7 @@ def _result(value):
         public['measurement_scope'] = {k:scope[k] for k in SCOPE_FIELDS if isinstance(scope.get(k),str)}
     if isinstance(value.get('exit_status'),dict):
         public['exit_status'] = {k:v for k,v in value['exit_status'].items()
-            if k in ('ipv4','ipv6','basic') and v in ('pending','completed','failed','not_requested')}
+            if k in ('ipv4','ipv6','basic') and v in ('pending','completed','failed','not_requested','cancelled','interrupted')}
     if isinstance(value.get('samples_mbps'),list):
         public['samples_mbps'] = [v for v in value['samples_mbps'][:5] if isinstance(v,(int,float))]
     if isinstance(value.get('ip'),dict):
@@ -172,6 +247,15 @@ def _result(value):
     # engines; nested subscription metadata has its own explicit whitelist.
     from speedbench_sources import result_origin
     public.update(result_origin(value))
+    updated = safe_metric_updated_at(value.get('metric_updated_at'))
+    if updated:
+        public['metric_updated_at'] = updated
+    count = value.get('measured_metric_count')
+    if type(count) is int:
+        # Clamp client-supplied counts to the supported raw-dimension bounds.
+        public['measured_metric_count'] = max(0, min(MAX_MEASURED_METRICS, int(count)))
+    elif updated:
+        public['measured_metric_count'] = observed_metric_count(public)
     return _copy(public)
 
 

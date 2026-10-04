@@ -101,6 +101,29 @@ class TaskUiJsTest(unittest.TestCase):
         """)
         self.assertIn('精测最多 20 节点',out);self.assertIn('1920 MB',out)
 
+    def test_result_metadata_details_show_updates_states_count_and_unknown(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const legacy=detailHtml({name:'old',latency_ms:12});
+            const fresh=detailHtml({name:'new',latency_ms:12,median_mbps:20,probe_loss_pct:0,
+              measured_metric_count:4,metric_updated_at:{network:1700000000000,ip_grade:1700000000001},
+              measurement_scope:{probe:'completed',bandwidth:'not_selected',intel:'failed'}});
+            const malicious=detailHtml({name:'x',measurement_scope:{probe:'<img src=x>',intel:'constructor'},
+              metric_updated_at:{network:1700000000000.5},measured_metric_count:9999});
+            console.log(JSON.stringify({legacy,fresh,malicious}));})();
+        """)
+        for label in ('Network 更新','IP Grade 更新','已测指标数','探测状态','带宽状态','情报状态'):
+            self.assertIn(label,out['fresh'])
+        self.assertIn('完成',out['fresh'])
+        self.assertIn('未选中',out['fresh'])
+        self.assertIn('失败',out['fresh'])
+        self.assertIn('未知',out['legacy'])
+        self.assertNotIn('1700000000000',out['legacy'])
+        self.assertNotIn('<img src=x>',out['malicious'])
+        self.assertNotIn('src=x',out['malicious'])
+        self.assertNotIn('function Object',out['malicious'])
+        self.assertNotIn('9999',out['malicious'])
+
     def test_probe_details_keep_main_and_worker_separate_and_explain_partial_denominator(self):
         out=self.run_app("""
           (async()=>{await new Promise(r=>setTimeout(r,0));

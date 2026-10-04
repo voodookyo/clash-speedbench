@@ -41,7 +41,20 @@ class ResultJournal:
                 # main probe stats. Do not lose those independent samples.
                 for key in ('probe_attempts','probe_successes','probe_failures',
                             'probe_success_rate','probe_loss_pct'):
-                    setattr(value,key,getattr(previous,key,None))
+                    observed=getattr(previous,key,None)
+                    setattr(value,key,observed);setattr(result,key,observed)
+            merged_times=dict(getattr(previous,'metric_updated_at',None) or {})
+            for key,stamp in (getattr(value,'metric_updated_at',None) or {}).items():
+                # Never regress a display boundary: a fresh final Result that
+                # replaced a partial row must not overwrite an earlier stamp.
+                if key not in merged_times or stamp > merged_times[key]:
+                    merged_times[key]=stamp
+            if merged_times:
+                value.metric_updated_at=dict(merged_times)
+                result.metric_updated_at=copy.deepcopy(merged_times)
+            scope=dict(getattr(previous,'measurement_scope',None) or {},**(value.measurement_scope or {}))
+            if scope:
+                value.measurement_scope=dict(scope);result.measurement_scope=copy.deepcopy(scope)
             self.rows[value.name]=value
 
     def snapshot(self):
@@ -81,7 +94,10 @@ class ProbeObserver:
         _apply_probe_stats(row,stats)
         row.probe_sources={self.source:dict(stats.to_dict(),started=self.started,
             requested=self.requested,status='completed' if complete else 'partial')}
-        row.measurement_scope={'probe':'completed' if complete else 'partial'}
+        config=getattr(self.args,'task_config',None)
+        row.measurement_scope={'probe':'completed' if complete and stats.successes else 'failed' if complete else 'partial',
+            'bandwidth':'pending' if config is None or config.bandwidth else 'not_requested',
+            'intel':'not_requested' if getattr(self.args,'no_ip',False) else 'pending'}
         apply_origin(row,getattr(self.args,'source_origins',{}).get(self.name))
         publish_result(self.args,'node_probe',row,phase_name='probing')
 

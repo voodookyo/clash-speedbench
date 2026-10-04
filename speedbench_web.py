@@ -469,7 +469,8 @@ def slim_history() -> list:
                     **speedbench_sources.result_origin(r),
                     **{k:v for k,v in safe_job_result(r).items() if k in (
                         'network_score','probe_attempts','probe_successes','probe_failures',
-                        'probe_loss_pct','measurement_scope','exit_status','ip_grade','ip_quality_score')+
+                        'probe_loss_pct','measurement_scope','exit_status','ip_grade','ip_quality_score',
+                        'metric_updated_at','measured_metric_count')+
                         (('jitter_ms','multi_mbps','intel_v4','intel_v6','ip') if
                          isinstance(rec.get('task'),dict) or r.get('measurement_scope') else ())},
                 }

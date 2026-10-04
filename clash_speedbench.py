@@ -51,7 +51,7 @@ import speedbench_tasks
 import speedbench_profiles
 from speedbench_process import run_cancellable, cancellation_scope, current_cancellation, SocketCancellation, connect_socket
 from speedbench_progress import ProgressEmitter, DownloadCounter, ProbeObserver, phase, publish_result, measure, emit_metric, milestone
-from speedbench_jobs import safe_probe_sources
+from speedbench_jobs import safe_probe_sources, observed_metric_count, safe_metric_updated_at
 
 from speedbench_ip_intel import (
     IpIntelCache,
@@ -480,6 +480,7 @@ class ProbeStats:
     attempts: int = 0
     successes: int = 0
     failures: int = 0
+    updated_at_ms: Optional[int] = None  # actual probe observation, never a duration
 
     def __post_init__(self) -> None:
         self.attempts = max(0, int(self.attempts))
@@ -597,6 +598,47 @@ class Result:
     download_bytes: Optional[int] = None  # observed curl bytes, not requested sample size
     exit_status: Optional[dict] = None
     probe_sources: Optional[dict] = None  # independent main/worker/serial observations
+    metric_updated_at: Optional[dict] = None  # display-only epoch ms per measured metric
+
+
+# Display-only update boundaries.  These timestamps describe *when* a raw
+# dimension was last observed; they never feed durations, budgets or ranking,
+# which keep their existing monotonic clocks.
+METRIC_UPDATE_KEYS = ('probe', 'bandwidth', 'exit', 'intel', 'network', 'ip_grade')
+# The raw observed dimensions counted by ``measured_metric_count``.  Derived
+# score/network_score/grade are deliberately excluded.
+
+
+def metric_updated_now() -> int:
+    """Wall-clock epoch milliseconds for display metadata only."""
+    return int(time.time() * 1000)
+
+
+def stamp_metric(result: Optional[Result], *keys: str,
+                 advance: bool = True) -> Optional[Result]:
+    """Record display completion times for the given supported metric keys.
+
+    ``advance=False`` keeps the first observation so re-applying already
+    measured probe stats (for example while finalizing a serial result) cannot
+    move a network boundary that enrichment did not observe.
+    """
+    if result is None:
+        return result
+    value = metric_updated_now()
+    current = dict(getattr(result, 'metric_updated_at', None) or {})
+    for key in keys:
+        if key not in METRIC_UPDATE_KEYS:
+            continue
+        if advance or key not in current:
+            current[key] = value
+    if current:
+        result.metric_updated_at = current
+    return result
+
+
+def metric_updated_dict(result: Optional[Result]) -> dict:
+    """Whitelisted, finite, non-negative display timestamps only."""
+    return safe_metric_updated_at(getattr(result, 'metric_updated_at', None)) or {}
 
 
 def detect_controller(secret: str, explicit: Optional[str]) -> Tuple[str, bool]:
@@ -1005,7 +1047,8 @@ def probe_latency(api: MihomoAPI, name: str, timeout_ms: int,
     def snapshot():
         return ProbeStats(int(round(statistics.median(vals))) if vals else None,
             round(statistics.stdev(vals),1) if len(vals)>1 else 0.0 if vals else None,
-            len(vals)+failures,len(vals),failures)
+            len(vals)+failures,len(vals),failures,
+            metric_updated_now() if vals or failures else None)
     try:
         for index in range(requested):
             if cancel_requested() or (cancel is not None and cancel()):raise KeyboardInterrupt
@@ -1068,6 +1111,13 @@ def _apply_probe_stats(result: Result, stats: Any,
         result.latency_ms = probe.latency_ms
     if result.jitter_ms is None and probe.jitter_ms is not None:
         result.jitter_ms = probe.jitter_ms
+    if probe.attempts > 0:
+        if probe.updated_at_ms is None:probe.updated_at_ms=metric_updated_now()
+        times=dict(result.metric_updated_at or {})
+        times.setdefault('probe',probe.updated_at_ms);times.setdefault('network',probe.updated_at_ms)
+        result.metric_updated_at=times
+        result.measurement_scope=dict(result.measurement_scope or {},
+            probe='completed' if probe.successes else 'failed')
     return result
 
 
@@ -1465,6 +1515,23 @@ def _apply_intelligence(result: Result, intel_by_ip: Dict[str, IpIntelligence]) 
     worst = min(usable, key=_intel_risk_key) if usable else None
     result.ip_quality_score = worst.ip_quality_score if worst else None
     result.ip_grade = worst.ip_grade if worst else None
+    # Only actual attached provider results count as an intelligence
+    # completion; a reporting/node_intelligence event or a pending/cancelled
+    # request must not fabricate a timestamp.  A grade stamp needs a real grade.
+    attached=[i for i in (result.intel_v4,result.intel_v6) if i is not None]
+    statuses=[status for i in attached for status in i.provider_status.values()]
+    usable_grade=(isinstance(result.ip_quality_score,(int,float)) and not isinstance(result.ip_quality_score,bool)
+        and math.isfinite(result.ip_quality_score) and 0<=result.ip_quality_score<=100 and result.ip_grade in ('S','A','B','C','D'))
+    if attached:
+        state='completed' if usable_grade or 'ok' in statuses else 'not_requested' if statuses and all(
+            status in ('disabled','key_missing') for status in statuses) else 'failed'
+        if state=='completed' and any(address and intel is None for address,intel in (
+                (result.exit_ipv4,result.intel_v4),(result.exit_ipv6,result.intel_v6))):state='partial'
+        result.measurement_scope=dict(result.measurement_scope or {},intel=state)
+        if state!='not_requested' and (statuses or usable_grade):stamp_metric(result,'intel')
+    elif (result.measurement_scope or {}).get('intel') not in ('not_requested','not_selected','cancelled','interrupted'):
+        result.measurement_scope=dict(result.measurement_scope or {},intel='failed')
+    if usable_grade:stamp_metric(result,'ip_grade')
 
     comparable: Dict[str, set] = {"country": set(), "asn": set(), "category": set()}
     for intel in (result.intel_v4, result.intel_v6):
@@ -1598,6 +1665,10 @@ def finish_intelligence_enrichment(enricher: Optional[_IntelEnrichment],
                                    results: List[Result]) -> None:
     if enricher is None:
         for result in results:
+            scope=dict(result.measurement_scope or {})
+            if scope.get('intel') not in ('not_requested','not_selected','cancelled','interrupted'):
+                scope['intel']='failed'
+            result.measurement_scope=scope
             compute_score(result)
             result.tags = make_tags(result)
         return
@@ -1843,14 +1914,17 @@ def classify_failure(status: str) -> str:
 
 def result_to_dict(r: Result) -> dict:
     ip = r.ip if r.ip and r.ip.ok else IpInfo()
+    updated = metric_updated_dict(r)
     return {
         "name": r.name,
         "provider": r.provider,
         **source_catalog.result_origin(r.origin),
-        **({"measurement_scope": r.measurement_scope} if r.measurement_scope else {}),
+        'measurement_scope':{'probe':'unknown','bandwidth':'unknown','intel':'unknown',**(r.measurement_scope or {})},
         **({'download_bytes':r.download_bytes} if r.download_bytes is not None else {}),
         **({'exit_status':r.exit_status} if r.exit_status is not None else {}),
         **({'probe_sources':safe_probe_sources(r.probe_sources)} if r.probe_sources else {}),
+        'metric_updated_at':updated,
+        'measured_metric_count':observed_metric_count(r),
         "node_key": r.node_key,
         "proto": r.proto,
         "latency_ms": r.latency_ms,
@@ -2532,6 +2606,7 @@ def _execute_benchmark(args,task_config):
                 partial.median_mbps=statistics.median(speeds) if speeds else None
                 partial.best_mbps=max(speeds) if speeds else None
                 partial.measurement_scope=dict(mode=args.mode or 'legacy',bandwidth='partial')
+                stamp_metric(partial,'bandwidth','network')
                 publish_result(args,'node_measurement',partial,phase_name='measuring')
 
             multi = None
@@ -2542,6 +2617,7 @@ def _execute_benchmark(args,task_config):
                         min(3.0,max_time),on_attempt=counter.start,on_sample=counter.finish)
             partial.multi_mbps=multi
             partial.measurement_scope=dict(mode=args.mode or 'legacy',bandwidth='completed' if speeds else 'failed')
+            stamp_metric(partial,'bandwidth','network')
             publish_result(args,'node_measurement',partial,phase_name='measuring')
 
             median = statistics.median(speeds) if speeds else None
@@ -2558,6 +2634,7 @@ def _execute_benchmark(args,task_config):
                 def early_exit(family,address,status):
                     if family!='legacy':
                         setattr(partial,'exit_'+family,address);partial.exit_status[family]=status
+                        if address:stamp_metric(partial,'exit')
                     else:partial.exit_status['basic']=status
                     publish_result(args,'node_exit',partial,phase_name='measuring')
                 exit_ipv4, exit_ipv6, data = fetch_exit_ips(proxy_url, args.ip_timeout,
@@ -2586,6 +2663,10 @@ def _execute_benchmark(args,task_config):
                 download_bytes=partial.download_bytes,
                 exit_status=partial.exit_status,
             )
+            # The partial row already observed probe/bandwidth/exit; carry those
+            # display boundaries forward so finalization cannot advance them.
+            res.metric_updated_at=dict(partial.metric_updated_at or {}) or None
+            res.measurement_scope=dict(partial.measurement_scope or {},intel='not_requested' if args.no_ip else 'pending')
             _apply_probe_stats(res, probe, fallback_attempts=_probe_count_from_args(args))
             if not args.no_ip:
                 if (intel_enricher is None and

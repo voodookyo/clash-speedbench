@@ -327,6 +327,29 @@ function rowHtml(r, i, opts){
 }
 
 // 行展开详情：延迟/抖动/建连/样本/单流/多流 + 出口 IP/ASN/ISP + 趋势入口
+// 结果元数据展示：只显示真实的观测完成时间与独立状态；旧记录一律 unknown，
+// 绝不把缺失字段显示成 now/0，也不从事件名推断成功。
+const SB_SCOPE_REASON = {completed:'完成',partial:'部分完成',failed:'失败',pending:'等待中',
+  cancelled:'已取消',not_requested:'未请求',not_selected:'未选中',interrupted:'已中断',unknown:'未知'};
+function metricTimeText(r,key){
+  const stamps=(r&&typeof r.metric_updated_at==='object'&&r.metric_updated_at)||{};
+  const t=stamps[key];
+  if(!Number.isSafeInteger(t)||t<0||t>253402300799999) return '未知';
+  const d=new Date(t);
+  if(isNaN(d.getTime())) return '未知';
+  const p=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function scopeStateText(r,key){
+  const scope=(r&&typeof r.measurement_scope==='object'&&r.measurement_scope)||{};
+  const raw=scope[key];
+  const status=(typeof raw==='string'&&raw)?raw:'unknown';
+  return Object.prototype.hasOwnProperty.call(SB_SCOPE_REASON,status)?SB_SCOPE_REASON[status]:'未知';
+}
+function measuredCountText(r){
+  const n=r?r.measured_metric_count:null;
+  return (Number.isSafeInteger(n)&&n>=0&&n<=9)?String(n):'未知';
+}
 function detailHtml(r, colspan){
   const ip = r.ip || {};
   const intel = intelOf(r);
@@ -347,10 +370,18 @@ function detailHtml(r, colspan){
     cell('单流带宽（最佳）', r.best_mbps!=null ? r.best_mbps.toFixed(1)+' Mbps' : '-'),
     cell('多流带宽', r.multi_mbps!=null ? r.multi_mbps.toFixed(1)+' Mbps' : '-'),
     cell('Network Score', r.network_score!=null ? esc(r.network_score) : (r.score!=null ? esc(r.score) : '-')),
+    cell('Network 更新', metricTimeText(r,'network')),
+    cell('IP Grade 更新', metricTimeText(r,'ip_grade')),
+    cell('探测状态', esc(scopeStateText(r,'probe'))),
+    cell('带宽状态', esc(scopeStateText(r,'bandwidth'))),
+    cell('情报状态', esc(scopeStateText(r,'intel'))),
+    cell('已测指标数', measuredCountText(r)),
     cell('应用层探测失败率', r.probe_loss_pct!=null ? esc(r.probe_loss_pct)+'%' : '-'),
     cell('出口 IP', ip.ok ? esc(ip.exit_ip||'-') : '-'),
     cell('IPv4', esc(r.exit_ipv4 || intel.exit_ipv4 || (ip.ok ? ip.exit_ip : '') || '-')),
     cell('IPv6', esc(r.exit_ipv6 || intel.exit_ipv6 || '-')),
+    cell('IPv4 状态', esc(scopeStateText({measurement_scope:r.exit_status},'ipv4'))),
+    cell('IPv6 状态', esc(scopeStateText({measurement_scope:r.exit_status},'ipv6'))),
     cell('ASN', asnTxt),
     cell('ISP', isp ? esc(isp) : '-'),
     cell('组织', organization ? esc(organization) : '-'),

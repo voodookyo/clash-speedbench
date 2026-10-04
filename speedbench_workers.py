@@ -92,6 +92,7 @@ from clash_speedbench import (
     _apply_probe_stats,
     _coerce_probe_stats,
     _probe_count_from_args,
+    stamp_metric,
     warmup_speed,
 )
 from speedbench_ip_intel import load_provider_config
@@ -1234,6 +1235,7 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
         else:
             setattr(partial,'exit_'+family,address)
             partial.exit_status[family] = status
+            if address:stamp_metric(partial,'exit')
         publish_result(args,'node_exit',partial,phase_name='probing')
     if not args.no_ip:
         try:
@@ -1250,6 +1252,7 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
                     status="ok", ip=ip, jitter_ms=jitter,
                     exit_ipv4=exit_ipv4, exit_ipv6=exit_ipv6)
     result.exit_status = partial.exit_status if getattr(args,'progress',None) is not None else None
+    result.metric_updated_at = dict(partial.metric_updated_at or {}) or None
     if probe_stats is not None:
         _apply_probe_stats(result, probe_stats)
     return result
@@ -1308,6 +1311,7 @@ def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
         r.best_mbps = max(speeds) if speeds else None
         r.status = 'ok' if speeds else ';'.join(statuses)[:160]
         r.measurement_scope=dict(r.measurement_scope or {},mode=getattr(args,'mode',None) or 'legacy',bandwidth='partial')
+        stamp_metric(r,'bandwidth','network')
         publish_result(args,'node_measurement',r,phase_name='measuring')
 
     if getattr(args, "multi", False):
@@ -1322,6 +1326,7 @@ def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
     r.best_mbps = max(speeds) if speeds else None
     r.status = "ok" if speeds else ";".join(statuses)[:160]
     if r.measurement_scope is not None:r.measurement_scope['bandwidth']='completed' if speeds else 'failed'
+    stamp_metric(r,'bandwidth','network')
 
 
 def select_phase2_nodes(results: List[Result], top_n: int,
@@ -1836,12 +1841,23 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                            'not_selected' if config.bandwidth else 'not_requested'),
                 exit=('not_requested' if args.no_ip else
                       'completed' if r.exit_ipv4 or r.exit_ipv6 else
-                      'failed' if r.name in ip_names or r.name in measured else 'not_selected'))
+                      'failed' if r.name in ip_names or r.name in measured else 'not_selected'),
+                intel=('not_requested' if args.no_ip else
+                       (r.measurement_scope or {}).get('intel','pending') if r.name in ip_names or r.name in measured else 'not_selected'))
         if r.name in measured:
             continue
         r.score = compute_score(r)
         r.tags = make_tags(r)
         relabel_unmeasured(r)
+
+    for r in results:
+        scope=dict(r.measurement_scope or {})
+        scope['intel']='not_requested' if args.no_ip else scope.get('intel','pending')
+        if not config:
+            scope['bandwidth']=('partial' if scope.get('bandwidth')=='partial' and getattr(args,'cancelled',False) else
+                'completed' if r.median_mbps is not None else 'failed' if r.sample_mb is not None else
+                'cancelled' if getattr(args,'cancelled',False) and r.name in measured else 'not_selected')
+        r.measurement_scope=scope
 
     # Wait for the bounded, deduplicated provider pool only after all network
     # work has completed, then derive node-level worst-IP quality and Overall.

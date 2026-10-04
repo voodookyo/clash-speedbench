@@ -15,6 +15,9 @@ class SourceJsTest(unittest.TestCase):
                     {'subscription_id':'subscription_v2_'+'b'*32,'name':'未加载乙','loaded':False}],
                     'nodes':[{'source_status':'verified'}]},
                 '/api/run':{'ok':True}, '/api/run/status':{'running':False},
+                '/api/switch/preview':{'ok':True,'plan':{'node_id':'node_v2_'+'c'*32,'runtime_name':'改名节点',
+                    'identity_strength':'strong','source_status':'unknown','subscription_name':'','subscription_ids':[],
+                    'subscriptions':[],'group':'选择','current':'old','root_revision':0}},
                 '/api/switch':{'ok':True,'now':'改名节点'}}
         stub = STUB_JS.replace('__FETCH_MAP__', json.dumps(data,ensure_ascii=False))
         stub = stub.replace('async function fetch(url){',
@@ -41,9 +44,13 @@ class SourceJsTest(unittest.TestCase):
         self.assertNotIn('机场甲',json.dumps(body))
 
     def test_switch_uses_id_and_accepts_current_runtime_name(self):
-        out = self.run_js("await switchNode('旧节点',{dataset:{nodeId:'node_v2_'+'c'.repeat(32)}}); console.log(JSON.stringify({requests:__requests,now:currentNode}));")
+        out = self.run_js("await switchNode('旧节点',{dataset:{nodeId:'node_v2_'+'c'.repeat(32)}}); const before=__requests.filter(x=>x.url==='/api/switch').length; const yes=modalYes; closeModal(); await yes(); console.log(JSON.stringify({before,requests:__requests,now:currentNode}));")
+        self.assertEqual(out['before'],0)
+        preview=next(x['body'] for x in out['requests'] if x['url']=='/api/switch/preview')
+        self.assertEqual(preview,{'node_id':'node_v2_'+'c'*32})
         body = next(x['body'] for x in out['requests'] if x['url']=='/api/switch')
-        self.assertEqual(body,{'node_id':'node_v2_'+'c'*32})
+        self.assertEqual(body['node_id'],'node_v2_'+'c'*32)
+        self.assertEqual(body['confirmation']['runtime_name'],'改名节点')
         self.assertEqual(out['now'],'改名节点')
 
     def test_expired_selection_is_not_silently_expanded_to_all(self):

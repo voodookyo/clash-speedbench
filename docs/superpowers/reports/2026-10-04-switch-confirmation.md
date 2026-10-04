@@ -12,4 +12,4 @@ Codex 审阅补正：预览也校验计划并在 STATE_LOCK 中核对配置目�
 
 实际浏览器：127.0.0.1 合成 fixture，快速任务生成三行；确认显示真实 fixture 计划，HTML/引号/emoji 仅作文字；Esc 返回切换按钮，Enter/Tab/Enter 切换后当前节点及使用中标记更新、焦点落到结果行。截图 `/tmp/clash-speedbench-switch-confirmation-final.jpg`。全部控制器／下载／历史均为临时或合成，无真实 Verge、节点流量、付费 API、用户历史。
 
-C/B/D 整阶段保持未验收：指标元数据与后续源码核对继续；真实流量、原生 WebView／休眠／各平台包和六格 Python 矩阵依赖待答授权及执行环境。本次不是原生 GUI 或真实控制器验收，无独立外部只读审阅成功记录。
+C/B/D 整阶段保持未验收：后续指标元数据已完成本机合约验收，见 result-metadata 报告；该冻结点两版最终全量各 1185 项通过，并更新旧 source_js 回归为 preview→确认协议。真实流量、原生 WebView／休眠／各平台包和六格 Python 矩阵依赖待答授权及执行环境。本次不是原生 GUI 或真实控制器验收，无独立外部只读审阅成功记录。
