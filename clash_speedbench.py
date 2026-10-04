@@ -2271,7 +2271,7 @@ def _execute_benchmark(args,task_config):
     phase(args,'preparing')
 
     try:
-        with measure(args,'connection') as counts:
+        with measure(args,'connection') as counts,cancellation_scope(cancel_requested):
             counts['attempts'] = 1
             api = connect_controller(args.secret, args.controller, interactive=not args.non_interactive)
             version = api.get("/version")
@@ -2284,7 +2284,7 @@ def _execute_benchmark(args,task_config):
 
     proxies: Dict[str, dict] = proxy_data.get("proxies", {})
     leaves = leaf_nodes(proxies)
-    with measure(args,'discovery'):
+    with measure(args,'discovery'),cancellation_scope(cancel_requested):
         catalog = source_catalog.discover_catalog(
             api, os.environ.get('SPEEDBENCH_HOME') or str(Path(args.history).resolve().parent),
             config_file=args.config_file, snapshot=proxies)
