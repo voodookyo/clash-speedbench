@@ -137,6 +137,98 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertNotIn('key',str(identity))
 
 
+class _FakeParentPipe:
+    """Private stdin transport: one bootstrap frame, then parent EOF."""
+    def __init__(self,frame):
+        self._lock=threading.Lock();self._frames=[frame]
+    def readline(self,limit=-1):
+        with self._lock:return self._frames.pop(0) if self._frames else b''
+
+
+class _FakeHandshakeStdout:
+    def __init__(self):self.text=''
+    def write(self,text):self.text+=text
+    def flush(self):pass
+
+
+class _FakeBackendServer:
+    def __init__(self,address,handler):
+        self.server_port=1;self.daemon_threads=False;self._done=threading.Event()
+    def shutdown(self):self._done.set()
+    def serve_forever(self,poll_interval=None):self._done.wait(10)
+    def server_close(self):pass
+
+
+class _FakeClock:
+    """monotonic() jumps past the 25s shutdown deadline without real waiting."""
+    def __init__(self,step=10.0):self._now=0.0;self.step=step;self.on_sleep=None
+    def monotonic(self):
+        value=self._now;self._now+=self.step;return value
+    def sleep(self,_seconds):
+        if self.on_sleep is not None:self.on_sleep()
+
+
+class _FakeLease:
+    instance_id='fixture-lease'
+    def __enter__(self):return self
+    def __exit__(self,*_):return False
+
+
+class DesktopExitCodeTest(unittest.TestCase):
+    """The production main()/shutdown() path, driven over a fake private pipe,
+    fake clock and fake loopback server; no real controller or data home."""
+    def run_main(self,state,clock):
+        frame=json.dumps({'protocol':1,'parent_pid':os.getppid(),'nonce':'c'*64}).encode()+b'\n'
+        handshake=_FakeHandshakeStdout()
+        cancelled=[]
+        names=('DATA_HOME','DATA_OWNER','DESKTOP_IDENTITY','DESKTOP_ACTIONS',
+               'DESKTOP_SHUTDOWN','DESKTOP_EXITING')
+        snapshot={name:getattr(web,name) for name in names}
+        with web.STATE_LOCK:
+            state_snapshot=dict(web.STATE)
+            web.STATE.clear();web.STATE.update(state)
+        saved_stdin,saved_stdout=sys.stdin,sys.stdout
+        sys.stdin=type('stdin',(),{'buffer':_FakeParentPipe(frame)})();sys.stdout=handshake
+        try:
+            with tempfile.TemporaryDirectory() as folder,\
+                 mock.patch.object(desktop,'BackendLease',lambda home:_FakeLease()),\
+                 mock.patch.object(desktop,'ThreadingHTTPServer',_FakeBackendServer),\
+                 mock.patch.object(desktop,'time',clock),\
+                 mock.patch.object(web,'DATA_HOME',Path(folder)),\
+                 mock.patch.object(web,'recover_history_import',lambda:False),\
+                 mock.patch.object(web,'sync_db',lambda:0),\
+                 mock.patch.object(web,'cancel_benchmark',lambda:cancelled.append(True)),\
+                 mock.patch.object(web.speedbench_db,'interrupt_tasks',lambda path:None):
+                code=desktop.main()
+            return code,handshake.text,cancelled
+        finally:
+            sys.stdin,sys.stdout=saved_stdin,saved_stdout
+            with web.STATE_LOCK:
+                web.STATE.clear();web.STATE.update(state_snapshot)
+            for name,value in snapshot.items():setattr(web,name,value)
+
+    def test_import_still_running_at_deadline_exits_nonzero(self):
+        code,handshake,cancelled=self.run_main({'running':False,'importing':True},_FakeClock())
+        self.assertEqual(json.loads(handshake)['nonce'],'c'*64)
+        self.assertTrue(cancelled)
+        self.assertEqual(code,2)
+
+    def test_leftover_failed_import_exits_nonzero(self):
+        code,handshake,_=self.run_main({'running':False,'importing':False,'import_failed':True},_FakeClock())
+        self.assertEqual(json.loads(handshake)['nonce'],'c'*64)
+        self.assertEqual(code,2)
+
+    def test_import_finishing_before_deadline_exits_clean(self):
+        clock=_FakeClock()
+        def finish_import():
+            with web.STATE_LOCK:web.STATE['importing']=False
+        clock.on_sleep=finish_import
+        code,handshake,cancelled=self.run_main({'running':False,'importing':True},clock)
+        self.assertEqual(json.loads(handshake)['nonce'],'c'*64)
+        self.assertTrue(cancelled)
+        self.assertEqual(code,0)
+
+
 class DesktopApiTest(WebServerCase):
     def test_compact_os_routes_require_auth_and_never_accept_urls_keys_or_paths(self):
         with mock.patch.object(web,'DESKTOP_ACTIONS',desktop.DesktopActions()):

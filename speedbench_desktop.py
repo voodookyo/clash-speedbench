@@ -154,7 +154,11 @@ def main():
             threading.Thread(target=controls,daemon=True).start()
             try:server.serve_forever(poll_interval=.1)
             finally:server.server_close()
-            with web.STATE_LOCK:busy=web.STATE['running']
+            # Match the shutdown wait condition: an import still running at
+            # the deadline, or a failed import left pending, is not a clean exit.
+            with web.STATE_LOCK:
+                busy=(web.STATE['running'] or web.STATE.get('importing')
+                      or web.STATE.get('import_failed'))
             return 2 if busy else 0
     except Exception:
         # Never dump arbitrary input, nonce, env, credentials or exception URL.
