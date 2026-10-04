@@ -22,6 +22,45 @@ class JobApiTest(WebServerCase):
     def create(self):
         return web.JOBS.create(resolve_config({'mode':'quick'}))
 
+    def test_serial_task_requires_explicit_boolean_confirmation(self):
+        for confirmation in (None,False,'true',1):
+            params={'mode':'legacy','workers':1}
+            if confirmation is not None:params['allow_serial']=confirmation
+            with self.subTest(confirmation=confirmation),mock.patch.object(web,'run_benchmark') as runner:
+                status,body=self.post_authorized('/api/jobs',params)
+                self.assertEqual(status,400);runner.assert_not_called()
+                self.assertFalse(web.STATE['running'])
+
+    def test_confirmed_serial_task_records_full_scope_and_command_opt_in(self):
+        params={'mode':'legacy','workers':1,'allow_serial':True}
+        with mock.patch.object(web,'run_benchmark'):
+            status,body=self.post_authorized('/api/jobs',params)
+        self.assertEqual(status,202)
+        job=web.JOBS.snapshot(json.loads(body)['job_id'])
+        self.assertTrue(job['config']['measure_all'])
+        self.assertNotIn('allow_serial',job['config'])
+        command=web.benchmark_command(params)
+        self.assertIn('--yes',command);self.assertNotIn('--deny-serial-fallback',command)
+
+    def test_serial_confirmation_cannot_be_reused_for_an_isolated_worker_mode(self):
+        for params in ({'mode':'legacy','workers':2,'allow_serial':True},
+                       {'mode':'quick','workers':1,'allow_serial':True}):
+            with self.subTest(params=params),mock.patch.object(web,'run_benchmark') as runner:
+                status,_body=self.post_authorized('/api/jobs',params)
+                self.assertEqual(status,400);runner.assert_not_called()
+
+    def test_all_unconfirmed_web_commands_deny_silent_serial_fallback(self):
+        for params in ({},{'mode':'quick'},{'mode':'legacy','workers':1}):
+            with self.subTest(params=params):
+                command=web.benchmark_command(params)
+                self.assertIn('--deny-serial-fallback',command)
+        self.assertNotIn('--yes',web.benchmark_command({'mode':'legacy','workers':1}))
+
+    def test_null_worker_override_keeps_shared_worker_default_without_fallback(self):
+        params=web.validate_run_params({'workers':None})
+        command=web.benchmark_command(params)
+        self.assertIn('--yes',command);self.assertIn('--deny-serial-fallback',command)
+
     def test_new_job_is_queued_before_dispatch_and_requires_token(self):
         self.assertEqual(self.post_json('/api/jobs',{'mode':'quick'})[0],403)
         with mock.patch.object(web,'run_benchmark'):

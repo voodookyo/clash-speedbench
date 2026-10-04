@@ -53,6 +53,15 @@ class PreferenceTransferTest(unittest.TestCase):
         self.assertEqual(len(json.loads(out['sb_favs_v2'])), 1)
         self.assertEqual(out['sb_mode'], 'quick')
 
+    def test_serial_mode_exports_and_merges_without_losing_favorites(self):
+        out = self.js('''const values={sb_mode:'legacy',sb_favs:'["旧收藏"]'};
+          const restored=P.parseImport(P.exportText(k=>values[k]??null));
+          console.log(JSON.stringify(P.merge(restored,{sb_favs:'["新收藏"]'})));''')
+        self.assertEqual(out['sb_mode'], 'legacy')
+        self.assertEqual(json.loads(out['sb_favs']), ['旧收藏', '新收藏'])
+        self.assertEqual(validate(out)['sb_mode'], 'legacy')
+        self.assertEqual(json.loads(validate(out)['sb_favs']), json.loads(out['sb_favs']))
+
     def test_browser_storage_failure_rolls_back_only_touched_whitelist_keys(self):
         out = self.js('''const store=new Map([['sb_theme','light'],['outside','untouched']]);let fail=true;
           try{P.saveBrowser({sb_theme:'dark',sb_mode:'ip'},k=>store.get(k)??null,

@@ -1129,6 +1129,7 @@ async function loadLatest(){
 }
 
 async function loadCurrent(){
+  currentGroup='';currentNode='';
   try{
     const r = await getJSON('/api/current');
     if(r.ok){ currentGroup=r.group; currentNode=r.now; }
@@ -1670,6 +1671,7 @@ function updateTaskBudget(){
   if(!el || !taskConfig || typeof SBTasks==='undefined') return;
   const mode=document.getElementById('f-mode').value||'standard';
   const config=Object.assign({},(taskConfig.modes||{})[mode]);
+  if(mode==='legacy') config.measure_all=true;
   const mb=document.getElementById('f-mb').value;
   if(mb!=='') config.mb=Number(mb);
   config.rounds=Number(document.getElementById('f-rounds').value)||1;
@@ -1695,7 +1697,22 @@ async function startTask(){
     if(!body.node_ids.length){ toast('所选范围没有可核验节点。请刷新订阅或重新选择。',false); return; }
   }else if(source) body.subscription_ids=[source];
   if(mode==='ip' && body.multi){ toast('IP 专项不请求带宽，请关闭“4 路峰值”。',false); return; }
-  if(body.auto_switch){
+  if(mode==='legacy'){
+    body.workers=1;
+    const nodes=scopedNodes();
+    if(!nodes.length || nodes.some(n=>n.identity_strength!=='strong' ||
+        !/^node_v2_[0-9a-f]{32}$/.test(n.node_id||''))){
+      toast('串行范围无法固定到可核验节点。请刷新目录或手动选择身份明确的节点。',false);return;
+    }
+    // Freeze the confirmed membership. CLI revalidates these identities against
+    // its fresh catalog; new subscription members cannot expand this task.
+    body.node_ids=[...new Set(nodes.map(n=>n.node_id))];
+    const count=body.node_ids.length;
+    const scope=document.getElementById('f-source').selectedOptions?.[0]?.textContent||'所选来源';
+    await loadCurrent();
+    const text=`改用兼容串行？将对 ${scope} 的最多 ${count} 个已选节点逐个全测${include?'（名称过滤仍生效）':''}，期间临时切 GLOBAL 并调整沿途策略组，会影响当前活动连接。当前：${currentGroup||'尚未确认策略组'} = ${currentNode||'尚未确认节点'}。确认范围已固定，目录变化时会重新核验；结束或取消后尝试恢复原模式和选择，清理失败会明确报告。${body.auto_switch?'另允许结束后切换到综合评分冠军。':''}`;
+    confirmModal(text,()=>{body.allow_serial=true;dispatchTask(body);});
+  }else if(body.auto_switch){
     confirmModal('测速完成后自动切换当前策略组到已测范围内冠军？此操作会改变当前活动节点。',()=>dispatchTask(body));
   }else await dispatchTask(body);
 }
@@ -1868,7 +1885,7 @@ function initTaskControls(){
     document.getElementById('btn-browser-audit').addEventListener('click',()=>desktopAction('browser_audit'));
   }
   const savedMode=lsGet('sb_mode'),savedTarget=lsGet('sb_target');
-  if(['quick','standard','deep','ip'].includes(savedMode)) document.getElementById('f-mode').value=savedMode;
+  if(['quick','standard','deep','ip','legacy'].includes(savedMode)) document.getElementById('f-mode').value=savedMode;
   if(['daily','download','balanced','ip','residential'].includes(savedTarget)) document.getElementById('f-target').value=savedTarget;
   getJSON('/api/task-config').then(c=>{taskConfig=c;updateTaskBudget();}).catch(()=>{});
   for(const id of ['f-source','f-mode','f-target','f-mb','f-rounds','f-multi','f-all-ip']){

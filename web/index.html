@@ -34,7 +34,7 @@
           <div><label for="f-source">订阅范围</label>
             <select id="f-source"><option value="">全部已加载节点</option></select></div>
           <div><label for="f-target">使用目标</label><select id="f-target"><option value="daily">日常</option><option value="download">下载</option><option value="ip">IP 质量</option><option value="balanced">综合</option><option value="residential">住宅优先</option></select></div>
-          <div><label for="f-mode">测速模式</label><select id="f-mode"><option value="quick">快速 · 精测最多 5 节点</option><option value="standard" selected>标准 · 精测最多 10 节点</option><option value="deep">深度 · 全部连通节点</option><option value="ip">IP 专项 · 不请求带宽</option></select></div>
+          <div><label for="f-mode">测速模式</label><select id="f-mode"><option value="quick">快速 · 精测最多 5 节点</option><option value="standard" selected>标准 · 精测最多 10 节点</option><option value="deep">深度 · 全部连通节点</option><option value="ip">IP 专项 · 不请求带宽</option><option value="legacy">兼容串行 · 全测并切 GLOBAL（需确认）</option></select></div>
         </div>
         <div id="manual-scope" hidden><label for="f-node-search">选择已加载节点</label><input id="f-node-search" type="text" placeholder="搜索节点名或来源"><div id="node-picker"></div></div>
         <div class="task-actions"><button id="btn-source-refresh" class="mini">刷新订阅</button><button id="btn-run">开始测速</button>
@@ -49,7 +49,7 @@
         </div></details>
         <div id="source-status" class="meta-line" role="status">正在核验本机订阅来源；不会切换未加载订阅。</div>
         <div id="task-budget" class="meta-line">带宽样本预算：随已选范围计算，不等于实际流量。</div>
-        <div class="warn">仅推荐已测范围内的节点；新模式使用独立 worker，不会静默串行回退或切换未加载订阅。</div>
+        <div class="warn">仅推荐已测范围内的节点；独立 worker 失败会停止。兼容串行会临时切 GLOBAL，每次开始前需确认。</div>
       </div>
       <div class="card" id="task-card" style="display:none">
         <h2 id="task-stage">任务状态</h2>

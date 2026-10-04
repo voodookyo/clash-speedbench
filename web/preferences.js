@@ -3,7 +3,7 @@
   'use strict';
   const FORMAT='clash-speedbench-ui-preferences', MAX_BYTES=262144;
   const ENUMS={sb_theme:['system','light','dark'],sb_profile:['all','daily','download','ipclean','residential'],
-    sb_mode:['quick','standard','deep','ip'],sb_target:['daily','download','balanced','ip','residential'],
+    sb_mode:['legacy','quick','standard','deep','ip'],sb_target:['daily','download','balanced','ip','residential'],
     sb_subs_days:['7','30','90','365'],sb_notifications:['off','on']};
   const KEYS=Object.freeze([...Object.keys(ENUMS),'sb_favs','sb_favs_v2']);
   const fail=()=>{throw new Error('偏好格式无效、含不支持字段或超过限制；未应用导入');};

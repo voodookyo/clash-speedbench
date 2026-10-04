@@ -387,7 +387,10 @@ def slim_history() -> list:
 
 
 def benchmark_command(params):
-    cmd = [sys.executable, '-u', str(SCRIPT), '--yes', '--history', str(HISTORY), '--non-interactive']
+    cmd = [sys.executable, '-u', str(SCRIPT), '--history', str(HISTORY), '--non-interactive']
+    confirmed=params.get('allow_serial') is True
+    if not confirmed:cmd.append('--deny-serial-fallback')
+    if (params.get('workers') or 6)>1 or confirmed:cmd.append('--yes')
     if sys.flags.dont_write_bytecode:cmd.insert(1,'-B')
     if params.get('mode') and params['mode'] != 'legacy':
         cmd += ['--mode',params['mode']]
@@ -411,9 +414,15 @@ def benchmark_command(params):
 def validate_run_params(params):
     if not isinstance(params,dict):
         raise speedbench_tasks.TaskConfigError('请求必须是对象')
-    control = {'include','auto_switch','subscription_ids','node_ids'}
+    control = {'include','auto_switch','subscription_ids','node_ids','allow_serial'}
     config = {k:v for k,v in params.items() if k not in control}
     resolved = speedbench_tasks.resolve_config(config)
+    if 'allow_serial' in params and not isinstance(params['allow_serial'],bool):
+        raise speedbench_tasks.TaskConfigError('串行确认必须是布尔值')
+    if resolved.workers<=1 and params.get('allow_serial') is not True:
+        raise speedbench_tasks.TaskConfigError('串行模式会切换 GLOBAL，请先在界面确认后再启动')
+    if params.get('allow_serial') is True and (resolved.mode!='legacy' or resolved.workers!=1):
+        raise speedbench_tasks.TaskConfigError('串行确认仅用于兼容串行模式；隔离 worker 任务不会自动回退')
     if resolved.mode != 'legacy' and resolved.workers <= 1:
         raise speedbench_tasks.TaskConfigError('新模式需要隔离 worker')
     if ('auto_switch' in params and not isinstance(params['auto_switch'],bool)):
@@ -1194,7 +1203,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 try:
                     config = speedbench_tasks.resolve_config({k:v for k,v in params.items()
-                        if k not in ('include','auto_switch','subscription_ids','node_ids')})
+                        if k not in ('include','auto_switch','subscription_ids','node_ids','allow_serial')})
                     job_id = JOBS.create(config)
                     # Clear only this backend's known sentinel before ownership
                     # is dispatched. The child will never erase a fresh cancel.

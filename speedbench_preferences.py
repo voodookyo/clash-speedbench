@@ -16,7 +16,7 @@ from speedbench_identity import _secure_new_file, _windows_private, _windows_sid
 LOCK=threading.RLock()
 ENUMS={'sb_theme':('system','light','dark'),
        'sb_profile':('all','daily','download','ipclean','residential'),
-       'sb_mode':('quick','standard','deep','ip'),
+       'sb_mode':('quick','standard','deep','ip','legacy'),
        'sb_target':('daily','download','balanced','ip','residential'),
        'sb_subs_days':('7','30','90','365'),
        'sb_notifications':('off','on')}

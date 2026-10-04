@@ -11,6 +11,72 @@ MODULE = Path(__file__).resolve().parents[1]/'web'/'tasks.js'
 
 @unittest.skipUnless(NODE,'Node unavailable')
 class TaskUiJsTest(unittest.TestCase):
+    def test_serial_choice_waits_for_every_explicit_confirmation(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            __el('f-mode').value='legacy';__el('f-target').value='daily';__el('f-rounds').value='1';
+            sourceCatalog={nodes:[{runtime_name:'fixture',node_id:'node_v2_'+'a'.repeat(32),identity_strength:'strong'}]};
+            currentGroup='stale';currentNode='stale';
+            let pending,confirmations=[],sent=[];
+            confirmModal=(message,yes)=>{confirmations.push(message);pending=yes;};
+            post=async(url,body)=>{sent.push({url,body:{...body}});return {ok:false,msg:'fixture'};};
+            await startTask();const before=sent.length;
+            pending=null;await startTask();const afterCancel=sent.length;
+            pending();await new Promise(r=>setTimeout(r,0));
+            await startTask();const thirdAwait=sent.length;
+            console.log(JSON.stringify({before,afterCancel,thirdAwait,confirmations,sent}));})();
+        """,{'/api/current':{'ok':True,'group':'Main','now':'fixture'}})
+        self.assertEqual((out['before'],out['afterCancel'],out['thirdAwait']),(0,0,1))
+        self.assertEqual(len(out['confirmations']),3)
+        self.assertTrue(all('GLOBAL' in text and 'Main = fixture' in text for text in out['confirmations']))
+        body=out['sent'][0]['body'];self.assertEqual(body['mode'],'legacy')
+        self.assertEqual(body['workers'],1);self.assertIs(body['allow_serial'],True)
+        self.assertEqual(body['node_ids'],['node_v2_'+'a'*32])
+
+    def test_serial_confirmation_freezes_identity_even_if_subscription_expands(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            __el('f-mode').value='legacy';__el('f-source').value='subscription_v2_'+'b'.repeat(32);
+            const original={node_id:'node_v2_'+'a'.repeat(32),identity_strength:'strong',
+              subscription_ids:[__el('f-source').value]};sourceCatalog={nodes:[original]};
+            let pending,sent=[];confirmModal=(message,yes)=>{pending=yes;};
+            post=async(url,body)=>{sent.push({...body});return {ok:false};};
+            await startTask();sourceCatalog.nodes.push({...original,node_id:'node_v2_'+'c'.repeat(32)});
+            pending();await new Promise(r=>setTimeout(r,0));console.log(JSON.stringify(sent));})();
+        """)
+        self.assertEqual(out[0]['node_ids'],['node_v2_'+'a'*32])
+        self.assertEqual(out[0]['subscription_ids'],['subscription_v2_'+'b'*32])
+
+    def test_serial_scope_with_unknown_identity_or_no_nodes_cannot_be_confirmed(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));__el('f-mode').value='legacy';
+            let confirms=0,sent=0;confirmModal=()=>{confirms++;};post=async()=>{sent++;};
+            for(const nodes of [[],[{node_id:'node_v2_'+'a'.repeat(32),identity_strength:'weak'}]]){
+              sourceCatalog={nodes};await startTask();}
+            console.log(JSON.stringify({confirms,sent}));})();
+        """)
+        self.assertEqual(out,{'confirms':0,'sent':0})
+
+    def test_serial_confirmation_does_not_present_failed_current_refresh_as_current(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));__el('f-mode').value='legacy';
+            sourceCatalog={nodes:[{node_id:'node_v2_'+'a'.repeat(32),identity_strength:'strong'}]};
+            currentGroup='stale-group';currentNode='stale-node';
+            getJSON=async()=>{throw Error('offline');};let text='';confirmModal=message=>{text=message;};
+            await startTask();console.log(JSON.stringify(text));})();
+        """)
+        self.assertNotIn('stale-',out);self.assertIn('尚未确认',out)
+
+    def test_serial_budget_displays_all_selected_nodes_not_top_fifteen(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            taskConfig={modes:{legacy:{bandwidth:true,top_n:15,mb:null,rounds:1,multi:false}}};
+            sourceCatalog={nodes:Array.from({length:20},(_,i)=>({node_id:'n'+i}))};
+            __el('f-mode').value='legacy';__el('f-rounds').value='1';
+            updateTaskBudget();console.log(JSON.stringify(__el('task-budget').textContent));})();
+        """)
+        self.assertIn('精测最多 20 节点',out);self.assertIn('1920 MB',out)
+
     def test_probe_details_keep_main_and_worker_separate_and_explain_partial_denominator(self):
         out=self.run_app("""
           (async()=>{await new Promise(r=>setTimeout(r,0));

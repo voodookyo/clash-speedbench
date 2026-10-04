@@ -2128,6 +2128,7 @@ def main() -> int:
                         help="并发模式用的完整配置文件路径（含节点凭据），默认自动找 Clash Verge 的运行配置")
     parser.add_argument("--yes", action="store_true",
                         help="不询问确认直接开始")
+    parser.add_argument('--deny-serial-fallback',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--backend-child',action='store_true',help=argparse.SUPPRESS)
     args = parser.parse_args()
     from speedbench_config import ENV as root_env, validate_root, ConfigRootError
@@ -2154,6 +2155,9 @@ def main() -> int:
     args.all = task_config.measure_all
     args.task_config = task_config if args.mode else None
     args.progress = ProgressEmitter.from_environment()
+    if args.deny_serial_fallback and args.workers<=1:
+        print('串行测试需要在界面明确确认 GLOBAL 切换；未开始测速。',file=sys.stderr)
+        return 2
     if args.mode and args.workers <= 1:
         print('新模式需要隔离 worker；串行模式请暂时不指定 --mode。',file=sys.stderr)
         return 2
@@ -2322,6 +2326,9 @@ def _execute_benchmark(args,task_config):
         except WorkerUnavailable as e:
             if args.mode:
                 print(f'隔离 worker 不可用：{e}。新模式不会静默改用全量串行测试。',file=sys.stderr)
+                return 1
+            if getattr(args,'deny_serial_fallback',False):
+                print(f'隔离 worker 不可用：{e}。未切换 GLOBAL；可在界面选择兼容串行并确认后启动新任务。',file=sys.stderr)
                 return 1
             print(f"并发模式不可用：{e}\n回退到串行模式。", file=sys.stderr)
         else:
