@@ -1,5 +1,6 @@
 import io
 import json
+import plistlib
 import tarfile
 import tempfile
 import unittest
@@ -65,6 +66,29 @@ class DesktopResourcesTest(unittest.TestCase):
             self.assertTrue(lock[target]['url'].startswith('https://'))
             self.assertRegex(lock[target]['sha256'],r'^[0-9a-f]{64}$')
             self.assertNotIn('latest',lock[target]['url'])
+
+    def test_macos_required_reason_asset_maps_system_boot_time_only(self):
+        asset=resources.ROOT/'desktop/src-tauri/PrivacyInfo.xcprivacy'
+        self.assertTrue(asset.is_file())
+        with asset.open('rb') as handle:
+            plist=plistlib.load(handle)
+        self.assertEqual(list(plist),['NSPrivacyAccessedAPITypes'])
+        entries=plist['NSPrivacyAccessedAPITypes']
+        self.assertEqual(len(entries),1)
+        self.assertEqual(entries[0]['NSPrivacyAccessedAPIType'],
+                         'NSPrivacyAccessedAPICategorySystemBootTime')
+        self.assertEqual(entries[0]['NSPrivacyAccessedAPITypeReasons'],['35F9.1'])
+        serialized=json.dumps(plist)
+        for unrelated in ('NSPrivacyTracking','NSPrivacyTrackingDomains','NSPrivacyCollectedDataTypes'):
+            self.assertNotIn(unrelated,serialized)
+        config=json.loads((resources.ROOT/'desktop/src-tauri/tauri.macos.conf.json')
+                          .read_text(encoding='utf-8'))
+        self.assertEqual(config['bundle']['macOS']['files'],
+                         {'Resources/PrivacyInfo.xcprivacy':'PrivacyInfo.xcprivacy'})
+        self.assertEqual(config['bundle']['macOS']['minimumSystemVersion'],'14.0')
+        for other in ('tauri.conf.json','tauri.linux.conf.json'):
+            text=(resources.ROOT/'desktop/src-tauri'/other).read_text(encoding='utf-8')
+            self.assertNotIn('PrivacyInfo',text)
 
     def test_archive_paths_reject_drive_traversal_nul_and_excessive_depth(self):
         for path in ('','.', '../key','/secret','C:/key','a\\b','a/../b','a\x00b','a/'*33+'b'):

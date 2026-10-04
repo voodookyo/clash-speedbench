@@ -14,6 +14,10 @@ from collections import deque
 from http.server import ThreadingHTTPServer
 
 from speedbench_owner import BackendLease, LeaseError
+import speedbench_power as power
+
+# Fixed startup diagnostic: never include native detail, paths or clock values.
+POWER_CLOCK_STARTUP_ERROR='Desktop suspend/resume clock unavailable; refusing to run unmonitored'
 
 APP_ID='com.voodookyo.clash-speedbench'
 VERSION='1.1.0-alpha.1'
@@ -99,67 +103,88 @@ def main():
     # Explicit isolated resource/data paths come from the parent environment,
     # not a URL or renderer-controlled shell command.
     web=None
+    monitor=None
+    server=None
+    # Initialize and validate the native suspend/resume clock before the
+    # private handshake. A missing or broken API fails closed here rather than
+    # silently falling back to a wall clock.
+    try:
+        clock=power.native_clock()
+        power.validate_sample(clock())
+    except power.PowerClockError:
+        print(POWER_CLOCK_STARTUP_ERROR,file=sys.stderr)
+        return 2
     try:
         frame=sys.stdin.buffer.readline(4097)
         if not frame.endswith(b'\n') or len(frame)>4096:raise DesktopError('Bootstrap frame too large')
         bootstrap=validate_bootstrap(json.loads(frame))
         import speedbench_web as web
+        monitor=web.PowerMonitor(clock)
         with BackendLease(web.DATA_HOME) as lease:
             web.DATA_OWNER=lease
-            web.recover_history_import()
-            server=ThreadingHTTPServer(('127.0.0.1',0),web.Handler)
-            server.daemon_threads=True
-            web.DESKTOP_IDENTITY=public_identity(lease.instance_id)
-            try:preferences=web.Preferences(web.DATA_HOME).read()
-            except web.PreferenceError:preferences={}
-            web.DESKTOP_ACTIONS=DesktopActions(preferences.get('sb_notifications')=='on')
-            web.sync_db();web.speedbench_db.interrupt_tasks(web.db_path())
-            response={**web.DESKTOP_IDENTITY,'port':server.server_port,
-                      'nonce':bootstrap['nonce'],'token':web.WEB_TOKEN}
-            sys.stdout.write(json.dumps(response)+'\n');sys.stdout.flush()
-            # No further structured or human output can accidentally disclose
-            # the private frame on stdout. Rust deliberately never logs it.
-            sys.stdout=sys.stderr
-            exiting=threading.Event()
-            web.DESKTOP_EXITING=exiting
-            shutdown_lock=threading.Lock()
-            shutdown_started=threading.Event()
-            def shutdown():
-                with shutdown_lock:
-                    if shutdown_started.is_set():return
-                    shutdown_started.set()
+            try:
+                web.recover_history_import()
+                server=ThreadingHTTPServer(('127.0.0.1',0),web.Handler)
+                server.daemon_threads=True
+                web.DESKTOP_IDENTITY=public_identity(lease.instance_id)
+                try:preferences=web.Preferences(web.DATA_HOME).read()
+                except web.PreferenceError:preferences={}
+                web.DESKTOP_ACTIONS=DesktopActions(preferences.get('sb_notifications')=='on')
+                web.sync_db();web.speedbench_db.interrupt_tasks(web.db_path())
+                web.DESKTOP_POWER=monitor
+                monitor.start()
+                response={**web.DESKTOP_IDENTITY,'port':server.server_port,
+                          'nonce':bootstrap['nonce'],'token':web.WEB_TOKEN}
+                sys.stdout.write(json.dumps(response)+'\n');sys.stdout.flush()
+                # No further structured or human output can accidentally disclose
+                # the private frame on stdout. Rust deliberately never logs it.
+                sys.stdout=sys.stderr
+                exiting=threading.Event()
+                web.DESKTOP_EXITING=exiting
+                shutdown_lock=threading.Lock()
+                shutdown_started=threading.Event()
+                def shutdown():
+                    with shutdown_lock:
+                        if shutdown_started.is_set():return
+                        shutdown_started.set()
+                    with web.STATE_LOCK:
+                        exiting.set();busy=web.STATE['running'] or web.STATE.get('importing')
+                    if busy:web.cancel_benchmark()
+                    deadline=time.monotonic()+25
+                    while time.monotonic()<deadline:
+                        with web.STATE_LOCK:busy=web.STATE['running'] or web.STATE.get('importing')
+                        if not busy:break
+                        time.sleep(.1)
+                    # A failed cleanup is not presented as success. The parent has
+                    # an independent owned-process-tree timeout and final wait.
+                    server.shutdown()
+                web.DESKTOP_SHUTDOWN=shutdown
+                def controls():
+                    try:
+                        while True:
+                            command=read_control(sys.stdin.buffer)
+                            if command=='cancel':web.cancel_benchmark()
+                            elif command is None or command=='exit':return
+                            elif isinstance(command,dict):web.DESKTOP_ACTIONS.finish(command['request_id'],command['ok'])
+                    except DesktopError:
+                        pass # Fail closed without dumping a private input frame.
+                    finally:
+                        shutdown() # Parent EOF/crash/bad transport: release ownership.
+                threading.Thread(target=controls,daemon=True).start()
+                server.serve_forever(poll_interval=.1)
+                # Match the shutdown wait condition: an import still running at
+                # the deadline, or a failed import left pending, is not a clean exit.
                 with web.STATE_LOCK:
-                    exiting.set();busy=web.STATE['running'] or web.STATE.get('importing')
-                if busy:web.cancel_benchmark()
-                deadline=time.monotonic()+25
-                while time.monotonic()<deadline:
-                    with web.STATE_LOCK:busy=web.STATE['running'] or web.STATE.get('importing')
-                    if not busy:break
-                    time.sleep(.1)
-                # A failed cleanup is not presented as success. The parent has
-                # an independent owned-process-tree timeout and final wait.
-                server.shutdown()
-            web.DESKTOP_SHUTDOWN=shutdown
-            def controls():
-                try:
-                    while True:
-                        command=read_control(sys.stdin.buffer)
-                        if command=='cancel':web.cancel_benchmark()
-                        elif command is None or command=='exit':return
-                        elif isinstance(command,dict):web.DESKTOP_ACTIONS.finish(command['request_id'],command['ok'])
-                except DesktopError:
-                    pass # Fail closed without dumping a private input frame.
-                finally:
-                    shutdown() # Parent EOF/crash/bad transport: release ownership.
-            threading.Thread(target=controls,daemon=True).start()
-            try:server.serve_forever(poll_interval=.1)
-            finally:server.server_close()
-            # Match the shutdown wait condition: an import still running at
-            # the deadline, or a failed import left pending, is not a clean exit.
-            with web.STATE_LOCK:
-                busy=(web.STATE['running'] or web.STATE.get('importing')
-                      or web.STATE.get('import_failed'))
-            return 2 if busy else 0
+                    busy=(web.STATE['running'] or web.STATE.get('importing')
+                          or web.STATE.get('import_failed'))
+                return 2 if busy else 0
+            finally:
+                # Stop and join the owned watcher before the data-owner lease is
+                # released; the thread is bounded and never auto-restarts.
+                if monitor is not None:
+                    monitor.stop();monitor.join()
+                web.DESKTOP_POWER=None
+                if server is not None:server.server_close()
     except Exception:
         # Never dump arbitrary input, nonce, env, credentials or exception URL.
         print('Desktop backend startup or ownership failed',file=sys.stderr)

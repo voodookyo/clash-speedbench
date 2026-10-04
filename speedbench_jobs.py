@@ -40,7 +40,8 @@ METRIC_PHASES = ('connection','discovery','dns','worker_start','delay','exit_v4'
                  'warmup','download','summary','restore','cleanup','probe')
 METRIC_COUNTERS = ('cache_hits','cache_misses','cache_writes','cache_errors','singleflight_reuses',
     'worker_count','nodes','unique_ips','api_calls','usable_results','key_missing','disabled',
-    'cooldown_skips','timeouts','rate_limited','quota_unavailable','invalid_responses')
+    'cooldown_skips','timeouts','rate_limited','quota_unavailable','invalid_responses',
+    'system_resumes','power_clock_errors')
 MILESTONES = ('first_result','first_recommendation','network_complete','intelligence_complete','cleanup_complete')
 CHILD_MILESTONES = ('network_complete','intelligence_complete')
 

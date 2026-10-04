@@ -112,6 +112,17 @@ Windows Job Object owns the backend and descendants before bootstrap; no global
 process-name kill. POSIX uses a dedicated process group and parent EOF cleanup;
 platform crash/forced-signal acceptance is still pending.
 
+The private desktop backend now checks paired native clocks for suspend during
+each accepted task. A confirmed suspend offset increase over 250ms cancels only
+that task through its existing signal/sentinel cleanup path, keeps partial
+results and explains the interruption in live/task-history views. It never
+automatically retries. A broken power clock refuses new measurements until
+restart. Native clock readings stay in memory; only fixed interruption counters
+are persisted. The watcher joins before the data-owner lease is released.
+macOS includes the SystemBootTime required-reason privacy asset. Current proof
+covers macOS clock reads, portable clock simulations and owned Python child
+cancellation; actual sleep/wake in native packages on each OS remains pending.
+
 A kernel-held, private `backend-owner.lock` coordinates desktop and standalone
 Web using the **same data directory**, even on different ports. Metadata alone
 does not prove a live owner; the lock inode is not deleted. Existing-owner

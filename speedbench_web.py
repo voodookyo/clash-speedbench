@@ -44,6 +44,7 @@ import speedbench_sources  # noqa: E402
 import speedbench_tasks  # noqa: E402
 from speedbench_jobs import JobStore, JobError, TERMINAL, _result as safe_job_result
 from speedbench_progress import PREFIX, parse_record
+import speedbench_power as power
 from speedbench_owner import BackendLease, LeaseError
 from speedbench_preferences import Preferences, PreferenceError
 from speedbench_transfer import HistoryTransfer, TransferError, PENDING as IMPORT_PENDING
@@ -103,10 +104,79 @@ DESKTOP_IDENTITY = None
 DESKTOP_ACTIONS = None
 DESKTOP_SHUTDOWN = None
 DESKTOP_EXITING = None
+# Private desktop backends own exactly one PowerMonitor (native ResumeGuard +
+# bounded polling thread). The ordinary browser backend leaves this None and
+# starts no thread or clock detection at all.
+DESKTOP_POWER = None
+POWER_REASONS = ('manual', 'system_resume', 'power_clock_error')
+_POWER_COUNTER_REASON = {'system_resume': 'system_resumes',
+                         'power_clock_error': 'power_clock_errors'}
+POWER_CLOCK_FAILED_MSG = ('本机挂起/恢复时钟不可用；为避免系统休眠干扰测量，'
+                          '已停止接受新任务。请重启应用后重试。')
 RELEASE_CHECKER = speedbench_releases.ReleaseChecker()
 CONFIG_ROOT = RootChoice(os.environ.get(ROOT_ENV,''))
 DATA_OWNER = None
 _TRANSFER = None
+
+
+class PowerMonitor:
+    """Private desktop-only suspend/resume watcher.
+
+    Exactly one native ResumeGuard and one bounded polling thread are owned
+    here. The thread never signals a process or mutates state directly: it
+    reserves an exact current job through the single shared STATE_LOCK helper
+    (which consumes the one-shot guard poll) and only then calls the existing
+    exact-job cooperative cancellation path. There is deliberately no retry,
+    restart or alternate scheduling architecture.
+    """
+
+    DEFAULT_INTERVAL = 0.25
+
+    def __init__(self, clock, interval=None):
+        self.guard = power.ResumeGuard(clock)
+        interval = self.DEFAULT_INTERVAL if interval is None else interval
+        if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval <= 0:
+            interval = self.DEFAULT_INTERVAL
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name='speedbench-power', daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def join(self, timeout=None):
+        if self._thread.is_alive():
+            self._thread.join(timeout)
+
+    def arm(self, job_id):
+        self.guard.arm(job_id)
+
+    def disarm(self, job_id):
+        self.guard.disarm(job_id)
+
+    def poll(self):
+        return self.guard.poll()
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                with STATE_LOCK:
+                    reserved = _reserve_power_cancellation_locked()
+                if reserved is not None:
+                    job_id, reason = reserved
+                    cancel_benchmark(expected_job_id=job_id, reason=reason)
+            except Exception:
+                # An unexpected watcher failure must fail closed: never keep
+                # measuring unmonitored.
+                with STATE_LOCK:
+                    STATE['power_clock_failed'] = True
+                    current = STATE.get('job_id') if STATE.get('running') else None
+                if current:
+                    cancel_benchmark(expected_job_id=current, reason='power_clock_error')
+                return
 
 
 def history_transfer():
@@ -460,6 +530,63 @@ def validate_run_params(params):
     return params
 
 
+def _reserve_cancellation_locked(job_id, reason):
+    """Reserve once while STATE_LOCK protects the current task and terminal decision."""
+    if STATE.get('cancel_requested'):
+        return False
+    STATE['cancel_requested'] = True
+    STATE['cancel_reason'] = reason
+    if job_id:
+        if reason in _POWER_COUNTER_REASON:
+            JOBS.publish(job_id,'phase_finished',phase='cleanup',
+                payload={'metrics':{'cleanup':{'counters':{_POWER_COUNTER_REASON[reason]:1}}}})
+        JOBS.transition(job_id, 'cancelling')
+    return True
+
+
+def _reserve_power_cancellation_locked():
+    """Caller MUST hold STATE_LOCK.
+
+    Single shared reservation helper for the desktop watcher and the runner's
+    terminal decision. It consumes the one-shot native guard poll and, for the
+    exact current active job, atomically reserves cancellation, the fixed
+    reason and the one-time interruption counter before the lock is released.
+    Returns (job_id, reason) when newly reserved, else None. Native clock
+    failure permanently marks this backend and reserves the error reason for
+    the current job too.
+    """
+    monitor = DESKTOP_POWER
+    if monitor is None or STATE.get('power_clock_failed'):
+        return None
+    current = STATE.get('job_id')
+    active = bool(STATE.get('running') and current)
+    failed = False
+    detected = None
+    try:
+        detected = monitor.poll()
+    except power.PowerClockError:
+        STATE['power_clock_failed'] = True
+        failed = True
+    if not active:
+        return None
+    if failed:
+        detected = current
+    if detected != current:
+        return None
+    # Reserve at most once per job: duplicate detections or a manual cancel
+    # must never increment interruption counters repeatedly.
+    if STATE.get('cancel_requested'):
+        return None
+    try:
+        if JOBS.snapshot(current)['status'] in TERMINAL:
+            return None
+    except JobError:
+        return None
+    reason = 'power_clock_error' if failed else 'system_resume'
+    _reserve_cancellation_locked(current, reason)
+    return current, reason
+
+
 def run_benchmark(params: dict) -> None:
     # -u：子进程 stdout 走管道时默认块缓冲，进度行会堵在缓冲区里，
     # 面板看不到实时进度；无缓冲模式让每行立即到达。
@@ -599,23 +726,31 @@ def run_benchmark(params: dict) -> None:
                 STATE["lines"].append(f"!! 历史入库失败: {_redact_runtime_text(e)}")
         if job_id:
             with STATE_LOCK:
-                cancelled = STATE.get('cancel_requested',False)
+                # Consume the one-shot guard poll and reserve cancellation for
+                # this exact job immediately before the terminal decision, even
+                # though the child may already have exited normally. A resume
+                # that landed before the next periodic poll therefore still
+                # becomes a partial terminal result.
+                _reserve_power_cancellation_locked()
+                cancelled = bool(STATE.get('cancel_requested',False))
                 exit_code = STATE['exit_code']
-            if proc is not None and not unreaped and exit_code in (0,130):
-                JOBS.complete_cleanup(job_id)
-            if exit_code == CLEANUP_FAILED_EXIT:
-                with STATE_LOCK:
+                status = JOBS.snapshot(job_id)['status']
+                if proc is not None and not unreaped and exit_code in (0,130):
+                    JOBS.complete_cleanup(job_id)
+                if exit_code == CLEANUP_FAILED_EXIT:
                     STATE['cleanup_incomplete']=True
                     STATE['lines'].append('!! 临时 worker 清理未完成；保留部分结果，任务标记失败，不能确认取消成功。')
-                JOBS.transition(job_id,'failed')
-            elif cancelled or exit_code == 130:
-                JOBS.transition(job_id,'cancelling')
-                JOBS.transition(job_id,'cancelled')
-            elif exit_code == 0 and JOBS.snapshot(job_id)['status']=='finalizing':
-                JOBS.transition(job_id,'completed')
-            else:
-                JOBS.transition(job_id,'failed')
+                    JOBS.transition(job_id,'failed')
+                elif cancelled or exit_code == 130:
+                    JOBS.transition(job_id,'cancelling')
+                    JOBS.transition(job_id,'cancelled')
+                elif exit_code == 0 and status == 'finalizing':
+                    JOBS.transition(job_id,'completed')
+                else:
+                    JOBS.transition(job_id,'failed')
             checkpoint()
+            if DESKTOP_POWER is not None:
+                DESKTOP_POWER.disarm(job_id)
         with STATE_LOCK:
             STATE["running"] = unreaped
             STATE["proc"] = proc if unreaped else None
@@ -632,7 +767,7 @@ def run_benchmark(params: dict) -> None:
             threading.Thread(target=wait_owned_child,daemon=True).start()
 
 
-def cancel_benchmark() -> dict:
+def cancel_benchmark(*, expected_job_id=None, reason='manual') -> dict:
     """中断正在运行的测速子进程。
 
     POSIX 发 SIGINT；Windows 写哨兵文件（面板无控制台后 CTRL_BREAK_EVENT
@@ -640,27 +775,49 @@ def cancel_benchmark() -> dict:
     KeyboardInterrupt）——两者都走 clash_speedbench.py 的 finally 恢复
     Clash 策略组/模式。Windows 的 terminate 是 TerminateProcess，不跑
     finally，所以只作兜底：最多等 5 秒，未退出再 terminate（再兜底 kill）。
+
+    ``expected_job_id`` (internal, not a public IPC parameter) pins the exact
+    job under STATE_LOCK; ``reason`` is one of POWER_REASONS. The cooperative
+    signal/sentinel is only delivered while that ownership check is still
+    locked, so a wake for an old job can never cancel a replacement job. The
+    bounded wait/terminate fallback runs on the captured owned process outside
+    STATE_LOCK. No process-name lookup is ever used.
     """
+    if reason not in POWER_REASONS:
+        return {'ok': False, 'msg': '中断原因无效'}
     with STATE_LOCK:
         proc = STATE.get("proc")
         running = STATE["running"]
         job_id = STATE.get('job_id')
-        if running and job_id:
-            STATE['cancel_requested'] = True
-    if running and job_id:
+        if expected_job_id is not None and job_id != expected_job_id:
+            return {'ok': False, 'msg': '任务已失效，请刷新'}
+        if not running:
+            return {"ok": False, "msg": "当前没有正在进行的测速"}
+        if job_id:
+            try:
+                if JOBS.snapshot(job_id)['status'] in TERMINAL:
+                    return {'ok': False, 'msg': '任务已结束'}
+            except JobError:
+                return {'ok': False, 'msg': '任务已失效，请刷新'}
+            try:
+                _reserve_cancellation_locked(job_id, reason)
+            except JobError:
+                return {'ok': False, 'msg': '任务已失效，请刷新'}
+            if proc is None:
+                return {'ok': True, 'msg': '已取消等待启动的任务；完成清理后会结束'}
+        if proc is None or proc.poll() is not None:
+            return {"ok": False, "msg": "当前没有正在进行的测速"}
+        # Ownership is verified and still locked: only now write the shared
+        # sentinel / signal the captured owned process.
         try:
-            JOBS.transition(job_id,'cancelling')
-        except JobError:
-            return {'ok':False,'msg':'任务已失效，请刷新'}
-        if proc is None:
-            return {'ok':True,'msg':'已取消等待启动的任务；完成清理后会结束'}
-    if not running or proc is None or proc.poll() is not None:
-        return {"ok": False, "msg": "当前没有正在进行的测速"}
+            if sys.platform == "win32":
+                CANCEL_FILE.write_text(str(int(time.time())), encoding="utf-8")
+            else:
+                proc.send_signal(signal.SIGINT)
+        except OSError as e:
+            return {"ok": False, "msg": f"中断失败: {e}"}
+    # Wait/terminate the captured process outside STATE_LOCK.
     try:
-        if sys.platform == "win32":
-            CANCEL_FILE.write_text(str(int(time.time())), encoding="utf-8")
-        else:
-            proc.send_signal(signal.SIGINT)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -670,7 +827,11 @@ def cancel_benchmark() -> dict:
             except subprocess.TimeoutExpired:
                 proc.kill()
         with STATE_LOCK:
-            STATE["lines"].append("!! 测速已被手动中断")
+            if STATE.get('job_id') == job_id:
+                message = {'manual':'!! 测速已被手动中断',
+                    'system_resume':'!! 系统休眠／唤醒中断本轮测量；保留部分结果，不会自动重试。',
+                    'power_clock_error':'!! 无法监测系统休眠／唤醒；保留部分结果，请重启应用。'}
+                STATE["lines"].append(message.get(STATE.get('cancel_reason'), message[reason]))
         return {"ok": True, "msg": "已请求中断测速；请以任务终态和恢复记录确认清理结果"}
     except Exception as e:
         return {"ok": False, "msg": f"中断失败: {e}"}
@@ -1263,9 +1424,13 @@ class Handler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 busy = STATE["running"] or STATE.get('importing') or STATE.get('import_failed')
                 cleanup_incomplete=STATE.get('cleanup_incomplete',False)
+                clock_failed=STATE.get('power_clock_failed',False)
                 root,root_revision=CONFIG_ROOT.snapshot()
             if cleanup_incomplete:
                 self._reject('此前 worker 清理未完成；请退出并核对本任务残留资源后再重新启动，不会强行继续测速',409)
+                return
+            if clock_failed:
+                self._reject(POWER_CLOCK_FAILED_MSG,409)
                 return
             if busy:
                 self._reject("已有测速任务进行中", 409)
@@ -1294,6 +1459,9 @@ class Handler(BaseHTTPRequestHandler):
                 if STATE.get('cleanup_incomplete',False):
                     self._reject('此前 worker 清理未完成；不能接受新任务',409)
                     return
+                if STATE.get('power_clock_failed',False):
+                    self._reject(POWER_CLOCK_FAILED_MSG,409)
+                    return
                 try:
                     config = speedbench_tasks.resolve_config({k:v for k,v in params.items()
                         if k not in ('include','auto_switch','subscription_ids','node_ids','allow_serial')})
@@ -1308,14 +1476,27 @@ class Handler(BaseHTTPRequestHandler):
                     JOBS.transition(job_id,'failed')
                     self._json({'ok':False,'msg':'任务取消通道不可用'},500)
                     return
+                # Arm the exact new job with a fresh native baseline inside the
+                # same ownership hold, before the worker thread or any child
+                # measurement can start. A broken clock fails closed here.
+                if DESKTOP_POWER is not None:
+                    try:
+                        DESKTOP_POWER.arm(job_id)
+                    except power.PowerClockError:
+                        STATE['power_clock_failed']=True
+                        JOBS.transition(job_id,'failed')
+                        self._json({'ok':False,'msg':POWER_CLOCK_FAILED_MSG},500)
+                        return
                 params = dict(params,_job_id=job_id,_config_root=root)
                 STATE.update(running=True, started=time.time(), exit_code=None, proc=None, lines=[],
-                             job_id=job_id,cancel_requested=False)
+                             job_id=job_id,cancel_requested=False,cancel_reason=None)
             try:
                 threading.Thread(target=run_benchmark, args=(params,), daemon=True).start()
             except Exception:
                 with STATE_LOCK:
                     STATE.update(running=False,exit_code=-1)
+                if DESKTOP_POWER is not None:
+                    DESKTOP_POWER.disarm(job_id)
                 JOBS.transition(job_id,'failed')
                 self._json({'ok':False,'msg':'测速任务启动失败'},500)
                 return
@@ -1343,7 +1524,7 @@ class Handler(BaseHTTPRequestHandler):
             if not matches:
                 self._json({'ok':False,'msg':'不是当前活动任务'},409)
             else:
-                self._json(cancel_benchmark())
+                self._json(cancel_benchmark(expected_job_id=job_id))
         elif path == "/api/ip-intel/settings":
             ok, msg = _set_ip_intel_settings(self._read_body())
             self._json({"ok": ok, "msg": msg}, 200 if ok else 400)

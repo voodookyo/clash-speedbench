@@ -137,6 +137,42 @@ class TaskUiJsTest(unittest.TestCase):
         self.assertEqual(out['theme'],'dark');self.assertEqual(out['profile'],'daily')
         self.assertEqual(out['ids'],[identity]);self.assertEqual(out['mode'],'ip')
         self.assertIn('不代表 Chrome',out['environment']);self.assertFalse(out['desktop'])
+    def test_power_notice_is_fixed_chinese_without_raw_values(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const resume=powerNotice({cleanup:{counters:{system_resumes:1}}});
+            const clock=powerNotice({cleanup:{counters:{power_clock_errors:2}}});
+            const both=powerNotice({cleanup:{counters:{system_resumes:1,power_clock_errors:1}}});
+            const none=powerNotice({});
+            const manual=powerNotice({cleanup:{counters:{cache_hits:5}}});
+            console.log(JSON.stringify({resume,clock,both,none,manual}));})();
+        """)
+        self.assertIn('从睡眠',out['resume']);self.assertIn('手动',out['resume'])
+        self.assertIn('未报告的流量',out['resume']);self.assertNotIn('<',out['resume'])
+        self.assertIn('重启应用',out['clock']);self.assertIn('不会自动重试',out['clock'])
+        self.assertIn('从睡眠',out['both']);self.assertIn('重启应用',out['both'])
+        self.assertEqual(out['none'],'');self.assertEqual(out['manual'],'')
+
+    def test_power_explanations_appear_in_live_and_history_views(self):
+        job='job_'+'a'*32
+        task={'job_id':job,'status':'cancelled','partial':True,'mode':'quick',
+              'elapsed_ms':1234,'results':[],'config':{'mode':'quick'},
+              'metrics':{'cleanup':{'duration_ms':0,'attempts':0,'successes':0,'bytes':0,
+                                    'counters':{'power_clock_errors':1}}}}
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            showTask(%s);
+            const live=document.getElementById('task-summary').textContent;
+            await showTaskHistory(%s);
+            const html=document.getElementById('task-detail').innerHTML;
+            console.log(JSON.stringify({live,html}));})();
+        """ % (json.dumps(task), json.dumps(job)), {'/api/tasks/'+job:task})
+        self.assertIn('重启应用',out['live'])
+        self.assertIn('重启应用',out['html'])
+        self.assertNotIn('<script',out['html'])
+        self.assertNotIn('SECRET',out['html'])
+        self.assertNotIn('power_clock_errors',out['html'])
+
     def run_app(self,driver,data=None):
         stub=STUB_JS.replace('__FETCH_MAP__',json.dumps(data or {}))
         code=stub+'\n'+MODULE.read_text(encoding='utf-8')+'\n'+APP_JS.read_text(encoding='utf-8')+'\n'+driver

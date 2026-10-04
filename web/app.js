@@ -1464,6 +1464,20 @@ async function attachTask(id){
     onChange:showTask,onError:e=>toast('任务连接中断；刷新任务中心可恢复',false)});
   await taskClient.attach(id);
 }
+function powerNotice(metrics){
+  // Fixed Chinese explanation derived only from known interruption counters.
+  // Never render raw API errors, caller text, timestamps or durations.
+  let resumes=0,clockErrors=0;
+  for(const metric of Object.values(metrics||{})){
+    const counters=(metric&&metric.counters)||{};
+    if(Number.isSafeInteger(counters.system_resumes)) resumes+=counters.system_resumes;
+    if(Number.isSafeInteger(counters.power_clock_errors)) clockErrors+=counters.power_clock_errors;
+  }
+  const parts=[];
+  if(resumes>0) parts.push('检测到系统从睡眠/休眠中恢复，任务已中断并保留已测部分结果；未报告的流量不计入统计。可手动重新开始测速，不会自动重试或自动恢复测量。');
+  if(clockErrors>0) parts.push('本机挂起/恢复时钟不可用，任务已中断并保留已测部分结果；请重启应用后再试，不会自动重试。');
+  return parts.join(' ');
+}
 function showTask(task){
   activeTask=task;
   const running=!SBTasks.terminal(task.status);
@@ -1479,7 +1493,8 @@ function showTask(task){
   const bytes=Object.values(task.metrics||{}).reduce((n,m)=>n+(m.bytes||0),0);
   const elapsed=task.elapsed_ms==null?'未知':(task.elapsed_ms/1000).toFixed(1)+'s';
   document.getElementById('task-stage').textContent=text;
-  document.getElementById('task-summary').textContent=`${running?'截至此更新，已等待':'总耗时'} ${elapsed} · 已报告实际下载 ${(bytes/1000000).toFixed(2)} MB · IPv4/IPv6 独立更新${running?' · 剩余时间尚无法可靠估计':' · 中断中的未报告字节不计入此值'}`;
+  const notice=powerNotice(task.metrics);
+  document.getElementById('task-summary').textContent=`${running?'截至此更新，已等待':'总耗时'} ${elapsed} · 已报告实际下载 ${(bytes/1000000).toFixed(2)} MB · IPv4/IPv6 独立更新${running?' · 剩余时间尚无法可靠估计':' · 中断中的未报告字节不计入此值'}${notice?' · '+notice:''}`;
   latestData={ts:task.started_at,results:task.results||[],task:task.config};
   document.getElementById('latest-meta').textContent=`${task.config?.mode||task.mode||'未知模式'} · ${text} · ${latestData.results.length} 个已返回节点 · 已测范围内推荐`;
   renderTable();renderBoard();
@@ -1511,7 +1526,8 @@ async function showTaskHistory(id){
   selectedTaskHistoryId=id;
   detail.hidden=false;
   const metrics=Object.entries(task.metrics||{}).map(([phase,m])=>`<tr><td>${esc(phase)}</td><td>${(m.duration_ms/1000).toFixed(2)}s</td><td>${m.successes}/${m.attempts}</td><td>${(m.bytes/1000000).toFixed(2)} MB</td></tr>`).join('');
-  detail.innerHTML=`<h2>${esc(taskLabels[task.status]||task.status)}</h2><p class="muted">${esc(task.mode)} · ${task.partial?'部分结果':'完整任务'} · 重叠阶段耗时不可直接相加。流量仅统计已报告的 curl 实际字节。</p><div class="table-wrap"><table><thead><tr><th>阶段</th><th>耗时</th><th>成功/尝试</th><th>已报告实际下载</th></tr></thead><tbody>${metrics||emptyRow('旧记录无阶段耗时',4)}</tbody></table></div><div class="table-wrap"><table><thead><tr><th>#</th><th>节点</th><th>延迟</th><th>带宽</th><th>Network</th><th>IP Grade</th><th>IP 类型</th><th>风险</th><th>标签</th><th></th></tr></thead><tbody>${(task.results||[]).map((r,i)=>rowHtml(r,i,{readonly:true,favs:new Set()})).join('')||emptyRow('任务尚未返回节点结果',10)}</tbody></table></div>`;
+  const notice=powerNotice(task.metrics);
+  detail.innerHTML=`<h2>${esc(taskLabels[task.status]||task.status)}</h2><p class="muted">${esc(task.mode)} · ${task.partial?'部分结果':'完整任务'} · 重叠阶段耗时不可直接相加。流量仅统计已报告的 curl 实际字节。</p>${notice?`<p class="muted">${esc(notice)}</p>`:''}<div class="table-wrap"><table><thead><tr><th>阶段</th><th>耗时</th><th>成功/尝试</th><th>已报告实际下载</th></tr></thead><tbody>${metrics||emptyRow('旧记录无阶段耗时',4)}</tbody></table></div><div class="table-wrap"><table><thead><tr><th>#</th><th>节点</th><th>延迟</th><th>带宽</th><th>Network</th><th>IP Grade</th><th>IP 类型</th><th>风险</th><th>标签</th><th></th></tr></thead><tbody>${(task.results||[]).map((r,i)=>rowHtml(r,i,{readonly:true,favs:new Set()})).join('')||emptyRow('任务尚未返回节点结果',10)}</tbody></table></div>`;
 }
 function applyTheme(){
   const theme=lsGet('sb_theme')||'system';

@@ -1,3 +1,4 @@
+import contextlib
 import io
 import os
 import json
@@ -174,15 +175,35 @@ class _FakeLease:
     def __exit__(self,*_):return False
 
 
+class _RecordingLease:
+    """Records lease release so monitor shutdown ordering can be asserted."""
+    instance_id='fixture-lease'
+    def __init__(self,events):self.events=events
+    def __enter__(self):return self
+    def __exit__(self,*_):self.events.append('lease_exit');return False
+
+
+class _FakeMonitor:
+    """Owned PowerMonitor stand-in: no thread, records start/stop/join order."""
+    def __init__(self,clock,events,interval=None):
+        self.clock=clock;self.events=events
+    def start(self):self.events.append('start')
+    def stop(self):self.events.append('stop')
+    def join(self,timeout=None):self.events.append('join')
+    def arm(self,job_id):self.events.append('arm')
+    def disarm(self,job_id):self.events.append('disarm')
+    def poll(self):return None
+
+
 class DesktopExitCodeTest(unittest.TestCase):
     """The production main()/shutdown() path, driven over a fake private pipe,
     fake clock and fake loopback server; no real controller or data home."""
-    def run_main(self,state,clock):
+    def run_main(self,state,clock,monitor_factory=None,lease_factory=None,recover=None,server_factory=None):
         frame=json.dumps({'protocol':1,'parent_pid':os.getppid(),'nonce':'c'*64}).encode()+b'\n'
         handshake=_FakeHandshakeStdout()
         cancelled=[]
         names=('DATA_HOME','DATA_OWNER','DESKTOP_IDENTITY','DESKTOP_ACTIONS',
-               'DESKTOP_SHUTDOWN','DESKTOP_EXITING')
+               'DESKTOP_SHUTDOWN','DESKTOP_EXITING','DESKTOP_POWER')
         snapshot={name:getattr(web,name) for name in names}
         with web.STATE_LOCK:
             state_snapshot=dict(web.STATE)
@@ -190,15 +211,27 @@ class DesktopExitCodeTest(unittest.TestCase):
         saved_stdin,saved_stdout=sys.stdin,sys.stdout
         sys.stdin=type('stdin',(),{'buffer':_FakeParentPipe(frame)})();sys.stdout=handshake
         try:
-            with tempfile.TemporaryDirectory() as folder,\
-                 mock.patch.object(desktop,'BackendLease',lambda home:_FakeLease()),\
-                 mock.patch.object(desktop,'ThreadingHTTPServer',_FakeBackendServer),\
-                 mock.patch.object(desktop,'time',clock),\
-                 mock.patch.object(web,'DATA_HOME',Path(folder)),\
-                 mock.patch.object(web,'recover_history_import',lambda:False),\
-                 mock.patch.object(web,'sync_db',lambda:0),\
-                 mock.patch.object(web,'cancel_benchmark',lambda:cancelled.append(True)),\
-                 mock.patch.object(web.speedbench_db,'interrupt_tasks',lambda path:None):
+            with tempfile.TemporaryDirectory() as folder,contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    desktop,'BackendLease',lease_factory or (lambda home:_FakeLease())))
+                stack.enter_context(mock.patch.object(desktop,'ThreadingHTTPServer',server_factory or _FakeBackendServer))
+                stack.enter_context(mock.patch.object(desktop,'time',clock))
+                # A deterministic native clock keeps lifecycle tests portable.
+                stack.enter_context(mock.patch.object(
+                    desktop.power,'native_clock',lambda:(lambda:(0,0))))
+                stack.enter_context(mock.patch.object(web,'DATA_HOME',Path(folder)))
+                if isinstance(recover,BaseException):
+                    stack.enter_context(mock.patch.object(
+                        web,'recover_history_import',side_effect=recover))
+                elif recover is not None:
+                    stack.enter_context(mock.patch.object(web,'recover_history_import',recover))
+                else:
+                    stack.enter_context(mock.patch.object(web,'recover_history_import',lambda:False))
+                stack.enter_context(mock.patch.object(web,'sync_db',lambda:0))
+                stack.enter_context(mock.patch.object(web,'cancel_benchmark',lambda:cancelled.append(True)))
+                stack.enter_context(mock.patch.object(web.speedbench_db,'interrupt_tasks',lambda path:None))
+                if monitor_factory is not None:
+                    stack.enter_context(mock.patch.object(web,'PowerMonitor',monitor_factory))
                 code=desktop.main()
             return code,handshake.text,cancelled
         finally:
@@ -227,6 +260,59 @@ class DesktopExitCodeTest(unittest.TestCase):
         self.assertEqual(json.loads(handshake)['nonce'],'c'*64)
         self.assertTrue(cancelled)
         self.assertEqual(code,0)
+
+    def test_monitor_stops_and_joins_before_lease_release_on_parent_eof(self):
+        events=[]
+        monitor=_FakeMonitor(None,events)
+        code,handshake,cancelled=self.run_main(
+            {'running':False},_FakeClock(),
+            monitor_factory=lambda clock,interval=None:monitor,
+            lease_factory=lambda home:_RecordingLease(events))
+        self.assertEqual(json.loads(handshake)['nonce'],'c'*64)
+        self.assertEqual(code,0)
+        self.assertIn('start',events)
+        self.assertIn('stop',events)
+        self.assertIn('join',events)
+        self.assertIn('lease_exit',events)
+        self.assertLess(events.index('stop'),events.index('lease_exit'))
+        self.assertLess(events.index('join'),events.index('lease_exit'))
+        self.assertIsNone(web.DESKTOP_POWER)
+
+    def test_monitor_closed_and_globals_restored_on_startup_failure(self):
+        events=[]
+        monitor=_FakeMonitor(None,events)
+        code,handshake,_=self.run_main(
+            {'running':False},_FakeClock(),
+            monitor_factory=lambda clock,interval=None:monitor,
+            lease_factory=lambda home:_RecordingLease(events),
+            recover=RuntimeError('canary-startup'))
+        self.assertEqual(code,2)
+        self.assertEqual(handshake,'')
+        self.assertIn('stop',events)
+        self.assertIn('join',events)
+        self.assertIn('lease_exit',events)
+        self.assertLess(events.index('join'),events.index('lease_exit'))
+        self.assertIsNone(web.DESKTOP_POWER)
+        self.assertIsNone(web.DATA_OWNER)
+
+    def test_monitor_start_failure_closes_bound_server_before_lease_release(self):
+        events=[]
+        class Monitor(_FakeMonitor):
+            def start(self):
+                self.events.append('start')
+                raise RuntimeError('fixture thread start failure')
+        class Server(_FakeBackendServer):
+            def server_close(self):events.append('server_close')
+        monitor=Monitor(None,events)
+        with contextlib.redirect_stderr(io.StringIO()):
+            code,handshake,_=self.run_main(
+                {'running':False},_FakeClock(),
+                monitor_factory=lambda clock:monitor,
+                lease_factory=lambda home:_RecordingLease(events),server_factory=Server)
+        self.assertEqual(code,2)
+        self.assertEqual(handshake,'')
+        self.assertLess(events.index('join'),events.index('lease_exit'))
+        self.assertLess(events.index('server_close'),events.index('lease_exit'))
 
 
 class DesktopApiTest(WebServerCase):
