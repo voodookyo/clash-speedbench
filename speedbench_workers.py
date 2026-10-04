@@ -1345,7 +1345,8 @@ def choose_task_nodes(results, args):
         ids = [(r.origin or {}).get('node_id') for r in results
                if (r.origin or {}).get('identity_strength') == 'strong']
         history = getattr(args, 'history', None)
-        args._candidate_history = (candidate_history_hints(Path(history).with_suffix('.db'), ids)
+        args._candidate_history = (candidate_history_hints(Path(history).with_suffix('.db'), ids,
+                                                           target_profile=config.target_profile)
                                    if history and ids and not config.measure_all else {})
     by_name = {r.name:r for r in results}
     rows = []
@@ -1354,9 +1355,12 @@ def choose_task_nodes(results, args):
         strong = origin.get('identity_strength') == 'strong'
         hint = args._candidate_history.get(origin.get('node_id'), {}) if strong else {}
         row = dict(name=r.name, latency_ms=r.latency_ms, node_id=origin.get('node_id',''),
+                   jitter_ms=r.jitter_ms,probe_loss_pct=r.probe_loss_pct,
                    identity_strength=origin.get('identity_strength'),
                    subscription_ids=origin.get('subscription_ids',[]),
                    recent_mbps=hint.get('recent_mbps'), history_age_days=hint.get('history_age_days'),
+                   recent_ip_quality=hint.get('recent_ip_quality'),
+                   recent_ip_category=hint.get('recent_ip_category'),recent_ip_confidence=hint.get('recent_ip_confidence'),
                    region=r.ip.country_code if r.ip and r.ip.ok else hint.get('region'))
         rows.append(row)
     selected = select_candidates(rows, config.top_n, measure_all=config.measure_all,
@@ -1523,6 +1527,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         stats = _coerce_probe_stats(latency_map.get(name,(None,None)),attempts=_probe_count_from_args(args))
         r = Result(name=name,provider='',proto=str(p.get('type','')),latency_ms=stats.latency_ms,
                    speeds_mbps=[],median_mbps=None,best_mbps=None,status='ok')
+        _apply_probe_stats(r,stats)
         apply_origin(r,getattr(args,'source_origins',{}).get(name))
         provisional.append(r)
     initial_chosen = choose_task_nodes(provisional,args)

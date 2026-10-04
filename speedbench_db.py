@@ -841,13 +841,50 @@ def all_runs(db_path) -> list:
         conn.close()
 
 
-def candidate_history_hints(db_path, node_ids, *, now=None) -> dict:
+def _candidate_ip_hint(rows, exits):
+    """Conservative public history hints, including the worse observed family."""
+    qualities=[];categories=[];confidences=[];seen=set()
+    ranks={'residential':7,'corporate':6,'mobile':5.5,'residential_proxy':5,
+           'datacenter':3.5,'vpn_proxy':2,'unknown':0}
+    grades={'S':95,'A':85,'B':70,'C':50,'D':20}
+    def number(value):
+        return float(value) if isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and 0<=value<=100 else None
+    for address,quality,grade,category,confidence,fraud,scam,conflicts,normalized in rows:
+        seen.add(address)
+        values=[v for v in (number(quality),grades.get(grade)) if v is not None]
+        values.extend(100-v for v in (number(fraud),number(scam)) if v is not None)
+        observed=bool(values)
+        confidence=number(confidence)
+        if confidence is not None:values.append(confidence)
+        if category not in ranks:category='unknown'
+        if category=='unknown' or conflicts:values.append(35)
+        try:data=json.loads(normalized)
+        except (ValueError,TypeError):data=None
+        if not isinstance(data,dict):values.append(35)
+        else:
+            for key,cap in (('tor',10),('vpn',20),('proxy',25),('hosting',45),('mobile',75),
+                            ('residential_proxy',55),('ipqs_recent_abuse',30),
+                            ('scamalytics_blacklisted',20),('scamalytics_datacenter',45)):
+                if data.get(key) is True:values.append(cap);observed=True
+        qualities.append(min(values) if observed else 0)
+        if not observed:category='unknown'
+        categories.append(category);confidences.append(confidence or 0)
+    if any(address and address not in seen for address in exits):
+        qualities.append(0);categories.append('unknown');confidences.append(0)
+    if not qualities:return {}
+    return dict(recent_ip_quality=min(qualities),
+                recent_ip_category=min(categories,key=lambda value:ranks[value]),
+                recent_ip_confidence=min(confidences))
+
+
+def candidate_history_hints(db_path, node_ids, *, now=None, target_profile='balanced') -> dict:
     """Bounded read-only hints for this task's strong stable-ID scope.
 
     Never creates/migrates a database, imports raw history, matches a name or
     returns a previous measurement as a present result. Missing/old/busy
     databases silently fall back to current probes. Seven-day successful
-    single-stream samples and validated country codes are selection hints
+    single-stream samples or target-specific conservative IP summaries and
+    validated country codes are selection hints
     only; country/exit reputations may have changed since that observation.
     """
     ids = sorted({v for v in list(node_ids)[:3000] if isinstance(v, str)
@@ -874,6 +911,16 @@ def candidate_history_hints(db_path, node_ids, *, now=None) -> dict:
                  WHERE n.node_id=? AND n.identity_version=2
                  AND n.identity_strength='strong' AND n.status='ok'
                  AND n.median_mbps>0 ORDER BY n.id DESC LIMIT 1'''
+        ip_target=target_profile in ('ip','residential')
+        if ip_target:
+            sql='''SELECT n.run_id,r.ts,n.exit_ipv4,n.exit_ipv6,
+                   (SELECT p.country_code FROM ip_profiles p WHERE p.node_result_id=n.id
+                    AND p.ok=1 ORDER BY p.id DESC LIMIT 1)
+                   FROM node_results n JOIN runs r ON r.id=n.run_id
+                   WHERE n.node_id=? AND n.identity_version=2 AND n.identity_strength='strong'
+                   AND n.status='ok' AND EXISTS(SELECT 1 FROM ip_intel_results i
+                     WHERE i.run_id=n.run_id AND i.exit_ip IN (n.exit_ipv4,n.exit_ipv6))
+                   ORDER BY n.id DESC LIMIT 1'''
         for node_id in ids:
             if time.monotonic() >= deadline:
                 # Do not bias a large task towards the first sorted IDs when
@@ -882,20 +929,28 @@ def candidate_history_hints(db_path, node_ids, *, now=None) -> dict:
             row = conn.execute(sql, (node_id,)).fetchone()
             if not row:
                 continue
-            speed, stamp, region = row
+            if ip_target:run_id,stamp,ipv4,ipv6,region=row
+            else:speed,stamp,region=row
             try:
                 date = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
                 # Historical CLI timestamps without an offset are local time.
                 age = (observed_now - date.astimezone(timezone.utc)).total_seconds() / 86400
-                if (not isinstance(speed, (int, float)) or not math.isfinite(speed)
-                        or speed <= 0 or not 0 <= age <= 7):
-                    continue
+                if not 0<=age<=7:continue
+                if not ip_target and (not isinstance(speed,(int,float)) or not math.isfinite(speed) or speed<=0):continue
             except (ValueError, TypeError, AttributeError, OverflowError, OSError):
                 continue
-            hint = dict(recent_mbps=speed, history_age_days=age)
+            hint=dict(history_age_days=age)
+            if ip_target:
+                rows=conn.execute('''SELECT exit_ip,ip_quality_score,ip_grade,classification,confidence,
+                    ipqs_fraud_score,scamalytics_score,CASE WHEN conflicts_json='[]' THEN 0 ELSE 1 END,
+                    substr(normalized_json,1,65536) FROM ip_intel_results
+                    WHERE run_id=? AND exit_ip IN (?,?)''',(run_id,ipv4,ipv6)).fetchall()
+                hint.update(_candidate_ip_hint(rows,(ipv4,ipv6)))
+            else:hint['recent_mbps']=speed
             if isinstance(region, str) and re.fullmatch(r'[A-Z]{2}', region):
                 hint['region'] = region
             hints[node_id] = hint
+        if time.monotonic()>=deadline:return {}
     except (sqlite3.Error, OSError, ValueError):
         # Optional enrichment cannot make a task fail or leak a local path,
         # corrupt database content, credentials or raw exception in logs.

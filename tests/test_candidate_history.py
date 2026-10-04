@@ -26,11 +26,15 @@ class CandidateHistoryTest(unittest.TestCase):
         self.jsonl = self.path.with_suffix('.jsonl')
 
     def insert(self, *, node=None, age=1, strength='strong', speed=80,
-               name='改名前', status='ok', region='US', ts=None):
+               name='改名前', status='ok', region='US', ts=None, intelligence=None, ipv6=None):
         row = dict(name=name, node_id=node or self.a, identity_version=2,
                    identity_strength=strength, source_status='unknown',
                    median_mbps=speed, status=status,
                    ip=dict(ok=True, country_code=region, exit_ip='203.0.113.1'))
+        if intelligence is not None:
+            row.update(exit_ipv4='203.0.113.1',intel_v4=dict(ip='203.0.113.1',**intelligence))
+        if ipv6 is not None:
+            row.update(exit_ipv6='2001:db8::1',intel_v6=dict(ip='2001:db8::1',**ipv6))
         record = dict(ts=ts or (self.now - timedelta(days=age)).isoformat(), results=[row])
         with self.jsonl.open('a', encoding='utf-8') as f:
             f.write(json.dumps(record) + '\n')
@@ -107,6 +111,36 @@ class CandidateHistoryTest(unittest.TestCase):
         with mock.patch.object(db.time, 'monotonic', side_effect=[0, 0, 1]):
             self.assertEqual(self.hints([self.a, self.b]), {})
 
+    def test_ip_hint_can_come_from_ip_only_run_and_never_returns_exit_or_raw(self):
+        self.insert(speed=None,intelligence=dict(ip_quality_score=80,ip_grade='A',classification='residential',
+                                                confidence=90,provider_status={'ipqs':'ok'},raw={'key':'CANARY'}))
+        before=self.path.read_bytes()
+        hints=db.candidate_history_hints(self.path,[self.a],now=self.now,target_profile='residential')
+        self.assertEqual(hints[self.a],dict(history_age_days=1,region='US',recent_ip_quality=80,
+                         recent_ip_category='residential',recent_ip_confidence=90))
+        self.assertNotIn('CANARY',json.dumps(hints));self.assertNotIn('203.0.113',json.dumps(hints))
+        self.assertEqual(self.path.read_bytes(),before)
+
+    def test_dual_stack_history_uses_worse_reputation_and_category(self):
+        self.insert(intelligence=dict(ip_quality_score=85,ip_grade='A',classification='residential',confidence=95),
+                    ipv6=dict(ip_quality_score=25,ip_grade='D',classification='vpn_proxy',confidence=90))
+        hints=db.candidate_history_hints(self.path,[self.a],now=self.now,target_profile='residential')
+        self.assertEqual(hints[self.a]['recent_ip_quality'],20)
+        self.assertEqual(hints[self.a]['recent_ip_category'],'vpn_proxy')
+
+    def test_ip_hint_ignores_changed_identity_stale_and_foreign_exit(self):
+        self.insert(node=self.b,age=8,intelligence=dict(ip_quality_score=85,classification='residential',confidence=90))
+        self.assertEqual(db.candidate_history_hints(self.path,[self.a],now=self.now,target_profile='ip'),{})
+        self.assertEqual(db.candidate_history_hints(self.path,[self.b],now=self.now,target_profile='ip'),{})
+
+    def test_production_daily_passes_current_probe_evidence_without_copying_history(self):
+        rows=[self.result('a',self.a,10),self.result('b',self.b,11)]
+        rows[0].jitter_ms=150;rows[0].probe_loss_pct=50
+        rows[1].jitter_ms=3;rows[1].probe_loss_pct=0
+        args=mk_args(history=str(self.jsonl),task_config=resolve_config(dict(mode='quick',top_n=1,target_profile='daily')))
+        self.assertEqual(workers.choose_task_nodes(rows,args)[0].name,'b')
+        self.assertTrue(all(r.median_mbps is None and r.ip is None for r in rows))
+
     def result(self, name, node_id, latency, strength='strong'):
         r = core.Result(name=name, provider='', proto='ss', latency_ms=latency,
                         speeds_mbps=[], median_mbps=None, best_mbps=None, status='ok')
@@ -118,8 +152,8 @@ class CandidateHistoryTest(unittest.TestCase):
         args = mk_args(history=str(self.jsonl), task_config=resolve_config(
             dict(mode='quick', top_n=1, target_profile='download')))
         rows = [self.result('a', self.a, 10), self.result('b', self.b, 20)]
-        with mock.patch.object(db, 'candidate_history_hints', wraps=lambda p, ids:
-                               db_loader(p, ids, now=self.now)) as loader:
+        with mock.patch.object(db, 'candidate_history_hints', wraps=lambda p, ids, **options:
+                               db_loader(p, ids, now=self.now, **options)) as loader:
             self.assertEqual([r.name for r in workers.choose_task_nodes(rows, args)], ['b'])
             self.assertEqual([r.name for r in workers.choose_task_nodes(rows, args)], ['b'])
             self.assertEqual(loader.call_count, 1)

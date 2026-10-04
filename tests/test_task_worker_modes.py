@@ -94,6 +94,12 @@ class TaskWorkerModeTest(unittest.TestCase):
         chosen = workers.choose_task_nodes(rows,self.args('standard',top_n=2))
         self.assertEqual([r.name for r in chosen],['a','c'])
 
+    def test_daily_initial_exit_scope_uses_main_probe_jitter(self):
+        _results,calls,_worker,_stdout=self.run_mock(self.args('quick',top_n=1,target_profile='daily'),
+                                                   {'A':(100,150),'B':(101,3)})
+        self.assertEqual([call[1] for call in calls if call[0]=='probe'],['B'])
+        self.assertEqual([call[1] for call in calls if call[0]=='speed'],['B'])
+
     def test_dynamic_workers_load_whole_pending_dependency_scope(self):
         _results,_calls,worker,_stdout = self.run_mock(self.args('ip',workers=2), {'A':(100,1),'B':(200,2)})
         for call in worker.call_args_list:
