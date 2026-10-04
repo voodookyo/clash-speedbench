@@ -24,6 +24,16 @@ def ledger(root, ts, speed=12, *, whitespace=False):
     return raw
 
 
+def fixture_task(db_path):
+    """One real queued task persisted through the production save path."""
+    from speedbench_jobs import JobStore
+    from speedbench_tasks import resolve_config
+    jobs = JobStore()
+    snapshot = jobs.snapshot(jobs.create(resolve_config({'mode': 'quick'})))
+    db.save_task(db_path, snapshot)
+    return snapshot
+
+
 class HistoryTransferTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -297,3 +307,72 @@ class HistoryTransferTest(unittest.TestCase):
         self.assertIsNotNone(status['backup_id']);self.assertTrue(status['can_rollback'])
         restarted.rollback(status['backup_id'],self.owner)
         self.assertFalse((self.home/'speedbench-history.jsonl').exists())
+
+    def _home_state(self):
+        return ({p.name:p.read_bytes() for p in self.home.iterdir() if p.is_file()},
+                {p.name for p in self.home.iterdir() if p.is_dir()})
+
+    def _assert_preview_rejected_without_write(self, error_fragment):
+        import speedbench_transfer as transfer
+        files,dirs=self._home_state()
+        before_pending=(self.home/transfer.PENDING).exists()
+        before_last=(self.home/transfer.LAST).exists()
+        with self.assertRaises(TransferError) as caught:self.preview()
+        self.assertIn(error_fragment,str(caught.exception))
+        self.assertEqual(self._home_state(),(files,dirs))
+        self.assertFalse((self.home/'history-import-backups').exists())
+        self.assertEqual((self.home/transfer.PENDING).exists(),before_pending)
+        self.assertEqual((self.home/transfer.LAST).exists(),before_last)
+
+    def test_union_cap_rejects_over_limit_runs_before_any_write(self):
+        import speedbench_transfer as transfer
+        ledger(self.home,'2026-10-01T01:00:00')
+        ledger(self.home,'2026-10-02T01:00:00')
+        ledger(self.source,'2026-10-03T01:00:00')
+        ledger(self.source,'2026-10-04T01:00:00')
+        with mock.patch.object(transfer,'MAX_RUNS',2):
+            self._assert_preview_rejected_without_write('合并后的历史')
+
+    def test_union_cap_rejects_over_limit_tasks_before_any_write(self):
+        import speedbench_transfer as transfer
+        fixture_task(self.home/'speedbench-history.db');fixture_task(self.home/'speedbench-history.db')
+        fixture_task(self.source/'speedbench-history.db');fixture_task(self.source/'speedbench-history.db')
+        with mock.patch.object(transfer,'MAX_RUNS',2):
+            self._assert_preview_rejected_without_write('任务历史')
+
+    def test_union_cap_accepts_duplicate_records_and_tasks_and_stays_idempotent(self):
+        import speedbench_transfer as transfer
+        ledger(self.home,'2026-10-01T01:00:00')
+        ledger(self.home,'2026-10-02T01:00:00')
+        ledger(self.source,'2026-10-01T01:00:00')
+        ledger(self.source,'2026-10-03T01:00:00')
+        shared=fixture_task(self.home/'speedbench-history.db')
+        fixture_task(self.home/'speedbench-history.db')
+        db.save_task(self.source/'speedbench-history.db',shared)
+        fixture_task(self.source/'speedbench-history.db')
+        with mock.patch.object(transfer,'MAX_RUNS',3):
+            preview=self.preview()
+            self.assertEqual((preview['new_runs'],preview['new_tasks']),(1,1))
+            result=self.service.apply(preview['token'],self.owner)
+            self.assertEqual((result['imported_runs'],result['imported_tasks']),(1,1))
+            merged=(self.home/'speedbench-history.jsonl').read_bytes()
+            repeated=self.service.apply(self.preview()['token'],self.owner)
+            self.assertEqual((repeated['imported_runs'],repeated['imported_tasks']),(0,0))
+            self.assertIsNone(repeated['backup_id'])
+            self.assertEqual((self.home/'speedbench-history.jsonl').read_bytes(),merged)
+            self.assertEqual(len(db.all_runs(self.home/'speedbench-history.db')),3)
+
+    def test_union_cap_counts_db_only_destination_records_alongside_ledger(self):
+        import speedbench_transfer as transfer
+        raw=ledger(self.home,'2026-10-01T01:00:00')
+        home_db=self.home/'speedbench-history.db'
+        db.import_jsonl(home_db,self.home/'speedbench-history.jsonl')
+        ledger(self.home,'2026-10-05T01:00:00')
+        db.import_jsonl(home_db,self.home/'speedbench-history.jsonl')
+        (self.home/'speedbench-history.jsonl').write_bytes((raw+'\n').encode('utf-8'))
+        destination=transfer._snapshot(self.home,destination=True)
+        self.assertEqual(set(destination['records']),{'2026-10-01T01:00:00','2026-10-05T01:00:00'})
+        ledger(self.source,'2026-10-06T01:00:00')
+        ledger(self.source,'2026-10-07T01:00:00')
+        with mock.patch.object(transfer,'MAX_RUNS',3):
+            self._assert_preview_rejected_without_write('合并后的历史')

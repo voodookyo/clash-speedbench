@@ -1015,7 +1015,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         data_paths = {'/api/latest','/api/history','/api/catalog','/api/node',
             '/api/source','/api/sources/history','/api/subscriptions','/api/subscription',
-            '/api/preferences','/api/leak/audits','/api/leak/history','/api/tasks'}
+            '/api/preferences','/api/leak/audits','/api/leak/history','/api/tasks',
+            '/api/ip-intel/status'}
         if path in data_paths or path.startswith('/api/tasks/'):
             if self._data_busy():return
             with _DB_SYNC_LOCK:
@@ -1063,8 +1064,10 @@ class Handler(BaseHTTPRequestHandler):
                 home=DATA_HOME.resolve();history=HISTORY.resolve()
                 database=HISTORY.with_suffix('.db').resolve()
                 source_history=HERE/'speedbench-history.jsonl'
+                source_database=HERE/'speedbench-history.db'
                 alternate=(dict(path=str(source_history.parent.resolve()),
-                                jsonl_exists=source_history.is_file())
+                                jsonl_exists=source_history.is_file(),
+                                database_exists=source_database.is_file())
                            if source_history.parent.resolve()!=home else None)
                 self._json(dict(ok=True,data_home=str(home),automatic_import=False,
                     history=dict(jsonl_path=str(history),jsonl_exists=history.is_file(),

@@ -248,6 +248,10 @@ def _snapshot(root, *, destination=False):
 def _plan(source, destination):
     new = {ts: raw for ts, raw in source['records'].items() if ts not in destination['records']}
     new_tasks = {job: row for job, row in source['tasks'].items() if job not in destination['tasks']}
+    if len(destination['records']) + len(new) > MAX_RUNS:
+        raise TransferError('合并后的历史将超过 10000 轮限制，请先清理或拆分来源副本')
+    if len(destination['tasks']) + len(new_tasks) > MAX_RUNS:
+        raise TransferError('合并后的任务历史将超过 10000 项限制')
     conflicts = sum(raw != destination['records'][ts] for ts, raw in source['records'].items()
                     if ts in destination['records'])
     conflicts += sum(row != destination['tasks'][job] for job, row in source['tasks'].items()

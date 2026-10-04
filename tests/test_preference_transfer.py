@@ -171,3 +171,43 @@ class DataStatusTest(WebServerCase):
                 self.assertNotIn(b'old-raw-fixture',raw)
                 self.assertFalse(history.with_suffix('.db').exists())
                 self.assertEqual(history.read_bytes(),b'old-raw-fixture-unchanged')
+
+    def test_alternate_reports_sqlite_only_source_by_existence_without_touching_files(self):
+        """SQLite-only 旧源码目录也能被发现：只查固定文件存在性，不打开、
+        不迁移、不枚举、不读写任何内容；两个临时目录都保持原样。"""
+        with tempfile.TemporaryDirectory() as data_home, tempfile.TemporaryDirectory() as source_home:
+            home, source = Path(data_home), Path(source_home)
+            sentinel = b'\x00not-a-real-sqlite-sentinel'
+            (source/'speedbench-history.db').write_bytes(sentinel)
+            with mock.patch.object(web,'DATA_HOME',home), \
+                 mock.patch.object(web,'HISTORY',home/'speedbench-history.jsonl'), \
+                 mock.patch.object(web,'HERE',source):
+                status,raw=self.request('GET','/api/data-status',
+                                        headers={'X-SpeedBench-Token':web.WEB_TOKEN})
+            self.assertEqual(status,200)
+            result=json.loads(raw)
+            self.assertEqual(result['alternate']['path'],str(source.resolve()))
+            self.assertTrue(result['alternate']['database_exists'])
+            self.assertFalse(result['alternate']['jsonl_exists'])
+            self.assertFalse(result['history']['jsonl_exists'])
+            self.assertFalse(result['history']['database_exists'])
+            self.assertFalse(result['automatic_import'])
+            # 存在性契约：sentinel 原样保留，两个目录都没有新文件（无迁移/副本/日志）。
+            self.assertEqual((source/'speedbench-history.db').read_bytes(),sentinel)
+            self.assertEqual([p.name for p in sorted(source.iterdir())],['speedbench-history.db'])
+            self.assertEqual(list(home.iterdir()),[])
+
+    def test_alternate_is_null_when_data_home_is_the_source_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root/'speedbench-history.db').write_bytes(b'sentinel-db-unchanged')
+            with mock.patch.object(web,'DATA_HOME',root), \
+                 mock.patch.object(web,'HISTORY',root/'speedbench-history.jsonl'), \
+                 mock.patch.object(web,'HERE',root):
+                status,raw=self.request('GET','/api/data-status',
+                                        headers={'X-SpeedBench-Token':web.WEB_TOKEN})
+            self.assertEqual(status,200)
+            result=json.loads(raw)
+            self.assertIsNone(result['alternate'])
+            self.assertTrue(result['history']['database_exists'])
+            self.assertEqual((root/'speedbench-history.db').read_bytes(),b'sentinel-db-unchanged')

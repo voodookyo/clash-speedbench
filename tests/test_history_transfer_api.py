@@ -96,3 +96,59 @@ class HistoryTransferApiTest(WebServerCase):
         self.assertEqual(self.post_authorized('/api/jobs')[0],409)
         self.assertEqual(self.post_authorized('/api/preferences',{'sb_theme':'dark'})[0],409)
         self.assertFalse((self.home/'ui-preferences.json').exists())
+
+    def test_ip_intel_status_blocked_with_import_and_failure_states(self):
+        entered=threading.Event();release=threading.Event();response=[]
+        calls=[]
+        preview=self.preview()
+        service=web.history_transfer()
+        apply=service.apply
+        def held(*args):
+            entered.set();release.wait(3);return apply(*args)
+        def payload():
+            calls.append(True);return {'ok':True,'providers':{}}
+        with mock.patch.object(service,'apply',side_effect=held), \
+                mock.patch.object(web,'_provider_status_payload',side_effect=payload):
+            thread=threading.Thread(target=lambda:response.append(self.post_authorized(
+                '/api/history-import/apply',{'token':preview['token']})))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                code,raw=self.request('GET','/api/ip-intel/status')
+                self.assertEqual(code,409,raw)
+                self.assertEqual(calls,[])
+                self.assertEqual(self.post_authorized('/api/run/cancel')[0],200)
+                self.assertEqual(self.request('GET','/api/run/status')[0],200)
+            finally:release.set();thread.join(4)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(response[0][0],200,response)
+            self.assertEqual(self.request('GET','/api/ip-intel/status')[0],200)
+            self.assertEqual(calls,[True])
+            self.set_state(import_failed=True)
+            self.assertEqual(self.request('GET','/api/ip-intel/status')[0],409)
+            self.assertEqual(calls,[True])
+
+    def test_ip_intel_status_reads_database_under_existing_db_mutex(self):
+        entered=threading.Event();probed=threading.Event();proceed=threading.Event()
+        acquired=[];response=[]
+        def payload():
+            entered.set()
+            def contender():
+                held=web._DB_SYNC_LOCK.acquire(timeout=0.5)
+                acquired.append(held)
+                if held:web._DB_SYNC_LOCK.release()
+                probed.set()
+            probe=threading.Thread(target=contender);probe.start();probe.join(2)
+            proceed.wait(3)
+            return {'ok':True,'providers':{}}
+        with mock.patch.object(web,'_provider_status_payload',side_effect=payload):
+            thread=threading.Thread(target=lambda:response.append(self.request('GET','/api/ip-intel/status')))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(probed.wait(2))
+                self.assertEqual(acquired,[False])
+            finally:
+                proceed.set();thread.join(4)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual((response[0][0],json.loads(response[0][1])['ok']),(200,True))

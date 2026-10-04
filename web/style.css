@@ -284,3 +284,6 @@ canvas,.about code { background:var(--input); }
 @media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation:none !important; transition:none !important; } }
 #config-root-settings input{width:100%;box-sizing:border-box}
 #config-root-status{overflow-wrap:anywhere;white-space:pre-line}
+#nodes-data-guide{max-width:100%}
+#nodes-data-status{white-space:pre-line;overflow-wrap:anywhere;word-break:break-word;line-height:1.7}
+@media (max-width:390px){#nodes-data-status{word-break:break-all}}

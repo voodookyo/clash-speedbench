@@ -1527,14 +1527,36 @@ function updatePendingFavorites(){
     (unresolved?`${unresolved} 个稳定 ID 收藏尚未匹配当前目录；不会自动改绑。`:
       '新收藏按稳定节点身份保存；未确认项不会用于自动扩大测速范围。');
 }
+function alternateKinds(alternate){
+  if(!alternate) return '';
+  return [alternate.jsonl_exists?'JSONL':null,alternate.database_exists?'SQLite':null].filter(Boolean).join(' 与 ');
+}
+function nodesDataStatusText(info){
+  const history=info.history||{};
+  const currentKinds=[history.jsonl_exists?'JSONL':null,history.database_exists?'SQLite':null].filter(Boolean);
+  const current=currentKinds.length
+    ? `本实例数据目录已有历史文件（${currentKinds.join(' 与 ')}）；存在不代表内容有效，仍需核验。`
+    : '本实例数据目录尚无历史文件（JSONL 与 SQLite 均无）。';
+  let text=`本实例数据目录：${info.data_home}\n${current}`;
+  const kinds=alternateKinds(info.alternate);
+  if(kinds) text+=`\n源码目录发现旧的 ${kinds}：${info.alternate.path}。仅检测到存在，内容未核验，不会自动导入；如需使用，请在设置中显式预览。`;
+  return text;
+}
 async function loadDataGuide(){
-  const status=document.getElementById('data-status');if(!status) return;
+  const status=document.getElementById('data-status');
+  const nodesStatus=document.getElementById('nodes-data-status');
+  if(!status && !nodesStatus) return;
   try{
     const response=await fetch('/api/data-status',{headers:{'X-SpeedBench-Token':SB_TOKEN}});
     const info=await response.json();if(!info.ok) throw new Error('Data status unavailable');
-    status.textContent=`本实例数据目录：${info.data_home}\nJSONL：${info.history.jsonl_path}（${info.history.jsonl_exists?'已有文件，沿用该位置':'尚无文件'}）\nSQLite：${info.history.database_path}（${info.history.database_exists?'已有文件':'尚无文件'}）`+
-      (info.alternate?.jsonl_exists?`\n另发现源码目录同名 JSONL 文件：${info.alternate.path}；未核验内容，没有自动导入。`:'');
-  }catch(e){status.textContent='无法读取数据位置；没有重置或迁移文件。请检查本实例连接。';}
+    const kinds=alternateKinds(info.alternate);
+    if(status) status.textContent=`本实例数据目录：${info.data_home}\nJSONL：${info.history.jsonl_path}（${info.history.jsonl_exists?'已有文件，沿用该位置':'尚无文件'}）\nSQLite：${info.history.database_path}（${info.history.database_exists?'已有文件':'尚无文件'}）`+
+      (kinds?`\n另发现源码目录同名 ${kinds} 文件：${info.alternate.path}；未核验内容，没有自动导入。`:'');
+    if(nodesStatus) nodesStatus.textContent=nodesDataStatusText(info);
+  }catch(e){
+    if(status) status.textContent='无法读取数据位置；没有重置或迁移文件。请检查本实例连接。';
+    if(nodesStatus) nodesStatus.textContent='无法读取本实例数据位置；没有重置或迁移任何文件。请检查本实例连接后重试。';
+  }
 }
 let pendingHistoryImport=null,historyImportBusy=false,historyImportBackup=null;
 function historyImportButtons(){
@@ -1610,6 +1632,21 @@ function initHistoryImport(){
     confirmModal('确认撤回最近一次历史导入？只恢复这次导入前的备份；如本实例已有新数据，会拒绝撤回。',()=>finishHistoryImport('rollback'));
   });
   loadHistoryImportStatus();
+}
+function initNodesDataGuide(){
+  const card=document.getElementById('nodes-data-guide');
+  if(card) card.hidden=!SB_DESKTOP;
+  if(!SB_DESKTOP) return;
+  const button=document.getElementById('btn-open-history-import');
+  if(!button) return;
+  button.addEventListener('click',()=>{
+    setHash('#/settings');
+    route();
+    const guide=document.getElementById('data-guide');
+    const directory=document.getElementById('history-import-directory');
+    if(guide && guide.scrollIntoView) guide.scrollIntoView({block:'start'});
+    if(directory) directory.focus?.();
+  });
 }
 let pendingPreferenceImport=null;
 function transferPreferenceRead(key){
@@ -1693,6 +1730,7 @@ function initPreferenceTransfer(){
   apply.addEventListener('click',()=>confirmModal('确认导入白名单界面选项并合并收藏？不会导入历史、密钥或身份种子，也不会修改当前测速。',applyPreferenceImport));
   document.getElementById('btn-data-refresh').addEventListener('click',()=>{loadDataGuide();loadHistoryImportStatus();});
   initHistoryImport();
+  initNodesDataGuide();
   loadDataGuide();
 }
 function initTaskControls(){

@@ -1,16 +1,26 @@
 import json
+import re
 import subprocess
 import unittest
 
 from tests.test_resume_js import NODE, STUB_JS, APP_JS
 
 
+def _fresh_status(**over):
+    status={'ok':True,'data_home':'/data/新目录','automatic_import':False,
+        'history':{'jsonl_path':'/data/新目录/speedbench-history.jsonl','jsonl_exists':False,
+                   'database_path':'/data/新目录/speedbench-history.db','database_exists':False},
+        'alternate':None}
+    status.update(over)
+    return status
+
+
 @unittest.skipUnless(NODE,'Node unavailable')
 class HistoryTransferUiTest(unittest.TestCase):
-    def app(self,script,*,preview=None,applied=None):
+    def app(self,script,*,preview=None,applied=None,data_status=None,desktop=False):
         responses={'/api/catalog':{'status':'ok','nodes':[],'sources':[]},
             '/api/run/status':{'running':False},'/api/history':[],
-            '/api/data-status':{'ok':True,'data_home':'fixture','history':{}},
+            '/api/data-status':data_status or {'ok':True,'data_home':'fixture','history':{}},
             '/api/history-import/status':{'ok':True,'can_rollback':True,'backup_id':'import_'+'a'*32},
             '/api/history-import/preview':preview or {'ok':True,'token':'fixture-token','source':'/fixture 旧目录',
                 'destination':'/fixture new','new_runs':3,'duplicate_runs':2,'new_tasks':1,'conflicts':0,'can_apply':True},
@@ -21,6 +31,7 @@ class HistoryTransferUiTest(unittest.TestCase):
             'async function fetch(url,options){__requests.push({url,method:options?.method||"GET",headers:options?.headers,body:options?.body?JSON.parse(options.body):null});')
         code='const SBPreferences=require('+json.dumps(str(APP_JS.parent/'preferences.js'))+');'
         code+='const SBTasks=require('+json.dumps(str(APP_JS.parent/'tasks.js'))+');const __requests=[];'+stub
+        if desktop:code+='window.SPEEDBENCH_ENV={client:"webview"};'
         code+=APP_JS.read_text(encoding='utf-8')+'\n(async()=>{await new Promise(r=>setTimeout(r,0));'+script+'})();'
         result=subprocess.run([NODE,'-'],input=code,capture_output=True,text=True,encoding='utf-8',timeout=10)
         self.assertEqual(result.returncode,0,result.stderr)
@@ -90,3 +101,77 @@ class HistoryTransferUiTest(unittest.TestCase):
           deliver(task);await pending;
           console.log(JSON.stringify({opened,cleared,hidden:__el('task-detail').hidden,html:__el('task-detail').innerHTML}));''')
         self.assertTrue(out['opened']);self.assertTrue(out['cleared']);self.assertTrue(out['hidden']);self.assertEqual(out['html'],'')
+
+    def test_nodes_guide_card_static_structure(self):
+        html=(APP_JS.parent/'index.html').read_text(encoding='utf-8')
+        for el_id in ('nodes-data-guide','nodes-data-guide-title','nodes-data-status','btn-open-history-import'):
+            self.assertIn(f'id="{el_id}"',html)
+        card=re.search(r'<div[^>]*id="nodes-data-guide"[^>]*>',html)
+        self.assertIsNotNone(card)
+        self.assertIn('hidden',card.group(0))
+
+    def test_desktop_nodes_guide_reveals_fresh_and_existing_history(self):
+        out=self.app('''console.log(JSON.stringify({hidden:__el('nodes-data-guide').hidden,
+          text:__el('nodes-data-status').textContent,html:__el('nodes-data-status').innerHTML}));''',
+          desktop=True,data_status=_fresh_status())
+        self.assertFalse(out['hidden'])
+        self.assertIn('/data/新目录',out['text'])
+        self.assertIn('尚无历史',out['text'])
+        self.assertEqual(out['html'],'')
+        out=self.app('''console.log(JSON.stringify({text:__el('nodes-data-status').textContent}));''',
+          desktop=True,data_status=_fresh_status(history={
+            'jsonl_path':'/data/新目录/speedbench-history.jsonl','jsonl_exists':True,
+            'database_path':'/data/新目录/speedbench-history.db','database_exists':True}))
+        self.assertIn('已有历史文件',out['text'])
+        self.assertNotIn('尚无历史',out['text'])
+
+    def test_desktop_nodes_guide_reports_sqlite_only_alternate_as_unverified(self):
+        alternate={'path':'/old/旧 源码目录','jsonl_exists':False,'database_exists':True}
+        out=self.app('''console.log(JSON.stringify({text:__el('nodes-data-status').textContent,
+          settings:__el('data-status').textContent}));''',
+          desktop=True,data_status=_fresh_status(alternate=alternate))
+        for text in (out['text'],out['settings']):
+            self.assertIn('/old/旧 源码目录',text)
+            self.assertIn('SQLite',text)
+            self.assertIn('未核验',text)
+        self.assertIn('不会自动导入',out['text'])
+        self.assertIn('尚无历史',out['text'])
+
+    def test_desktop_nodes_guide_failure_is_actionable_and_never_claims_no_history(self):
+        out=self.app('''console.log(JSON.stringify({hidden:__el('nodes-data-guide').hidden,
+          text:__el('nodes-data-status').textContent}));''',
+          desktop=True,data_status={'ok':False,'msg':'boom'})
+        self.assertFalse(out['hidden'])
+        self.assertIn('无法读取',out['text'])
+        self.assertIn('检查',out['text'])
+        self.assertNotIn('尚无历史',out['text'])
+
+    def test_nodes_guide_path_is_plain_text_not_html(self):
+        hostile='/data/<img src=x onerror="alert(1)"> 目录'
+        out=self.app('''console.log(JSON.stringify({text:__el('nodes-data-status').textContent,
+          html:__el('nodes-data-status').innerHTML}));''',
+          desktop=True,data_status=_fresh_status(data_home=hostile))
+        self.assertIn(hostile,out['text'])
+        self.assertEqual(out['html'],'')
+
+    def test_browser_nodes_guide_card_stays_hidden(self):
+        out=self.app('''console.log(JSON.stringify({hidden:__el('nodes-data-guide').hidden}));''',
+          desktop=False,data_status=_fresh_status())
+        self.assertTrue(out['hidden'])
+
+    def test_guide_button_shows_settings_and_focuses_import_directory(self):
+        out=self.app('''const dir=__el('history-import-directory');dir.value='我 的/旧 目录';
+          let focusCount=0;dir.focus=()=>{focusCount++;};
+          pendingHistoryImport={token:'keep',directory:'我 的/旧 目录'};
+          __el('view-settings').style.display='none';__requests.length=0;
+          __el('btn-open-history-import').__listeners.click[0]();
+          console.log(JSON.stringify({hash:window.location.hash,settings:__el('view-settings').style.display,
+            focusCount,value:dir.value,pending:pendingHistoryImport&&pendingHistoryImport.token,
+            requests:__requests.map(r=>r.url)}));''',
+          desktop=True,data_status=_fresh_status())
+        self.assertEqual(out['hash'],'#/settings')
+        self.assertEqual(out['settings'],'')
+        self.assertEqual(out['focusCount'],1)
+        self.assertEqual(out['value'],'我 的/旧 目录')
+        self.assertEqual(out['pending'],'keep')
+        self.assertFalse(any('/history-import/' in u for u in out['requests']))
