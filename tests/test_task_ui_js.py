@@ -281,3 +281,138 @@ class TaskUiJsTest(unittest.TestCase):
         self.assertEqual(body['mode'],'quick')
         self.assertEqual(body['target_profile'],'download')
         self.assertNotIn('mb',body)
+
+    def test_switch_preview_then_confirmation_uses_stable_id_and_exact_plan(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const nid='node_v2_'+'a'.repeat(32), sid='subscription_v2_'+'b'.repeat(32);
+            const plan={node_id:nid,runtime_name:'节点',identity_strength:'strong',
+              source_status:'verified',subscription_name:'订阅甲',subscription_ids:[sid],
+              subscriptions:[{subscription_id:sid,name:'订阅甲'}],
+              group:'选择',current:'old',root_revision:1};
+            let pending=null,previews=[],switches=[];
+            post=async(url,body)=>{if(url==='/api/switch/preview'){previews.push(body);return {ok:true,plan};}
+              switches.push({url,body});return {ok:true,msg:'已切换',group:'选择',now:'节点'};};
+            confirmModal=(text,yes)=>{pending=yes;};
+            const btn={dataset:{name:'节点',nodeId:nid},disabled:false,textContent:'切换'};
+            await switchNode('节点',btn);
+            const beforeConfirm={previews:previews.length,switches:switches.length,
+              modal:typeof pending==='function',disabled:btn.disabled,previewBody:previews[0]};
+            await pending();
+            console.log(JSON.stringify({beforeConfirm,last:switches[switches.length-1]}));})();
+        """)
+        self.assertEqual(out['beforeConfirm']['previews'],1)
+        self.assertEqual(out['beforeConfirm']['switches'],0)
+        self.assertTrue(out['beforeConfirm']['modal'])
+        self.assertFalse(out['beforeConfirm']['disabled'])
+        self.assertEqual(out['beforeConfirm']['previewBody'],{'node_id':'node_v2_'+'a'*32})
+        self.assertEqual(out['last']['url'],'/api/switch')
+        confirmation=out['last']['body']['confirmation']
+        self.assertEqual(out['last']['body']['node_id'],'node_v2_'+'a'*32)
+        self.assertEqual(set(confirmation),{'node_id','runtime_name','identity_strength',
+            'source_status','subscription_name','subscription_ids','subscriptions',
+            'group','current','root_revision'})
+        self.assertEqual(confirmation['group'],'选择')
+        self.assertEqual(confirmation['runtime_name'],'节点')
+
+    def test_switch_modal_cancel_performs_no_switch_and_restores_button(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const nid='node_v2_'+'a'.repeat(32);
+            const plan={node_id:nid,runtime_name:'节点',identity_strength:'strong',
+              source_status:'verified',subscription_name:'',subscription_ids:[],subscriptions:[],
+              group:'选择',current:'old',root_revision:1};
+            let pending=null,switches=0;
+            post=async(url)=>{if(url==='/api/switch')switches++;return {ok:true,plan};};
+            confirmModal=(text,yes)=>{pending=yes;};
+            const btn={dataset:{name:'节点',nodeId:nid},disabled:false};
+            await switchNode('节点',btn);
+            console.log(JSON.stringify({opened:typeof pending==='function',
+              switches,disabled:btn.disabled}));})();
+        """)
+        self.assertTrue(out['opened'])
+        self.assertEqual(out['switches'],0)
+        self.assertFalse(out['disabled'])
+
+    def test_switch_cancel_restores_clicked_button_even_after_table_replacement(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));let clicked=0,replacement=0,wrong=0;
+            const nodeId='node_v2_'+'a'.repeat(32),btn={dataset:{nodeId},disabled:false,isConnected:true,
+              focus:()=>{clicked++;}};
+            document.activeElement={isConnected:true,focus:()=>{wrong++;}};
+            post=async()=>({ok:true,plan:{node_id:nodeId,runtime_name:'fixture',group:'group',current:'old',
+              source_status:'unknown',identity_strength:'weak',subscriptions:[]}});
+            await switchNode('fixture',btn);closeModal();
+            await switchNode('fixture',btn);btn.isConnected=false;
+            document.querySelectorAll=()=>[{dataset:{nodeId},isConnected:true,focus:()=>{replacement++;}}];closeModal();
+            console.log(JSON.stringify({clicked,replacement,wrong}));})();
+        """)
+        self.assertEqual(out,{'clicked':1,'replacement':1,'wrong':0})
+
+    def test_confirmed_switch_focuses_result_row_after_current_button_becomes_disabled(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));let focused=0;
+            const nodeId='node_v2_'+'a'.repeat(32),btn={dataset:{nodeId},disabled:false};
+            const plan={node_id:nodeId,runtime_name:'fixture',group:'group',current:'old',
+              source_status:'unknown',identity_strength:'weak',subscriptions:[]};
+            post=async(url)=>url.endsWith('/preview')?{ok:true,plan}:{ok:true,now:'fixture',group:'group'};
+            await switchNode('fixture',btn);const yes=modalYes;closeModal();
+            document.querySelectorAll=()=>[{dataset:{nodeId},focus:()=>{focused++;}}];renderTable=()=>{};
+            await yes();console.log(JSON.stringify({focused,disabled:btn.disabled}));})();
+        """)
+        self.assertEqual(out,{'focused':1,'disabled':False})
+
+    def test_switch_confirmation_displays_fresh_plan_not_cached_metadata(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const nid='node_v2_'+'a'.repeat(32);
+            latestData={results:[{name:'节点',node_id:nid,subscription_name:'旧来源',provider:'旧'}]};
+            currentGroup='stale-group';currentNode='stale-node';
+            const plan={node_id:nid,runtime_name:'新名',identity_strength:'strong',
+              source_status:'verified',subscription_name:'新来源',subscription_ids:[],subscriptions:[],
+              group:'新组',current:'新当前',root_revision:2};
+            let modalText='';post=async()=>({ok:true,plan});
+            confirmModal=text=>{modalText=text;};
+            await switchNode('节点',{dataset:{name:'节点',nodeId:nid},disabled:false});
+            console.log(JSON.stringify(modalText));})();
+        """)
+        self.assertIn('新名',out);self.assertIn('新组',out)
+        self.assertIn('新当前',out);self.assertIn('新来源',out)
+        self.assertNotIn('stale-group',out);self.assertNotIn('旧来源',out)
+
+    def test_failed_switch_preview_shows_no_modal_and_performs_no_switch(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            let modal=0,switches=0;
+            post=async(url)=>{if(url==='/api/switch')switches++;return {ok:false,msg:'目录暂不可用'};};
+            confirmModal=()=>{modal++;};
+            const btn={dataset:{name:'节点',nodeId:'node_v2_'+'a'.repeat(32)},disabled:false};
+            await switchNode('节点',btn);
+            console.log(JSON.stringify({modal,switches,disabled:btn.disabled}));})();
+        """)
+        self.assertEqual(out,{'modal':0,'switches':0,'disabled':False})
+
+    def test_switch_confirmation_labels_sources_honestly_and_renders_unsafe_names_as_text(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const nid='node_v2_'+'a'.repeat(32);let texts=[];
+            const base={node_id:nid,runtime_name:'节点',identity_strength:'strong',
+              source_status:'verified',subscription_name:'',subscription_ids:[],subscriptions:[],
+              group:'选择',current:'old',root_revision:1};
+            const realConfirm=confirmModal;
+            confirmModal=text=>{texts.push(text);};
+            post=async()=>({ok:true,plan:{...base,source_status:'ambiguous'}});
+            await switchNode('节点',{dataset:{name:'节点',nodeId:nid},disabled:false});
+            post=async()=>({ok:true,plan:{...base,identity_strength:'weak',source_status:'unknown'}});
+            await switchNode('节点',{dataset:{name:'节点',nodeId:nid},disabled:false});
+            confirmModal=realConfirm;
+            post=async()=>({ok:true,plan:{...base,runtime_name:'<img src=x onerror=alert(1)>'}});
+            await switchNode('节点',{dataset:{name:'节点',nodeId:nid},disabled:false});
+            const el=document.getElementById('modal-text');
+            console.log(JSON.stringify({texts,text:el.textContent,html:el.innerHTML}));})();
+        """)
+        self.assertIn('多个来源（无法唯一确认）',out['texts'][0])
+        self.assertIn('来源未知',out['texts'][1])
+        self.assertIn('名称范围，身份未验证',out['texts'][1])
+        self.assertIn('<img src=x onerror=alert(1)>',out['text'])
+        self.assertNotIn('<img',out['html'])

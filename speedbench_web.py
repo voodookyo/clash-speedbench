@@ -867,7 +867,164 @@ def _check_source_selection(params):
     return True
 
 
-def do_switch(name: str, node_id: str = '') -> dict:
+# Fresh-confirmation plan contract.  Only these exact keys may cross the wire,
+# and only these types are accepted back.  Paths, credentials, connection
+# definitions and raw configuration never appear here.
+_SWITCH_PLAN_STRINGS = ('node_id', 'runtime_name', 'identity_strength', 'source_status',
+                        'subscription_name', 'group', 'current')
+_SWITCH_PLAN_FIELDS = frozenset(_SWITCH_PLAN_STRINGS + ('subscription_ids', 'subscriptions',
+                                                        'root_revision'))
+_SWITCH_STALE_MSG = '切换信息已变化，请刷新目录后重新确认切换'
+_SUB_ID_RE = re.compile(r'subscription_v2_[0-9a-f]{32}\Z')
+_NODE_ID_RE = re.compile(r'node_v2_[0-9a-f]{32}\Z')
+
+
+def _resolve_switch_node(catalog, *, name='', node_id=''):
+    """Resolve exactly one current catalogue node; never guess on ambiguity."""
+    nodes = catalog.get('nodes') if isinstance(catalog, dict) else None
+    nodes = nodes if isinstance(nodes, list) else []
+    if node_id:
+        matches = [n for n in nodes if isinstance(n, dict) and n.get('node_id') == node_id]
+        if len(matches) != 1:
+            return None, '节点身份已失效，请刷新目录后重试'
+        return matches[0], ''
+    if name:
+        matches = [n for n in nodes if isinstance(n, dict) and n.get('runtime_name') == name]
+        if not matches:
+            return None, '目录中找不到该节点，请刷新后重试'
+        if len(matches) > 1:
+            return None, '该名称对应多个节点，无法唯一确认，请刷新目录后重试'
+        return matches[0], ''
+    return None, '缺少节点名或节点身份'
+
+
+def _switch_plan(node, group, current, revision):
+    subscriptions = []
+    for item in node.get('subscriptions') or []:
+        if isinstance(item, dict) and isinstance(item.get('subscription_id'), str):
+            subscriptions.append({'subscription_id': item['subscription_id'],
+                                  'name': item.get('name') if isinstance(item.get('name'), str) else ''})
+    return {
+        'node_id': str(node.get('node_id') or ''),
+        'runtime_name': str(node.get('runtime_name') or ''),
+        'identity_strength': str(node.get('identity_strength') or ''),
+        'source_status': str(node.get('source_status') or ''),
+        'subscription_name': str(node.get('subscription_name') or ''),
+        'subscription_ids': [x for x in (node.get('subscription_ids') or []) if isinstance(x, str)],
+        'subscriptions': subscriptions,
+        'group': str(group or ''),
+        'current': '' if current is None else str(current),
+        'root_revision': int(revision),
+    }
+
+
+def _valid_switch_plan(plan) -> bool:
+    if not isinstance(plan, dict) or frozenset(plan) != _SWITCH_PLAN_FIELDS:
+        return False
+    if any(not isinstance(plan.get(k), str) for k in _SWITCH_PLAN_STRINGS):
+        return False
+    if not _NODE_ID_RE.fullmatch(plan['node_id']):
+        return False
+    if plan['identity_strength'] not in ('strong', 'weak'):
+        return False
+    if plan['source_status'] not in ('verified', 'ambiguous', 'unknown'):
+        return False
+    if any(len(plan[k]) > 4096 for k in ('runtime_name', 'group', 'current', 'subscription_name')):
+        return False
+    if not plan['group']:
+        return False
+    ids = plan['subscription_ids']
+    if (not isinstance(ids, list) or len(ids) > 100 or
+            any(not isinstance(x, str) or not _SUB_ID_RE.fullmatch(x) for x in ids)):
+        return False
+    subs = plan['subscriptions']
+    if not isinstance(subs, list) or len(subs) > 100:
+        return False
+    for item in subs:
+        if (not isinstance(item, dict) or frozenset(item) != {'subscription_id', 'name'} or
+                not isinstance(item['name'], str) or len(item['name']) > 4096 or
+                not isinstance(item['subscription_id'], str) or
+                not _SUB_ID_RE.fullmatch(item['subscription_id'])):
+            return False
+    return type(plan['root_revision']) is int and 0<=plan['root_revision']<2**63
+
+
+def _resolve_group(proxies, runtime_name):
+    graph = build_selectable_graph(proxies)
+    group = pick_switch_group(proxies, graph, runtime_name, "GLOBAL")
+    if not group:
+        return None, f"找不到包含 {runtime_name} 的 Selector 组"
+    return group, ''
+
+
+def preview_switch(name: str = '', node_id: str = '') -> dict:
+    """Read-only fresh plan.  Never selects or writes to the controller."""
+    try:
+        root, revision = CONFIG_ROOT.snapshot()
+        api = connect_controller(config_root=root)
+        proxies = api.get("/proxies").get("proxies", {})
+        if not isinstance(proxies, dict):
+            return {'ok': False, 'msg': '无法确认当前节点，请刷新后重试'}
+        catalog = get_catalog(api, snapshot=proxies, config_root=root)
+        node, error = _resolve_switch_node(catalog, name=name, node_id=node_id)
+        if error:
+            return {'ok': False, 'msg': error}
+        runtime_name = str(node.get('runtime_name') or '')
+        if runtime_name not in proxies:
+            return {'ok': False, 'msg': '节点身份已失效，请刷新目录后重试'}
+        group, error = _resolve_group(proxies, runtime_name)
+        if error:
+            return {'ok': False, 'msg': error}
+        current = proxies.get(group, {}).get("now")
+        plan=_switch_plan(node, group, current, revision)
+        if not _valid_switch_plan(plan):
+            return {'ok':False,'msg':'节点目录暂不可核验，请刷新后重试'}
+        with STATE_LOCK:
+            if CONFIG_ROOT.snapshot()[1]!=revision:
+                return {'ok':False,'msg':_SWITCH_STALE_MSG}
+            return {'ok': True, 'plan': plan}
+    except Exception as e:
+        return {'ok': False, 'msg': _redact_runtime_text(e)}
+
+
+def _confirmed_switch(plan: dict) -> dict:
+    """Re-resolve fresh state and require an exact match before any select."""
+    try:
+        root, revision = CONFIG_ROOT.snapshot()
+        api = connect_controller(config_root=root)
+        proxies = api.get("/proxies").get("proxies", {})
+        if not isinstance(proxies, dict):
+            return {'ok': False, 'msg': _SWITCH_STALE_MSG}
+        catalog = get_catalog(api, snapshot=proxies, config_root=root)
+        node, error = _resolve_switch_node(catalog, node_id=plan['node_id'],
+                                           name=plan['runtime_name'])
+        if error:
+            return {'ok': False, 'msg': _SWITCH_STALE_MSG}
+        runtime_name = str(node.get('runtime_name') or '')
+        if runtime_name not in proxies:
+            return {'ok': False, 'msg': _SWITCH_STALE_MSG}
+        group, error = _resolve_group(proxies, runtime_name)
+        if error:
+            return {'ok': False, 'msg': _SWITCH_STALE_MSG}
+        current = proxies.get(group, {}).get("now")
+        if _switch_plan(node, group, current, revision) != plan:
+            return {'ok': False, 'msg': _SWITCH_STALE_MSG}
+        with STATE_LOCK:
+            if CONFIG_ROOT.snapshot()[1] != revision:
+                return {'ok': False, 'msg': _SWITCH_STALE_MSG}
+            if current == runtime_name:
+                return {"ok": True, "msg": f"{group} 已是 {runtime_name}", "group": group, "now": runtime_name}
+            api.select(group, runtime_name)
+        return {"ok": True, "msg": f"已切换 {group} → {runtime_name}", "group": group, "now": runtime_name}
+    except Exception as e:
+        return {"ok": False, "msg": _redact_runtime_text(e)}
+
+
+def do_switch(name: str, node_id: str = '', confirmation=None) -> dict:
+    if confirmation is not None:
+        if not _valid_switch_plan(confirmation) or node_id!=confirmation['node_id']:
+            return {'ok':False,'msg':_SWITCH_STALE_MSG}
+        return _confirmed_switch(confirmation)
     try:
         root,revision=CONFIG_ROOT.snapshot()
         api = connect_controller(config_root=root)
@@ -1360,7 +1517,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path in ('/api/history-import/preview','/api/history-import/apply','/api/history-import/rollback'):
             self._history_import(path)
-        elif path in ('/api/preferences','/api/leak/audit','/api/leak/save','/api/leak/evaluate','/api/switch'):
+        elif path in ('/api/preferences','/api/leak/audit','/api/leak/save','/api/leak/evaluate','/api/switch','/api/switch/preview'):
             if self._data_busy():return
             with _DB_SYNC_LOCK:
                 if self._data_busy():return
@@ -1501,6 +1658,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({'ok':False,'msg':'测速任务启动失败'},500)
                 return
             self._json({"ok": True,'version':1,'job_id':job_id},202 if path=='/api/jobs' else 200)
+        elif path == "/api/switch/preview":
+            body = self._read_body()
+            if not isinstance(body, dict):
+                self._json({'ok':False,'msg':'请求格式无效'},400)
+                return
+            name = body.get('name', '')
+            node_id = body.get('node_id', '')
+            if not isinstance(name, str) or not isinstance(node_id, str) or len(node_id) > 80:
+                self._json({'ok':False,'msg':'节点身份无效'},400)
+                return
+            if not name and not node_id:
+                self._json({'ok':False,'msg':'缺少节点名'},400)
+                return
+            self._json(preview_switch(name=name, node_id=node_id))
         elif path == "/api/switch":
             body = self._read_body()
             if not isinstance(body, dict):
@@ -1508,13 +1679,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
             name = str(body.get("name", ""))
             node_id = body.get('node_id', '')
+            confirmation = body.get('confirmation') if 'confirmation' in body else None
+            if 'confirmation' in body and not _valid_switch_plan(confirmation):
+                self._json({'ok':False,'msg':'确认信息无效，请刷新后重新确认切换'},400)
+                return
+            if confirmation is not None and node_id!=confirmation['node_id']:
+                self._json({'ok':False,'msg':'确认目标不一致，请刷新后重新确认切换'},400)
+                return
             if not isinstance(node_id, str) or len(node_id) > 80:
                 self._json({'ok':False,'msg':'节点身份无效'},400)
                 return
-            if not name and not node_id:
+            if not name and not node_id and confirmation is None:
                 self._json({"ok": False, "msg": "缺少节点名"}, 400)
                 return
-            self._json(do_switch(name, node_id=node_id) if node_id else do_switch(name))
+            if confirmation is not None:
+                self._json(do_switch(name, node_id=node_id, confirmation=confirmation))
+            else:
+                self._json(do_switch(name, node_id=node_id) if node_id else do_switch(name))
         elif path == "/api/run/cancel":
             self._json(cancel_benchmark())
         elif re.fullmatch(r'/api/jobs/job_[0-9a-f]{32}/cancel',path):

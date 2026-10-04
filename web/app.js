@@ -56,8 +56,8 @@ function toast(msg, ok=true){
 
 /* 自制确认对话框（中断测速/停止面板这类破坏性操作用） */
 let modalYes = null, modalReturnFocus=null;
-function confirmModal(text, onYes){
-  modalReturnFocus=document.activeElement;
+function confirmModal(text, onYes, returnFocus=document.activeElement){
+  modalReturnFocus=returnFocus;
   document.getElementById('modal-text').textContent = text;
   modalYes = onYes;
   document.getElementById('modal-mask').style.display = 'flex';
@@ -66,6 +66,10 @@ function confirmModal(text, onYes){
 function closeModal(){
   document.getElementById('modal-mask').style.display = 'none';
   modalYes = null;
+  if(modalReturnFocus?.dataset?.nodeId && !modalReturnFocus.isConnected){
+    const id=modalReturnFocus.dataset.nodeId;
+    modalReturnFocus=[...document.querySelectorAll('button.sw')].find(b=>b.dataset.nodeId===id)||null;
+  }
   if(modalReturnFocus && modalReturnFocus.isConnected && modalReturnFocus.focus) modalReturnFocus.focus({preventScroll:true});
   modalReturnFocus=null;
 }
@@ -975,20 +979,54 @@ function cancelRun(){
 }
 
 /* ==================== 节点操作 ==================== */
+// 切换一律先取后端新鲜预览：目标运行时名、稳定 node_id、来源、实际策略组及其
+// 当前选择、配置根 revision。确认时把整份计划回传后端做逐字段复核；任何变化
+// 都要求刷新后重新确认，且不写控制器。取消模态框不触发任何切换。
+function switchConfirmText(plan){
+  const labels=(plan.subscriptions||[]).map(s=>s.name||'名称未知').join('、');
+  const source = plan.source_status==='verified'?(plan.subscription_name||labels||'订阅名称未知'):
+    plan.source_status==='ambiguous'?`多个来源（无法唯一确认）${labels?'：'+labels:''}`:'来源未知';
+  const identity = plan.identity_strength==='weak' ? '（名称范围，身份未验证）' : '';
+  return `切换到 ${plan.runtime_name}？涉及策略组：${plan.group}（当前：${plan.current||'尚未确认'}）。来源：${source}${identity}。目录、来源或选择变化时会要求刷新后重新确认，不会直接切换。`;
+}
 async function switchNode(name, btn){
-  if(btn){ btn.disabled = true; btn.textContent = '切换中…'; }
-  let r;
-  try{ r = await post('/api/switch', btn && btn.dataset && btn.dataset.nodeId ? {node_id:btn.dataset.nodeId} : {name}); }
-  catch(e){ toast('切换请求失败', false); renderTable(); return; }
-  if(r.ok){
-    currentNode = r.now || name;
-    if(r.group) currentGroup = r.group;
-    toast(r.msg || `已切换 → ${name}`);
-    renderMeta();
-  }else{
-    toast(r.msg||'切换失败', false);
-    renderTable();
+  if(btn?.disabled) return;
+  const nodeId = (btn && btn.dataset && btn.dataset.nodeId) ? btn.dataset.nodeId : '';
+  const body = nodeId ? {node_id:nodeId} : {name};
+  let preview, requestFailed = false;
+  if(btn && 'disabled' in btn) btn.disabled = true;
+  try{ preview = await post('/api/switch/preview', body); }
+  catch(e){ requestFailed = true; }
+  finally{
+    // 预览只读；无论成功与否都在打开模态框前恢复按钮，取消时不会永久禁用。
+    if(btn && 'disabled' in btn) btn.disabled = false;
   }
+  if(requestFailed){
+    toast('无法读取切换信息，请检查本地后端连接', false);
+    return;
+  }
+  if(!preview || !preview.ok || !preview.plan){
+    toast((preview && preview.msg) || '无法确认切换信息，请刷新目录后重试', false);
+    return;
+  }
+  const plan = preview.plan;
+  confirmModal(switchConfirmText(plan), async ()=>{
+    if(btn && 'disabled' in btn){ btn.disabled = true; btn.textContent = '切换中…'; }
+    try{
+      const r = await post('/api/switch', {node_id:plan.node_id, confirmation:plan});
+      if(r.ok){currentNode=r.now||plan.runtime_name;if(r.group)currentGroup=r.group;
+        toast(r.msg||`已切换 → ${plan.runtime_name}`);renderMeta();}
+      else toast(r.msg||'切换失败，请刷新目录后重新确认',false);
+    }catch(e){toast('切换请求失败；请刷新当前节点后检查结果',false);}
+    finally{
+      if(btn){btn.disabled=false;btn.textContent='切换';}renderTable();
+      if(btn){
+        const row=[...document.querySelectorAll('tr[data-node-id]')].find(el=>
+          el.dataset.nodeId===plan.node_id || (!el.dataset.nodeId && el.dataset.name===plan.runtime_name));
+        if(row?.focus) row.focus({preventScroll:true});
+      }
+    }
+  },btn||document.activeElement);
 }
 
 // 「查看 30 天趋势」：跳到历史视图并选中该节点（含该节点的最近一轮）
@@ -1254,11 +1292,7 @@ function init(){
       return;
     }
     const sw = e.target.closest('button.sw');
-    if(sw && sw.dataset.name!=null){
-      if(typeof SBTasks!=='undefined') confirmModal(`切换到 ${sw.dataset.name}？涉及策略组：${currentGroup||'由后端验证可选策略组'}。来源：${sourceLabel((latestData?.results||[]).find(r=>nodeUiKey(r)===(sw.dataset.nodeId||sw.dataset.name))||{})}。`,()=>switchNode(sw.dataset.name,sw));
-      else switchNode(sw.dataset.name, sw);
-      return;
-    }
+    if(sw && sw.dataset.name!=null){ switchNode(sw.dataset.name, sw); return; }
     const tb = e.target.closest('button.trend');
     if(tb && tb.dataset.name!=null){ gotoTrend(tb.dataset.name,tb.dataset.nodeId||''); return; }
     const cell = e.target.closest('td.stars');

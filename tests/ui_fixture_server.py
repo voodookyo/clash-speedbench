@@ -4,6 +4,7 @@ Run explicitly (not unittest discovery): python -m tests.ui_fixture_server
 All synthetic rows are labelled fixture. This is never a production fallback.
 """
 import argparse
+import copy
 from contextlib import ExitStack
 import sys
 import tempfile
@@ -63,13 +64,26 @@ def main():
         nodes=[dict(node_id='node_v2_'+str(i)*32,runtime_name=name,proto='ss',identity_strength='strong',
                     source_status='verified',subscription_ids=[source],subscription_name='界面验证 fixture <订阅>')
                for i,name in enumerate(['fixture 长名称节点 <香港> & "仅用于界面验证" 🇭🇰','fixture 美国节点','fixture 失败节点'],1)]
-        web.get_catalog=lambda:dict(version=2,status='ok',sources=[
+        web.get_catalog=lambda *a,**k:dict(version=2,status='ok',sources=[
             dict(subscription_id=source,name='界面验证 fixture <订阅>',loaded=True),
             dict(subscription_id='subscription_v2_'+'b'*32,name='fixture 未加载订阅',loaded=False)],nodes=nodes)
-        web.get_current=lambda:dict(ok=True,now=nodes[0]['runtime_name'],group='fixture 策略组')
-        web.connect_controller=lambda *a,**k:None
+        class FixtureController:
+            def __init__(self):
+                self.lock=threading.Lock()
+                self.proxies={n['runtime_name']:dict(type='Shadowsocks') for n in nodes}
+                self.proxies['GLOBAL']=dict(type='Selector',all=['fixture 策略组'])
+                self.proxies['fixture 策略组']=dict(type='Selector',all=[n['runtime_name'] for n in nodes],now=nodes[0]['runtime_name'])
+            def get(self,path):
+                if path!='/proxies':raise ValueError('Fixture only supports /proxies')
+                with self.lock:return dict(proxies=copy.deepcopy(self.proxies))
+            def select(self,group,name):
+                with self.lock:
+                    if name not in self.proxies[group]['all']:raise ValueError('Invalid fixture selection')
+                    self.proxies[group]['now']=name
+        controller=FixtureController()
+        web.get_current=lambda:dict(ok=True,now=controller.get('/proxies')['proxies']['fixture 策略组']['now'],group='fixture 策略组')
+        web.connect_controller=lambda *a,**k:controller
         web.LEAK_BASIC_LOOKUP=lambda ip:None
-        web.switch_node=lambda name:dict(ok=True,now=name,group='fixture 策略组')
         def run(params):
             job=params['_job_id']
             try:

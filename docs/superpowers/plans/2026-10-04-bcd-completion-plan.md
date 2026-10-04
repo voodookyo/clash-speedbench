@@ -45,6 +45,7 @@
 - [x] normal-code 只读导入审阅完成；两个 normal-code --write 从 clean 06fffc1 隔离完成桌面首页数据发现引导、SQLite-only 固定文件存在性、情报状态读互斥及导入总量上限。Codex 检查 diff／保护记录后手动整合，28／32 项专项与真实浏览器键盘、明暗、390px、导入／撤回同步验证通过；原生首次启动门槛另列。
 - [x] D 休眠恢复源码接入：normal-code --write 从 clean f85b663／45c371a 隔离产出；第二轮因超时／403 未完成，由 Codex 在已结束的隔离工作区补足审阅修正和真实自有 Python 子进程取消测试后手动整合。两版本 76 项时钟专项、Python3.12 的 87 项接入专项、Python3.14/3.12 的 1132 项全量回归通过；仅记录固定原因计数，不自动重跑。实际 OS 休眠、原生窗口／包及平台矩阵仍未验收，见 desktop-power-recovery 报告。
 - [ ] B 实现与全部验收。
+- [x] C 手动切换使用认证后端新鲜预览，确认目标／订阅／实际 Selector／当前选择后再次核验，过期映射拒绝。normal-code --write 从 clean a164efa 隔离完成，Codex 审阅补足 root/id/长名/焦点并手动整合；Python3.12 的 66 项专项、Python3.14 源仓库 53 项及实际合成浏览器键盘／确认／取消／切换操作通过，见 switch-confirmation 报告。真实控制器及原生 WebView 仍待验。
 - [ ] C 实现与全部验收。
 - [ ] D 实现与全部验收。
 - [ ] 最终逐规格完成审计。
