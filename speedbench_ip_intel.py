@@ -32,8 +32,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from speedbench_process import cancellation_scope, current_cancellation, SocketCancellation
 
 
 # Public status values.  Keeping these in one place makes the UI and tests
@@ -505,6 +507,26 @@ def _coerce_transport_response(response: Any) -> _TransportResponse:
     return _TransportResponse(int(status), body, headers)
 
 
+class _ScopedHTTPHandler:
+    def do_open(self, connection_class, request, **options):
+        with ExitStack() as resources:
+            def connection(*args, **kwargs):
+                conn=connection_class(*args, **kwargs)
+                resources.enter_context(SocketCancellation(conn,current_cancellation()))
+                return conn
+            # urllib retains its request/header/response and error semantics.
+            # The response reader owns its socket after do_open returns.
+            return super().do_open(connection,request,**options)
+
+
+class _CancellableHTTPHandler(_ScopedHTTPHandler, urllib.request.HTTPHandler):
+    pass
+
+
+class _CancellableHTTPSHandler(_ScopedHTTPHandler, urllib.request.HTTPSHandler):
+    pass
+
+
 def _urllib_transport(url: str, timeout: float = 8.0,
                       headers: Optional[Mapping[str, str]] = None) -> _TransportResponse:
     request = urllib.request.Request(
@@ -517,17 +539,21 @@ def _urllib_transport(url: str, timeout: float = 8.0,
         # default ProxyHandler otherwise inherits HTTP(S)_PROXY from the
         # environment.  Provider credentials must never be sent through a
         # tested node or an ambient proxy.
-        opener = urllib.request.build_opener(
-            _NoRedirectHandler, urllib.request.ProxyHandler({})
-        )
+        handlers=[_NoRedirectHandler,urllib.request.ProxyHandler({})]
+        if current_cancellation() is not None:
+            handlers.extend([_CancellableHTTPHandler,_CancellableHTTPSHandler])
+        opener = urllib.request.build_opener(*handlers)
         with opener.open(request, timeout=timeout) as response:
             return _TransportResponse(int(response.getcode()), response.read(), response.headers)
     except urllib.error.HTTPError as exc:
         try:
-            body = exc.read()
-        except Exception:
-            body = b""
-        return _TransportResponse(int(exc.code), body, getattr(exc, "headers", {}))
+            try:body = exc.read()
+            except Exception:body = b""
+            return _TransportResponse(int(exc.code), body, getattr(exc, "headers", {}))
+        finally:
+            # HTTPError also owns a response stream. A cancelled body must
+            # close it even though KeyboardInterrupt is not an Exception.
+            if exc.fp is not None:exc.close()
 
 
 Transport = Callable[..., Any]
@@ -1284,6 +1310,8 @@ class IpIntelCache:
         including a non-cacheable error, without issuing duplicate requests.
         Different keys remain concurrent.
         """
+        cancel=current_cancellation()
+        if cancel is not None and cancel():raise KeyboardInterrupt
         name = str(getattr(provider, "name", provider))
         normalized_ip = _valid_ip(ip) or str(ip)
         # An explicit opt-out is stronger than a historical cache entry.  Do
@@ -1327,7 +1355,10 @@ class IpIntelCache:
         assert flight is not None
         if not owner:
             started=time.monotonic()
-            try:flight.event.wait()
+            try:
+                while not flight.event.wait(.05):
+                    if cancel is not None and cancel():raise KeyboardInterrupt
+                if cancel is not None and cancel():raise KeyboardInterrupt
             finally:
                 _observe(self.observer,'intel_cache_wait',duration_ms=max(0,time.monotonic()-started)*1000,
                     attempts=1,successes=int(flight.result is not None),
@@ -1412,14 +1443,19 @@ class IpIntelCache:
             return {}
         workers = max(1, min(int(max_workers), len(unique)))
         out: Dict[str, ProviderResult] = {}
+        with cancellation_scope(cancel):scope=current_cancellation()
         if workers == 1:
             for name,provider in unique.items():
-                if cancel is not None and cancel():break
-                out[name]=self.get_or_query(provider,ip,now=now)
+                if scope is not None and scope():break
+                try:
+                    with cancellation_scope(scope):out[name]=self.get_or_query(provider,ip,now=now)
+                except KeyboardInterrupt:
+                    if scope is None or not scope():raise
+                    break
             return out
         def query(provider):
-            if cancel is not None and cancel():return None
-            return self.get_or_query(provider,ip,now=now)
+            if scope is not None and scope():return None
+            with cancellation_scope(scope):return self.get_or_query(provider,ip,now=now)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             pending = {
                 pool.submit(query,provider): name
@@ -1430,6 +1466,8 @@ class IpIntelCache:
                 try:
                     value=future.result()
                     if value is not None:out[name]=value
+                except KeyboardInterrupt:
+                    if scope is None or not scope():raise
                 except Exception as exc:
                     out[name] = self._error_result(
                         name, ip, "error", _sanitize_error(exc, self.secrets)

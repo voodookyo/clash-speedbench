@@ -48,7 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import speedbench_controller as controller_config
 import speedbench_sources as source_catalog
 import speedbench_tasks
-from speedbench_process import run_cancellable, cancellation_scope, current_cancellation, SocketCancellation
+from speedbench_process import run_cancellable, cancellation_scope, current_cancellation, SocketCancellation, connect_socket
 from speedbench_progress import ProgressEmitter, DownloadCounter, ProbeObserver, phase, publish_result, measure, emit_metric, milestone
 from speedbench_jobs import safe_probe_sources
 
@@ -114,7 +114,9 @@ class UnixHTTPConnection(http.client.HTTPConnection):
     def connect(self) -> None:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
-        self.sock.connect(self.socket_path)
+        cancel=current_cancellation()
+        if cancel is None:self.sock.connect(self.socket_path)
+        else:connect_socket(self.sock,self.socket_path,cancel,time.monotonic()+self.timeout)
 
 
 # ---------------- Windows 命名管道传输（external-controller-pipe） ----------------
