@@ -22,7 +22,7 @@ STAGE=ROOT/'desktop'/'src-tauri'/'resources'
 MODULES=('clash_speedbench','speedbench_config','speedbench_controller','speedbench_identity','speedbench_sources',
          'speedbench_tasks','speedbench_profiles','speedbench_jobs','speedbench_process','speedbench_pipe','speedbench_progress',
          'speedbench_owner','speedbench_transfer','speedbench_desktop','speedbench_preferences','speedbench_releases','speedbench_db','speedbench_ip_intel',
-         'speedbench_leak','speedbench_web','speedbench_switch','speedbench_workers','speedbench_tray')
+         'speedbench_leak','speedbench_web','speedbench_switch','speedbench_workers','speedbench_tray','speedbench_power')
 WEB=('index.html','app.js','profiles.js','tasks.js','view.js','preferences.js','releases.js','config-root.js','style.css')
 
 

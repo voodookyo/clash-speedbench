@@ -33,12 +33,13 @@ cp "$ROOT/clash_speedbench.py" \
    "$ROOT/speedbench_switch.py" \
    "$ROOT/speedbench_workers.py" \
    "$ROOT/speedbench_tray.py" \
+   "$ROOT/speedbench_power.py" \
    "$APP/Contents/Resources/app/"
 
 echo "→ 校验程序文件完整性（防止漏拷打出残包）"
 for f in clash_speedbench.py speedbench_config.py speedbench_controller.py speedbench_identity.py speedbench_sources.py speedbench_tasks.py speedbench_profiles.py speedbench_jobs.py speedbench_process.py speedbench_pipe.py speedbench_progress.py speedbench_owner.py speedbench_transfer.py speedbench_desktop.py speedbench_preferences.py speedbench_releases.py speedbench_db.py speedbench_ip_intel.py \
          speedbench_leak.py speedbench_web.py \
-         speedbench_switch.py speedbench_workers.py speedbench_tray.py; do
+         speedbench_switch.py speedbench_workers.py speedbench_tray.py speedbench_power.py; do
   if [ ! -f "$APP/Contents/Resources/app/$f" ]; then
     echo "✗ 缺少 $f：程序文件不完整，终止打包（避免打出残包）" >&2
     exit 1
