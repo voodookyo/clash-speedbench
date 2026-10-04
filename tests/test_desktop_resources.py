@@ -60,7 +60,7 @@ class DesktopResourcesTest(unittest.TestCase):
         for module in resources.MODULES:
             self.assertTrue((resources.ROOT/(module+'.py')).is_file())
             self.assertNotIn('test',module)
-        self.assertEqual(set(resources.WEB),{'index.html','app.js','profiles.js','tasks.js','view.js','preferences.js','releases.js','config-root.js','style.css'})
+        self.assertEqual(set(resources.WEB),{'index.html','app.js','profiles.js','tasks.js','view.js','history-view.js','preferences.js','releases.js','config-root.js','style.css'})
         lock=json.loads((resources.ROOT/'desktop/runtime-lock.json').read_text(encoding='utf-8'))
         for target in ('windows-x86_64','macos-aarch64','macos-x86_64','linux-x86_64','linux-aarch64'):
             self.assertTrue(lock[target]['url'].startswith('https://'))

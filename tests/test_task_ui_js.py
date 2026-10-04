@@ -198,7 +198,7 @@ class TaskUiJsTest(unittest.TestCase):
 
     def run_app(self,driver,data=None):
         stub=STUB_JS.replace('__FETCH_MAP__',json.dumps(data or {}))
-        code=stub+'\n'+MODULE.read_text(encoding='utf-8')+'\n'+APP_JS.read_text(encoding='utf-8')+'\n'+driver
+        code=stub+'\nconst SBHistory=require('+json.dumps(str(APP_JS.parent/'history-view.js'))+');\n'+MODULE.read_text(encoding='utf-8')+'\n'+APP_JS.read_text(encoding='utf-8')+'\n'+driver
         with tempfile.TemporaryDirectory() as td:
             path=Path(td)/'app.js';path.write_text(code,encoding='utf-8')
             result=subprocess.run([NODE,str(path)],capture_output=True,text=True,encoding='utf-8',timeout=10)
@@ -286,7 +286,7 @@ class TaskUiJsTest(unittest.TestCase):
         self.assertEqual(out['results'][0]['latency_ms'],12)
 
     def test_real_app_starts_mode_job_without_requesting_a_fixed_sample(self):
-        data={'/api/catalog':{'status':'ok','sources':[],'nodes':[]},
+        data={'/api/catalog':{'status':'ok','sources':[],'nodes':[{'node_id':'node_v2_'+'b'*32,'source_status':'unknown'}]},
               '/api/jobs':{'ok':True,'job_id':'job_'+'a'*32},
               '/api/jobs/job_'+'a'*32:{'version':1,'job_id':'job_'+'a'*32,'seq':1,'status':'failed','results':[]}}
         stub=STUB_JS.replace('__FETCH_MAP__',json.dumps(data))

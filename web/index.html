@@ -122,6 +122,7 @@
         <div class="hist-main">
           <div class="card">
             <div class="card-title" id="hist-run-title">选择左侧一轮测速查看结果</div>
+            <div id="hist-run-meta" class="meta-line"></div>
             <div class="table-wrap">
               <table>
                 <thead><tr>
@@ -151,7 +152,19 @@
     <section id="view-subs" style="display:none">
       <div class="card">
         <div class="toolbar">
-          <div class="card-title" style="margin:0;flex:1">订阅汇总（点行看趋势）</div>
+          <h2 class="card-title" style="margin:0;flex:1">实时订阅目录</h2>
+          <button type="button" class="mini" id="btn-subs-catalog-refresh">刷新目录</button>
+        </div>
+        <p class="card-sub">来自当前 Verge 配置与已加载节点。未加载订阅可查看，需先在 Verge 加载后再测速；下方历史数据不会自动归到当前同名来源。</p>
+        <p id="subs-catalog-status" class="meta-line" role="status">正在读取实时目录…</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>订阅来源</th><th>加载状态</th><th>当前节点</th><th>下一步</th></tr></thead>
+          <tbody id="subs-catalog-tbody"></tbody>
+        </table></div>
+      </div>
+      <div class="card">
+        <div class="toolbar">
+          <div class="card-title" style="margin:0;flex:1">历史订阅汇总（选择订阅看趋势）</div>
           <label class="muted" for="subs-days">统计范围</label>
           <select id="subs-days">
             <option value="7">近 7 天</option>
@@ -328,6 +341,7 @@
 <script src="/static/releases.js"></script>
 <script src="/static/config-root.js"></script>
 <script src="/static/view.js"></script>
+<script src="/static/history-view.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

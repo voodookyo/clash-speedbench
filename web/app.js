@@ -297,10 +297,17 @@ async function loadSourceCatalog(){
     select.value = selected;
     const unknown = (catalog.nodes||[]).filter(n=>n.source_status!=='verified').length;
     status.textContent = catalog.status==='ok'
-      ? `已核验 ${(catalog.nodes||[]).length} 个节点 · ${unknown} 个来源不唯一/未知。未加载订阅不会自动切换。`
-      : '订阅目录暂不可核验，仍可测速已加载节点；来源不会被猜测填入。';
+      ? ((catalog.nodes||[]).length?`已核验 ${catalog.nodes.length} 个节点 · ${unknown} 个来源不唯一/未知。未加载订阅不会自动切换。`:'当前没有已加载节点。请在 Verge 加载订阅，再点击“刷新订阅”。')
+      : '订阅目录暂不可核验。请启动 Verge、开启外部控制器，再刷新订阅；来源不会被猜测填入。';
+    renderLiveSubsCatalog();
     renderNodePicker(); updateTaskBudget();
-  }catch(e){ if(stamp===catalogRequestRevision)status.textContent='订阅目录读取失败；请确认 Verge 已运行。'; }
+  }catch(e){
+    if(stamp===catalogRequestRevision){
+      sourceCatalog={status:'unavailable',nodes:[],sources:[]};
+      status.textContent='订阅目录读取失败或超时；请确认 Verge 已运行、外部控制器可用，再刷新订阅。';
+      renderLiveSubsCatalog();renderNodePicker();updateTaskBudget();
+    }
+  }
 }
 
 /* ==================== 表格行渲染（节点/历史/订阅三视图复用） ==================== */
@@ -446,6 +453,7 @@ function emptyRow(text, colspan){
 function renderTable(){
   const tbody = document.getElementById('tbody');
   if(!latestData){ tbody.innerHTML = skeletonRows(6); return; }
+  if(activeTask && latestData.task===activeTask.config && latestData.ts===activeTask.started_at) renderTaskResultMeta(activeTask);
   const all = latestData.results || [];
   if(!all.length){
     tbody.innerHTML = emptyRow(activeTask && !SBTasks.terminal(activeTask.status)?'等待首个探测结果；任务正在运行。':'暂无测速记录 · 在上方选择范围与模式，点击「开始测速」');
@@ -586,8 +594,14 @@ function renderHistList(){
 function renderHistTable(){
   const tbody = document.getElementById('hist-tbody');
   const rec = histData[histSelRun];
+  const meta=document.getElementById('hist-run-meta');
+  if(meta)meta.textContent='';
   if(!rec){ tbody.innerHTML = emptyRow('暂无数据'); return; }
   document.getElementById('hist-run-title').textContent = `本轮结果：${rec.ts}（只读，点击行看趋势）`;
+  if(meta && typeof SBHistory!=='undefined'){
+    const summary=SBHistory.describe(rec);
+    meta.textContent=`${summary.mode} · ${summary.status}\n${summary.range} · 耗时 ${summary.elapsed} · 流量 ${summary.traffic}\n指标覆盖（按已返回节点）：${summary.coverage}`;
+  }
   const rows = (rec.results||[]).slice();
   if(!rows.length){ tbody.innerHTML = emptyRow('该轮没有节点数据'); return; }
   sortRows(rows, histSortKey, histSortAsc);
@@ -746,7 +760,27 @@ const UNKNOWN_PROVIDER = '(未知订阅)';
 // 汇总/API 用展示名，匹配 slim 历史行里的原始 provider 时用原始值
 function subsRawProvider(){ return subsSel===UNKNOWN_PROVIDER ? '' : subsSel; }
 
+function renderLiveSubsCatalog(){
+  const body=document.getElementById('subs-catalog-tbody'),status=document.getElementById('subs-catalog-status');
+  if(!body || !status)return;
+  const nodes=sourceCatalog.nodes||[];
+  if(sourceCatalog.status!=='ok'){
+    status.textContent='实时目录暂不可核验；请检查 Verge 与外部控制器，再刷新目录。下方历史汇总仍可查看。';
+    body.innerHTML=emptyRow('实时来源未知；不会按名称猜测归属',4);return;
+  }
+  status.textContent=`当前已加载 ${nodes.length} 个节点。多来源节点分别出现在相关订阅中，计数不能跨订阅相加。`;
+  body.innerHTML=(sourceCatalog.sources||[]).map(s=>{
+    const matches=nodes.filter(n=>(n.subscription_ids||[]).includes(s.subscription_id));
+    const ambiguous=matches.filter(n=>n.source_status==='ambiguous').length;
+    return `<tr><td>${esc(s.name)}</td><td>${s.loaded?'已加载':'未加载/不可用'}</td><td>${matches.length}${ambiguous?`（${ambiguous} 多来源）`:''}</td><td>${s.loaded&&matches.length?`<button type="button" class="mini" data-test-source="${esc(s.subscription_id)}">选择此订阅测速</button>`:'请先在 Verge 加载订阅并刷新目录'}</td></tr>`;
+  }).join('');
+  const unknown=nodes.filter(n=>n.source_status==='unknown').length;
+  if(unknown)body.innerHTML+=`<tr><td>来源未知</td><td>已加载节点</td><td>${unknown}</td><td>在节点页使用全部已加载范围，或手动选择身份明确的节点</td></tr>`;
+  if(!body.innerHTML)body.innerHTML=emptyRow('未发现订阅。请在 Verge 加载后刷新目录；可用节点仍可在节点页手动选择。',4);
+}
+
 async function loadSubs(){
+  loadSourceCatalog(); // Independent live directory failure must not hide history.
   let d;
   try{ d = await getJSON((typeof SBTasks==='undefined'?'/api/subscriptions':'/api/sources/history')+'?days='+subsDays); }
   catch(e){ d = []; toast('读取订阅汇总失败', false); }
@@ -1439,6 +1473,17 @@ function init(){
       restoreListFocus('subs-tbody','.subs-pick','provider',tr.dataset.provider);
     }
   });
+  document.getElementById('btn-subs-catalog-refresh')?.addEventListener('click',loadSourceCatalog);
+  document.getElementById('subs-catalog-tbody')?.addEventListener('click',e=>{
+    const button=e.target.closest('button[data-test-source]');
+    if(!button)return;
+    const id=button.dataset.testSource;
+    if(sourceCatalog.status!=='ok' || !(sourceCatalog.sources||[]).some(s=>s.loaded && s.subscription_id===id)){
+      toast('订阅已失效或未加载，请刷新目录',false);return;
+    }
+    const select=document.getElementById('f-source');select.value=id;
+    renderNodePicker();updateTaskBudget();window.location.hash='#/nodes';route();select.focus?.({preventScroll:true});
+  });
   document.getElementById('subs-nodes-tbody').addEventListener('click', e=>{
     const cell = e.target.closest('td.stars');
     if(cell && cell.dataset.name!=null) gotoTrend(cell.dataset.name,cell.closest('tr').dataset.nodeId||'');
@@ -1513,6 +1558,9 @@ function updateTaskBudget(){
   el.textContent=`范围 ${count} 节点 · ${config.bandwidth?'精测最多 '+(config.measure_all?count:Math.min(count,config.top_n))+' 节点':'不请求带宽'} · 带宽样本预算上限 ${budget} MB（不含小流量探测；不是实际流量）`;
 }
 async function startTask(){
+  if(sourceCatalog.status==='ok' && !(sourceCatalog.nodes||[]).length){
+    toast('当前没有已加载节点。请先在 Verge 加载订阅，再刷新订阅。',false);return;
+  }
   const mode=document.getElementById('f-mode').value||'standard';
   const body={mode,target_profile:document.getElementById('f-target').value||'daily',
     rounds:Number(document.getElementById('f-rounds').value)||1,
@@ -1594,9 +1642,13 @@ function showTask(task){
   const notice=powerNotice(task.metrics);
   document.getElementById('task-summary').textContent=`${running?'截至此更新，已等待':'总耗时'} ${elapsed} · 已报告实际下载 ${(bytes/1000000).toFixed(2)} MB · IPv4/IPv6 独立更新${running?' · 剩余时间尚无法可靠估计':' · 中断中的未报告字节不计入此值'}${notice?' · '+notice:''}`;
   latestData={ts:task.started_at,results:task.results||[],task:task.config};
-  document.getElementById('latest-meta').textContent=`${task.config?.mode||task.mode||'未知模式'} · ${text} · ${latestData.results.length} 个已返回节点 · 已测范围内推荐`;
   renderTable();renderBoard();
   if(!running){histLoaded=false;subsLoaded=false;}
+}
+function renderTaskResultMeta(task){
+  const rows=task.results||[],running=!SBTasks.terminal(task.status),text=taskLabels[task.status]||'状态未知';
+  const hasRecommendation=rows.some(r=>profileScore(r)!=null);
+  document.getElementById('latest-meta').textContent=`${task.config?.mode||task.mode||'未知模式'} · ${text} · ${rows.length} 个已返回节点 · ${hasRecommendation?'已测范围内推荐':running?'等待可用于推荐的观测结果':'当前目标没有可推荐结果；请展开指标状态，检查节点连接或调整测速模式后重试'}`;
 }
 let taskListRevision=0,taskDetailRevision=0,selectedTaskHistoryId='';
 function clearTaskHistory(){

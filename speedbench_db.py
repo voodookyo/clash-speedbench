@@ -440,6 +440,31 @@ def task_snapshot(db_path, job_id):
         return result
 
 
+def history_task_summaries(db_path, job_ids):
+    """Bounded public totals keyed by exact task identity, never timestamps.
+
+    Missing checkpoints/metrics remain absent; sample budgets are not bytes.
+    Batch queries avoid reopening SQLite once per historical run.
+    """
+    from contextlib import closing
+    ids=sorted({key for key in job_ids if isinstance(key,str) and re.fullmatch(r'job_[0-9a-f]{32}',key)})
+    result={}
+    if not ids:return result
+    with closing(_open(db_path)) as conn:
+        for start in range(0,len(ids),400):
+            chunk=ids[start:start+400]
+            rows=conn.execute('''SELECT t.job_id,t.status,t.partial,t.elapsed_ms,
+                TOTAL(m.bytes),COUNT(m.phase) FROM task_runs t
+                LEFT JOIN task_metrics m ON m.job_id=t.job_id AND m.phase!='milestones'
+                WHERE t.job_id IN ('''+','.join('?' for _ in chunk)+') GROUP BY t.job_id',chunk)
+            for key,status,partial,elapsed,bytes_,metric_count in rows:
+                summary=dict(status=status,partial=bool(partial))
+                if elapsed is not None and elapsed>0:summary['elapsed_ms']=elapsed
+                if metric_count and 0<=bytes_<=2**53-1:summary['downloaded_bytes']=int(bytes_)
+                result[key]=summary
+    return result
+
+
 def interrupt_tasks(db_path):
     """Called only by an owning backend on restart; retains partial records."""
     from contextlib import closing

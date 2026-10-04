@@ -69,6 +69,7 @@ STATIC_FILES = {
     '/static/preferences.js': ('preferences.js','application/javascript; charset=utf-8'),
     '/static/profiles.js': ('profiles.js','application/javascript; charset=utf-8'),
     '/static/view.js': ('view.js','application/javascript; charset=utf-8'),
+    '/static/history-view.js': ('history-view.js','application/javascript; charset=utf-8'),
     '/static/tasks.js': ('tasks.js','application/javascript; charset=utf-8'),
     "/static/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/static/style.css": ("style.css", "text/css; charset=utf-8"),
@@ -452,13 +453,28 @@ def slim_history() -> list:
     """Trend data: per run, per node, only the fields the chart needs."""
     sync_db()
     out = []
-    for rec in speedbench_db.all_runs(db_path()):
+    records=speedbench_db.all_runs(db_path())
+    summaries=speedbench_db.history_task_summaries(db_path(),
+        [rec['task'].get('job_id') for rec in records if isinstance(rec.get('task'),dict)])
+    for rec in records:
+        task={}
+        raw=rec.get('task')
+        if isinstance(raw,dict):
+            if raw.get('mode') in speedbench_tasks.MODES:task['mode']=raw['mode']
+            if raw.get('target_profile') in speedbench_tasks.PROFILES:task['target_profile']=raw['target_profile']
+            if isinstance(raw.get('partial'),bool):task['partial']=raw['partial']
+            if raw.get('status') in ('completed','cancelled','failed','interrupted'):task['status']=raw['status']
+            count=raw.get('selected_node_count')
+            if isinstance(count,int) and not isinstance(count,bool) and 0<=count<=3000:task['selected_node_count']=count
+            summary=summaries.get(raw.get('job_id')) if isinstance(raw.get('job_id'),str) else None
+            if summary:
+                # Late cleanup failure/cancellation cannot be hidden by a raw
+                # report saved just before the backend reached its terminal.
+                partial=task.get('partial',False) or summary['partial']
+                task.update(summary);task['partial']=partial
         out.append({
             "ts": rec.get("ts", ""),
-            **({'task':{k:v for k,v in rec['task'].items() if
-                k=='mode' and v in speedbench_tasks.MODES or
-                k=='target_profile' and v in speedbench_tasks.PROFILES}}
-               if isinstance(rec.get('task'),dict) else {}),
+            **({'task':task} if isinstance(raw,dict) else {}),
             "results": [
                 {
                     "name": r.get("name"),

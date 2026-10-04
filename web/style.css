@@ -169,6 +169,7 @@ input[type=password] { background: var(--input); color: var(--fg); border: 1px s
 .hist-side { flex: 0 0 280px; max-height: 75vh; overflow: auto;
              position: sticky; top: 24px; }
 .hist-main { flex: 1; min-width: 0; }
+#hist-run-meta { white-space: pre-line; margin-bottom: 12px; overflow-wrap: anywhere; }
 .hist-item { padding: 8px 10px; border-radius: 6px; cursor: pointer;
              border: 1px solid transparent; margin-bottom: 2px; }
 button.hist-item { display: block; width: 100%; text-align: left; background: transparent;
@@ -234,6 +235,7 @@ canvas { width: 100%; height: 240px; background: var(--input);
   .nav-foot { margin: 0 0 0 auto; border-top: 0; padding: 8px 12px; }
   #main { padding: 14px; }
   .hist-layout { flex-direction: column; }
+  .hist-main { width: 100%; }
   .hist-side { flex: none; width: 100%; max-height: 240px; position: static; }
   #f-search { width: 100%; }
 }

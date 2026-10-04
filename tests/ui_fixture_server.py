@@ -61,8 +61,17 @@ def seed_history(path, nodes, source):
         legacy=dict(name='fixture 旧格式 未知来源',provider='',proto='ss',latency_ms=50,status='ok')
         records.append(dict(ts=ts,mb=10,rounds=1,task=dict(mode='quick',target_profile='daily'),
                             results=[row,ambiguous,unknown,legacy]))
+        if index:
+            records[-1]['task'].update(job_id='job_'+str(index)*32,selected_node_count=4 if index==1 else 5,
+                partial=index==2,status='completed' if index==1 else 'cancelled')
     path.write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in records),encoding='utf-8')
     web.speedbench_db.import_jsonl(path.with_suffix('.db'),path)
+    for index,record in enumerate(records[1:],1):
+        task=record['task']
+        web.speedbench_db.save_task(path.with_suffix('.db'),dict(job_id=task['job_id'],status=task['status'],
+            config={'mode':'quick','target_profile':'daily'},started_at=record['ts'],finished_at=record['ts'],
+            elapsed_ms=2500 if index==1 else 1750,results=record['results'],metrics={
+                'download':dict(duration_ms=1000,attempts=1,successes=1,bytes=10000000 if index==1 else 500000)}))
 
 
 LEAK_FIXTURE_JS="""'use strict';

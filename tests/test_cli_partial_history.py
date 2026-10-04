@@ -70,6 +70,7 @@ class CliPartialHistoryTest(unittest.TestCase):
         code,output,_=self.invoke(self.producer(KeyboardInterrupt()),extra=['--auto-switch'])
         self.assertEqual(code,130)
         record=self.records()[0];self.assertTrue(record['task']['partial']);self.assertEqual(record['task']['status'],'cancelled')
+        self.assertEqual(record['task']['selected_node_count'],1)
         self.assertEqual(len(record['results']),1)
         result=record['results'][0];self.assertEqual(result['latency_ms'],20)
         self.assertIsNone(result['median_mbps']);self.assertIsNone(result['ip_quality_score'])

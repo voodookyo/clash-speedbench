@@ -1981,6 +1981,9 @@ def append_history(results: List[Result], path: Path, mb: Optional[int], rounds:
                           ('job_id','mode','target_profile','partial') and isinstance(v,(str,bool))}
         if task.get('status') in ('completed','cancelled','failed','interrupted'):
             record['task']['status']=task['status']
+        count=task.get('selected_node_count')
+        if isinstance(count,int) and not isinstance(count,bool) and 0<=count<=3000:
+            record['task']['selected_node_count']=count
         record['ts'] = datetime.now().isoformat(timespec='microseconds')
     try:
         with path.open("a", encoding="utf-8") as f:
@@ -2033,6 +2036,7 @@ def _save_partial_report(args,status):
     except (OSError,KeyboardInterrupt):
         print('部分 CSV 未完整保存；仍尝试保留 JSONL 历史。',file=sys.stderr)
     task=dict(mode=args.mode or 'legacy',target_profile=args.target_profile,partial=True,status=status)
+    if hasattr(args,'selected_node_count'):task['selected_node_count']=args.selected_node_count
     if args.progress is not None:task['job_id']=args.progress.job_id
     if not args.no_history:
         args._history_saved=append_history(results,Path(args.history),args.mb,args.rounds,csv_path,task=task)
@@ -2144,6 +2148,7 @@ def _report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict
             task = dict(mode=getattr(args,'mode',None) or 'legacy',
                         target_profile=getattr(args,'target_profile','balanced'),
                         partial=partial,status='cancelled' if partial else 'completed')
+            if hasattr(args,'selected_node_count'):task['selected_node_count']=args.selected_node_count
             if getattr(args,'progress',None) is not None:
                 task['job_id'] = args.progress.job_id
         args._history_saved=append_history(results, Path(args.history), args.mb, args.rounds, out,task=task)
@@ -2393,6 +2398,7 @@ def _execute_benchmark(args,task_config):
     candidates.sort()
     if args.limit > 0:
         candidates = candidates[:args.limit]
+    args.selected_node_count=len(candidates)
 
     if not candidates:
         print("没有找到符合筛选条件的实际代理节点。", file=sys.stderr)
