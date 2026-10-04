@@ -29,7 +29,21 @@
       status:status+' · '+partial,elapsed:number(t.elapsed_ms)?(t.elapsed_ms/1000).toFixed(2)+'s':'未知',
       traffic:Number.isSafeInteger(t.downloaded_bytes) && t.downloaded_bytes>=0?(t.downloaded_bytes/1000000).toFixed(2)+' MB（仅已报告实际字节）':'未知',coverage};
   }
-  const api=Object.freeze({describe});
+  function sourceNames(points,identified){
+    if(!identified) return '名称记录未知：历史来源缺少稳定 ID，不能确认改名关系。';
+    const observations=[];
+    let previous;
+    for(const point of Array.isArray(points)?points:[]){
+      const name=typeof point?.name_snapshot==='string' && point.name_snapshot.trim()?point.name_snapshot:null;
+      if(observations.length && name===previous) continue;
+      const ts=typeof point?.ts==='string' && point.ts.trim()?point.ts:'观测时间未知';
+      observations.push(`${ts} · ${name===null?'名称未知':name}`);
+      previous=name;
+    }
+    return observations.length?'名称观测（仅所选时段；时间是测速观测时间）：\n'+observations.join('\n'):
+      '名称记录未知：所选时段没有名称快照。';
+  }
+  const api=Object.freeze({describe,sourceNames});
   if(typeof module==='object'&&module.exports) module.exports=api;
   else root.SBHistory=api;
 })(typeof window==='object'?window:globalThis);

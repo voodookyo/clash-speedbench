@@ -51,6 +51,7 @@
 - [x] C 共享界面键盘／focus／aria 与历史身份回归、合成历史/错误/partial/泄漏场景：两个 normal-code --write 从 clean 3ec1f11 隔离启动，均因超时／403 未完成，由 Codex 在已结束隔离区补足并审阅整合。两版各 110 项专项通过，七页实际合成浏览器、390px 深色／常规浅色、取消及刷新后任务中心回放通过；修复信誉跨节点借用。订阅实时/历史区分、轮次元数据、直接错误引导和原生门槛仍待补，见 shared-ui-navigation 报告。
 - [ ] D 实现与全部验收。
 - [x] C 实时目录／历史订阅显式分区、稳定 ID 选择入口、轮次模式／原范围／partial／SQLite 实测时间与字节／指标覆盖、空目录与无推荐引导；CLI 新 raw 保留筛选后数量，旧 raw 未知不补造。Codex 在已结束 normal-code --write 隔离区接续实现并审阅；两版各 1207 项全量通过，最终样式／中文文案修正后 7 项专项及390px历史／订阅实际浏览器通过，见 history-scope-ui 报告。原生和真实网络门槛未降低。
+- [x] C 订阅名称观测：复用按 subscription_id 查询的 name_snapshot，展示相邻名称变化、恢复旧名与未知快照；旧来源不推断改名，同名不同 ID 不合并，过期响应不覆盖新来源或天数。Codex 在既有已结束 normal-code --write 隔离区实现，88 项专项及键盘／常规和390px实际合成浏览器通过，见 history-scope-ui 补记；本次未重复旧全量或新增 native 验收结论。
 - [ ] 最终逐规格完成审计。
 
 当前路由执行补记：上述 GREEN 是路由更新时的历史检查。本批从 a164efa 启动的两个 normal-code --write 仍满足 VERIFIED／allowlist／worktree 隔离，实际多次超时后均由 DeepSeek flash 完成；registry 验证与历史健康不等于即时可用性。Codex 按返回 diff 与源树保护记录审阅，另行运行真实测试；未修改 ai-dev 或把 worker 测试文字当作最终验收。

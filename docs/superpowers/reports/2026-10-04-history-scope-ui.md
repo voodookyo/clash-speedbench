@@ -25,3 +25,15 @@ Codex 继续在已结束的 normal-code --write 隔离工作区完成这些接�
 截图：/tmp/clash-speedbench-c-history-metadata.jpg、/tmp/clash-speedbench-c-live-history-sources.jpg、/tmp/clash-speedbench-c-all-failed-guidance.jpg、/tmp/clash-speedbench-c-history-narrow.jpg。三项自有 fixture 正常 exit=0，标签已关闭，viewport 已恢复。无真实 Verge 设置、节点/STUN 流量、付费 API 或用户历史操作。
 
 C 整阶段仍等待原生 WebView、真实 controller/流量和其他平台门槛；B/D 与最终逐规格验收也保持未完成。安装开发工具、真实网络与外部执行的既有授权问题仍待用户答复。
+
+## 订阅名称观测补齐
+
+逐规格核对发现订阅详情没有显示名称变更，虽然按 subscription_id 查询的既有 API 已提供每轮 name_snapshot。共享 history-view.js 增加纯文本名称观测描述，订阅详情按原有时间顺序呈现，折叠相邻重复名称，保留恢复旧名与缺失快照；明确时间是测速观测时间，而非推断的实际改名时刻。旧来源缺少稳定 ID 时不确认改名关系，同名但不同 ID 的来源分开查询。只增加前端显示，无数据库或 API 修改。
+
+选择来源或统计范围后，先清除旧名称记录；请求序号防止较早的成功/失败响应覆盖新选择及新时间范围。加载、无快照和读取失败各自提示，失败提供重新选择或刷新下一步。名称/时间均经 textContent 显示，aria-live 提供更新提示，长文字在窄窗口换行。
+
+接续同一已结束的 normal-code --write 隔离区，由 Codex 完成窄改动与审阅；当前路由配置/策略/registry/health 已核对，六候选仍 RED（timeout/403），未重复此前失败的委派或修改全局环境。整合前源仓库仍 clean 2096790；没有新 worker 成功或外部独立审阅证据。
+
+先运行两项新测试，均以名称显示为空失败。实现后 Python3.14.7 的 88 项针对性检查通过（23.599s）：history_summary、source_history、navigation_ui_js、task_ui_js、web_security、desktop_resources。覆盖重复折叠、恢复旧名、未知快照、同名不同来源、不使用 innerHTML、旧来源未知、失败提示，以及新选择/同一来源不同天数的乱序成功或失败响应。node --check 与 diff 检查通过；本次前端窄改动不重复此前全量，不把旧 1207 项结果称为当前提交全量验证。
+
+自有 localhost fixture 使用生产 SQLite 投影与 API；实际键盘选择、切换旧来源、改选近7天，看到旧名→新名及缺少稳定 ID 提示。浅色常规窗口和390px实测，无名称元素子节点，无 warn/error，文档宽375px；截图 /tmp/clash-speedbench-c-name-history.jpg 和 /tmp/clash-speedbench-c-name-history-narrow.jpg。原生、真实流量与其他平台仍待验收。

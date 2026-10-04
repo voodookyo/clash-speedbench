@@ -108,3 +108,64 @@ class HistorySummaryJsTest(unittest.TestCase):
         """)
         self.assertEqual(out['sent'],0);self.assertIn('Verge 加载订阅',out['messages'][0])
         self.assertIn('没有可推荐结果',out['download']);self.assertIn('已测范围内推荐',out['daily'])
+
+    def test_subscription_name_observations_keep_reverts_gaps_and_source_identity(self):
+        out=task_ui.TaskUiJsTest.run_app(self,"""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const a='subscription_v2_'+'a'.repeat(32),b='subscription_v2_'+'b'.repeat(32);
+            subsData=[{selection_key:a,subscription_id:a,provider:'当前名'},
+              {selection_key:b,subscription_id:b,provider:'当前名'},
+              {selection_key:'legacy',source_status:'legacy_unknown',provider:'当前名'},
+              {selection_key:'unknown',source_status:'unknown',provider:'来源未知'}];
+            const series=[{ts:'t1',name_snapshot:'旧名 <img src=x> " 🇭🇰'},
+              {ts:'t2',name_snapshot:'旧名 <img src=x> " 🇭🇰'},
+              {ts:'t3',name_snapshot:'当前名'}, {ts:'t4'},
+              {ts:'t5',name_snapshot:'当前名'}, {ts:'t6',name_snapshot:'旧名 <img src=x> " 🇭🇰'}];
+            let urls=[];getJSON=async url=>{urls.push(url);return url.includes(a)?series:
+              url.includes(b)?[{ts:'t7',name_snapshot:'第二来源旧名'}]:series;};
+            histLoaded=true;histData=[];drawSubsChart=()=>{};
+            await selectSub(a);const first={text:__el('subs-name-history').textContent,html:__el('subs-name-history').innerHTML};
+            await selectSub(b);const second=__el('subs-name-history').textContent;
+            await selectSub('legacy');const legacy=__el('subs-name-history').textContent;
+            await selectSub('unknown');const unknown=__el('subs-name-history').textContent;
+            console.log(JSON.stringify({first,second,legacy,unknown,urls}));})();
+        """)
+        text=out['first']['text']
+        self.assertIn('测速观测时间',text)
+        self.assertEqual(text.count('旧名 <img src=x> " 🇭🇰'),2)
+        self.assertNotIn('t2',text);self.assertIn('t4 · 名称未知',text)
+        self.assertLess(text.index('t1'),text.index('t3'))
+        self.assertLess(text.index('t3'),text.index('t6'))
+        self.assertEqual(out['first']['html'],'')
+        self.assertIn('第二来源旧名',out['second']);self.assertNotIn('t1',out['second'])
+        for key in ('legacy','unknown'):
+            self.assertIn('缺少稳定 ID',out[key]);self.assertNotIn('t1',out[key])
+        self.assertEqual(len(out['urls']),3)
+        self.assertTrue(out['urls'][0].startswith('/api/source?subscription_id='))
+        self.assertIn('/api/subscription?name=',out['urls'][2])
+
+    def test_subscription_name_request_cannot_replace_new_selection_or_day_range(self):
+        out=task_ui.TaskUiJsTest.run_app(self,"""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const a='subscription_v2_'+'a'.repeat(32),b='subscription_v2_'+'b'.repeat(32);
+            subsData=[{selection_key:a,subscription_id:a,provider:'A'},
+              {selection_key:b,subscription_id:b,provider:'B'}];
+            histLoaded=true;histData=[];drawSubsChart=()=>{};
+            let pending=[];getJSON=url=>new Promise((resolve,reject)=>pending.push({url,resolve,reject}));
+            const old=selectSub(a);const fresh=selectSub(b);
+            pending[1].resolve([{ts:'fresh',name_snapshot:'B 新名'}]);await fresh;
+            pending[0].reject(new Error('stale'));await old;
+            const chosen=__el('subs-name-history').textContent;
+            subsDays=7;const week=selectSub(b);subsDays=30;const month=selectSub(b);
+            pending[3].resolve([{ts:'month',name_snapshot:'B 月度名'}]);await month;
+            pending[2].resolve([{ts:'week',name_snapshot:'B 旧范围名'}]);await week;
+            const ranged=__el('subs-name-history').textContent;
+            const empty=selectSub(b);pending[4].resolve([]);await empty;
+            const noSnapshots=__el('subs-name-history').textContent;
+            const failed=selectSub(b);pending[5].reject(new Error('fixture'));await failed;
+            console.log(JSON.stringify({chosen,ranged,noSnapshots,failed:__el('subs-name-history').textContent}));})();
+        """)
+        self.assertIn('B 新名',out['chosen']);self.assertNotIn('A',out['chosen'])
+        self.assertIn('B 月度名',out['ranged']);self.assertNotIn('旧范围名',out['ranged'])
+        self.assertIn('没有名称快照',out['noSnapshots'])
+        self.assertIn('读取名称记录失败',out['failed']);self.assertIn('刷新',out['failed'])

@@ -755,6 +755,7 @@ let subsLoaded = false;
 let subsDays = +(lsGet('sb_subs_days')||30) || 30;
 let subsSel = null;         // 当前选中的订阅（API 展示名，未知来源为 "(未知订阅)"）
 let subsSeries = null;      // {name, pts:[{ts,online_ratio,median_mbps,latency_ms,avg_score}]}
+let subsRequest = 0;        // Discard responses for earlier selections or day ranges.
 
 const UNKNOWN_PROVIDER = '(未知订阅)';
 // 汇总/API 用展示名，匹配 slim 历史行里的原始 provider 时用原始值
@@ -815,6 +816,7 @@ function renderSubsTable(){
 }
 
 async function selectSub(name){
+  const request=++subsRequest;
   subsSel = name;
   const source=subsData.find(s=>(s.selection_key||s.provider)===name);
   const display=source?source.provider:name;
@@ -823,6 +825,8 @@ async function selectSub(name){
     `订阅趋势：${display}（近 ${subsDays} 天，三条线各自归一；多来源节点不能跨订阅相加）`;
   renderSubsTable();
   subsSeries = null;
+  const names=document.getElementById('subs-name-history');
+  names.textContent=source?.subscription_id?'读取名称记录…':SBHistory.sourceNames([],false);
   drawSubsChart();
   if(source && !source.subscription_id && source.source_status==='unknown'){
     subsSeries={name,pts:[]};
@@ -832,10 +836,13 @@ async function selectSub(name){
   try{
     const url=source && source.subscription_id?'/api/source?subscription_id='+encodeURIComponent(source.subscription_id):'/api/subscription?name='+encodeURIComponent(display==='历史来源未知' || display==='来源未知'?'':display);
     const d = await getJSON(url+'&days='+subsDays);
-    if(subsSel!==name) return;   // 等待期间用户已改选别的订阅，丢弃过期响应
+    if(request!==subsRequest) return;   // 改选来源或时间范围后丢弃过期响应。
     subsSeries = {name, pts: Array.isArray(d) ? d : []};
+    names.textContent=SBHistory.sourceNames(subsSeries.pts,!!source?.subscription_id);
   }catch(e){
+    if(request!==subsRequest) return;
     subsSeries = {name, pts: []};
+    names.textContent=source?.subscription_id?'读取名称记录失败，请重新选择订阅或刷新。':SBHistory.sourceNames([],false);
   }
   drawSubsChart();
   renderSubsNodes(name);
