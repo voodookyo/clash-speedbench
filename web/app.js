@@ -235,7 +235,22 @@ function updateSortArrows(sel, key, asc){
   const ths = document.querySelectorAll(sel);
   for(const th of ths){
     const arr = th.querySelector('.arr');
-    if(arr) arr.textContent = (th.dataset && th.dataset.k===key) ? (asc?'▲':'▼') : '';
+    const active = !!(th.dataset && th.dataset.k===key);
+    if(arr) arr.textContent = active ? (asc?'▲':'▼') : '';
+    if(typeof th.setAttribute==='function')
+      th.setAttribute('aria-sort', active ? (asc?'ascending':'descending') : 'none');
+  }
+}
+
+// 列表按稳定标识重渲染后把键盘焦点还给当前选中项；逐项比较 dataset，
+// 绝不把可能含引号的订阅名拼进选择器。
+function restoreListFocus(boxId, selector, attr, value){
+  const box = document.getElementById(boxId);
+  if(!box || typeof box.querySelectorAll!=='function') return;
+  for(const el of box.querySelectorAll(selector)){
+    if(el && el.dataset && String(el.dataset[attr])===String(value) && typeof el.focus==='function'){
+      el.focus({preventScroll:true}); return;
+    }
   }
 }
 
@@ -472,7 +487,7 @@ function setSort(k){
 
 /* ---------- 地区榜 ---------- */
 function boardItem(x){
-  return `<button class="board-item" data-name="${esc(x.name)}" data-node-id="${esc(x.node_id||'')}">${esc(x.name)} <b>${x.sc==null?'-':x.sc.toFixed(1)}</b>${x.mbps!=null?`·${x.mbps.toFixed(0)}M`:''}</button>`;
+  return `<button type="button" class="board-item" data-name="${esc(x.name)}" data-node-id="${esc(x.node_id||'')}">${esc(x.name)} <b>${x.sc==null?'-':x.sc.toFixed(1)}</b>${x.mbps!=null?`·${x.mbps.toFixed(0)}M`:''}</button>`;
 }
 
 // 地区榜：按 regionOf 分组，每组取当前 Profile 下 Top 3；不通/无数据（分数 null）不进榜；
@@ -562,8 +577,8 @@ function renderHistList(){
     const ch = championOf(rec);
     const sub = ch ? `${n} 节点 · 🥇 ${esc(ch.name)} · ${ch.median_mbps!=null?ch.median_mbps.toFixed(1)+'M':'-'}`
                    : `${n} 节点`;
-    html += `<div class="hist-item${i===histSelRun?' on':''}" data-i="${i}">` +
-            `<div class="hist-ts">${esc(rec.ts||'')}</div><div class="hist-sub">${sub}</div></div>`;
+    html += `<button type="button" class="hist-item${i===histSelRun?' on':''}" data-i="${i}"${i===histSelRun?' aria-current="true"':''}>` +
+            `<span class="hist-ts">${esc(rec.ts||'')}</span><span class="hist-sub">${sub}</span></button>`;
   }
   box.innerHTML = html;
 }
@@ -576,10 +591,11 @@ function renderHistTable(){
   const rows = (rec.results||[]).slice();
   if(!rows.length){ tbody.innerHTML = emptyRow('该轮没有节点数据'); return; }
   sortRows(rows, histSortKey, histSortAsc);
-  tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
+  const render=()=>{tbody.innerHTML = rows.map((r,i)=>rowHtml(r, i, {
     readonly:true, currentNode:'', favs:{has(){return false}},
     expanded:false, selected: histSelNodeId?r.node_id===histSelNodeId:!r.node_id && r.name===histSelNode, intelColumns:false,
-  })).join('');
+  })).join('');};
+  if(typeof SBView!=='undefined') SBView.retainTable(tbody,render);else render();
 }
 
 function setHistSort(k){
@@ -750,17 +766,18 @@ function renderSubsTable(){
     tbody.innerHTML = emptyRow('暂无订阅数据 · 先在「节点」页跑一轮测速');
     return;
   }
-  tbody.innerHTML = subsData.map(s=>
-    `<tr data-provider="${esc(s.selection_key||s.provider)}"${(s.selection_key||s.provider)===subsSel?' class="sel"':''}>` +
-    `<td>${esc(s.provider)}</td>` +
+  tbody.innerHTML = subsData.map(s=>{
+    const key=s.selection_key||s.provider, sel=key===subsSel;
+    return `<tr data-provider="${esc(key)}"${sel?' class="sel"':''}>` +
+    `<td><button type="button" class="subs-pick" data-provider="${esc(key)}" aria-pressed="${sel}">${esc(s.provider)}</button></td>` +
     `<td class="mono">${s.run_count}</td>` +
     `<td class="mono">${s.node_count}</td>` +
     `<td class="mono">${s.online_ratio==null?'N/A':(s.online_ratio*100).toFixed(0)+'%'}${s.bandwidth_coverage==null?'':`<small class="node-source">带宽覆盖 ${(s.bandwidth_coverage*100).toFixed(0)}% · 成功率 ${s.bandwidth_success_ratio==null?'N/A':(s.bandwidth_success_ratio*100).toFixed(0)+'%'}</small>`}</td>` +
     `<td class="mono">${s.median_mbps!=null?s.median_mbps.toFixed(1):'-'}</td>` +
     `<td class="mono">${s.latency_ms!=null?s.latency_ms.toFixed(0):'-'}</td>` +
     `<td class="mono">${s.avg_score!=null?s.avg_score.toFixed(1):'-'}</td>` +
-    `<td class="mono">${esc((s.last_ts||'').slice(0,16))}</td></tr>`
-  ).join('');
+    `<td class="mono">${esc((s.last_ts||'').slice(0,16))}</td></tr>`;
+  }).join('');
 }
 
 async function selectSub(name){
@@ -1181,6 +1198,7 @@ function collectWebRTCCandidates(){
 
 async function runLeakAudit(){
   const run = document.getElementById('btn-leak-run');
+  const restoreFocus = document.activeElement===run;
   if(run){ run.disabled = true; run.textContent = '检测中…'; }
   setLeakStatus({status:'unknown', status_text:'正在采集 WebRTC candidate…'});
   try{
@@ -1203,6 +1221,7 @@ async function runLeakAudit(){
     setLeakStatus(evaluation); renderLeakDetails(evaluation);
   }finally{
     if(run){ run.disabled = false; run.textContent = '开始 WebRTC 检测'; }
+    if(restoreFocus && document.activeElement===document.body && run?.focus) run.focus({preventScroll:true});
   }
 }
 
@@ -1295,7 +1314,14 @@ function route(){
     if(el) el.style.display = x===v ? '' : 'none';
   }
   const navs = document.querySelectorAll('.nav-item');
-  for(const a of navs){ if(a.classList) a.classList.toggle('on', a.dataset && a.dataset.view===v); }
+  for(const a of navs){
+    const on = !!(a.dataset && a.dataset.view===v);
+    if(a.classList) a.classList.toggle('on', on);
+    if(typeof a.setAttribute==='function'){
+      if(on) a.setAttribute('aria-current','page');
+      else if(typeof a.removeAttribute==='function') a.removeAttribute('aria-current');
+    }
+  }
   if(v==='history'){
     if(!histLoaded) loadHistory(); else drawChart();   // 切回时 canvas 已有宽度，重画
   }
@@ -1352,9 +1378,11 @@ function init(){
       histSelRun = +it.dataset.i;
       const rec = histData[histSelRun];
       const ch = rec ? championOf(rec) : null;
-      histSelNode = ch ? ch.name : (((rec&&rec.results)||[])[0]||{}).name || null;
-      histSelNodeId=ch?ch.node_id||'':'';
+      const selected=ch || ((rec&&rec.results)||[])[0];
+      histSelNode = selected?selected.name:null;
+      histSelNodeId=selected?selected.node_id||'':'';
       renderHistList(); renderHistTable();
+      restoreListFocus('hist-list','.hist-item','i',histSelRun);
       if(histSelNode) fetchNodeTrend(histSelNode); else drawChart();
     }
   });
@@ -1370,11 +1398,13 @@ function init(){
     b.addEventListener('click', ()=>setProfile(b.dataset.p));
   }
   // 地区榜：标题点击折叠/展开（默认折叠），条目点击看该节点趋势
-  document.getElementById('board-toggle').addEventListener('click', ()=>{
+  document.getElementById('board-toggle').addEventListener('click', e=>{
     const body = document.getElementById('board-body');
     const open = body.style.display==='none';
     body.style.display = open?'':'none';
     document.getElementById('board-arrow').textContent = open?'▾':'▸';
+    if(e && e.currentTarget && typeof e.currentTarget.setAttribute==='function')
+      e.currentTarget.setAttribute('aria-expanded',String(open));
   });
   document.getElementById('board-body').addEventListener('click', e=>{
     const it = e.target.closest('.board-item');
@@ -1404,7 +1434,10 @@ function init(){
   });
   document.getElementById('subs-tbody').addEventListener('click', e=>{
     const tr = e.target.closest('tr[data-provider]');
-    if(tr && tr.dataset.provider!=null) selectSub(tr.dataset.provider);
+    if(tr && tr.dataset.provider!=null){
+      selectSub(tr.dataset.provider);
+      restoreListFocus('subs-tbody','.subs-pick','provider',tr.dataset.provider);
+    }
   });
   document.getElementById('subs-nodes-tbody').addEventListener('click', e=>{
     const cell = e.target.closest('td.stars');
@@ -1848,7 +1881,10 @@ function initTaskControls(){
   document.getElementById('tbody').addEventListener('keydown',e=>{
     if(e.target.tagName==='TR' && (e.key==='Enter'||e.key===' ')){e.preventDefault();e.target.click();}
   });
-  for(const id of ['hist-tbody','subs-nodes-tbody','task-detail']){
+  document.getElementById('hist-tbody').addEventListener('keydown',e=>{
+    if(e.target.tagName==='TR' && (e.key==='Enter'||e.key===' ')){e.preventDefault();e.target.click();}
+  });
+  for(const id of ['subs-nodes-tbody','task-detail']){
     document.getElementById(id).addEventListener('keydown',e=>{
       if(e.target.tagName==='TR' && (e.key==='Enter'||e.key===' ')){
         e.preventDefault();gotoTrend(e.target.dataset.name,e.target.dataset.nodeId||'');

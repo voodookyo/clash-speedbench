@@ -303,6 +303,25 @@ class IpHistoryDbTest(unittest.TestCase):
         self.assertFalse(changes[0]["intel_available"])
         self.assertIsNone(changes[0]["ip_quality_score"])
 
+    def test_one_intel_in_multi_node_run_is_not_borrowed_by_node_without_exit(self):
+        self.write([record('2026-08-29T00:04:10',[
+            result('measured',intel={'ip':'203.0.113.10','ip_grade':'S','ip_quality_score':90}),
+            {'name':'failed','node_id':'node_v2_'+'a'*32,'identity_version':2,'identity_strength':'strong','status':'timeout'},
+        ])])
+        db.import_jsonl(self.db_path,self.jsonl)
+        timeline=db.ip_reputation_changes(self.db_path,'',node_id='node_v2_'+'a'*32)
+        self.assertEqual(len(timeline),1)
+        self.assertFalse(timeline[0]['intel_available'])
+        self.assertIsNone(timeline[0]['exit_ip']);self.assertIsNone(timeline[0]['ip_grade'])
+
+    def test_single_node_legacy_intel_only_fallback_remains_readable(self):
+        self.write([record('2026-08-29T00:04:20',[{'name':'partial','intel_v4':{
+            'ip':'203.0.113.30','ip_grade':'A','ip_quality_score':80}}])])
+        db.import_jsonl(self.db_path,self.jsonl)
+        timeline=db.ip_reputation_changes(self.db_path,'partial')
+        self.assertTrue(timeline[0]['intel_available'])
+        self.assertEqual(timeline[0]['exit_ip'],'203.0.113.30')
+
     def test_malicious_json_values_are_parameters_not_sql(self):
         marker = "x'); DROP TABLE runs;--"
         self.write([record("2026-08-29T00:05:00", [

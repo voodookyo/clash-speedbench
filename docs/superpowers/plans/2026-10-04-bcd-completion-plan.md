@@ -48,6 +48,7 @@
 - [x] B/C 结果指标元数据：normal-code --write 从 clean a164efa 隔离产出，Codex 审阅修正并手动整合；真实观测时间、独立 probe/bandwidth/intel 与地址族状态、有效指标数、partial/final 合并及旧历史未知展示。两版最终全量各 1185 项通过（Python3.14 skipped=6、Python3.12 skipped=10），共享合成浏览器详情通过，见 result-metadata 报告；真实网络／原生／其他平台不在该证据范围。
 - [x] C 手动切换使用认证后端新鲜预览，确认目标／订阅／实际 Selector／当前选择后再次核验，过期映射拒绝。normal-code --write 从 clean a164efa 隔离完成，Codex 审阅补足 root/id/长名/焦点并手动整合；Python3.12 的 66 项专项、Python3.14 源仓库 53 项及实际合成浏览器键盘／确认／取消／切换操作通过，见 switch-confirmation 报告。真实控制器及原生 WebView 仍待验。
 - [ ] C 实现与全部验收。
+- [x] C 共享界面键盘／focus／aria 与历史身份回归、合成历史/错误/partial/泄漏场景：两个 normal-code --write 从 clean 3ec1f11 隔离启动，均因超时／403 未完成，由 Codex 在已结束隔离区补足并审阅整合。两版各 110 项专项通过，七页实际合成浏览器、390px 深色／常规浅色、取消及刷新后任务中心回放通过；修复信誉跨节点借用。订阅实时/历史区分、轮次元数据、直接错误引导和原生门槛仍待补，见 shared-ui-navigation 报告。
 - [ ] D 实现与全部验收。
 - [ ] 最终逐规格完成审计。
 

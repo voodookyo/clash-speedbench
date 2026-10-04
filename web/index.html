@@ -85,18 +85,18 @@
           <input type="text" id="f-search" aria-label="搜索测速结果" placeholder="🔍 搜索节点名…">
         </div>
         <div id="board" style="display:none">
-          <div id="board-toggle"><span id="board-arrow">▸</span> 地区榜 · 各地区在当前 Profile 下的 Top 3（点击看趋势）</div>
+          <button type="button" id="board-toggle" aria-expanded="false" aria-controls="board-body"><span id="board-arrow" aria-hidden="true">▸</span> 地区榜 · 各地区在当前 Profile 下的 Top 3（点击看趋势）</button>
           <div id="board-body" style="display:none"></div>
         </div>
         <div class="table-wrap">
           <table>
             <thead><tr>
               <th>#</th>
-              <th class="sort" data-k="name">节点 <span class="arr"></span></th>
-              <th class="sort" data-k="provider" id="th-provider" style="display:none">订阅 <span class="arr"></span></th>
-              <th class="sort" data-k="latency_ms">延迟 <span class="arr"></span></th>
-              <th class="sort" data-k="median_mbps">带宽 <span class="arr"></span></th>
-              <th class="sort" data-k="network_score">Network <span class="arr">▼</span></th>
+              <th class="sort" data-k="name" aria-sort="none"><button type="button" class="th-sort">节点 <span class="arr"></span></button></th>
+              <th class="sort" data-k="provider" id="th-provider" style="display:none" aria-sort="none"><button type="button" class="th-sort">订阅 <span class="arr"></span></button></th>
+              <th class="sort" data-k="latency_ms" aria-sort="none"><button type="button" class="th-sort">延迟 <span class="arr"></span></button></th>
+              <th class="sort" data-k="median_mbps" aria-sort="none"><button type="button" class="th-sort">带宽 <span class="arr"></span></button></th>
+              <th class="sort" data-k="network_score" aria-sort="none"><button type="button" class="th-sort">Network <span class="arr">▼</span></button></th>
               <th>IP Grade</th><th>IP 类型</th><th>风险</th>
               <th>标签</th><th></th>
             </tr></thead>
@@ -126,10 +126,10 @@
               <table>
                 <thead><tr>
                   <th>#</th>
-                  <th class="hsort" data-k="name">节点 <span class="arr"></span></th>
-                  <th class="hsort" data-k="latency_ms">延迟 <span class="arr"></span></th>
-                  <th class="hsort" data-k="median_mbps">带宽 <span class="arr"></span></th>
-                  <th class="hsort" data-k="score">评分 <span class="arr">▼</span></th>
+                  <th class="hsort" data-k="name" aria-sort="none"><button type="button" class="th-sort">节点 <span class="arr"></span></button></th>
+                  <th class="hsort" data-k="latency_ms" aria-sort="none"><button type="button" class="th-sort">延迟 <span class="arr"></span></button></th>
+                  <th class="hsort" data-k="median_mbps" aria-sort="none"><button type="button" class="th-sort">带宽 <span class="arr"></span></button></th>
+                  <th class="hsort" data-k="score" aria-sort="none"><button type="button" class="th-sort">评分 <span class="arr">▼</span></button></th>
                   <th>IP画像</th>
                   <th>标签</th><th></th>
                 </tr></thead>
@@ -152,6 +152,7 @@
       <div class="card">
         <div class="toolbar">
           <div class="card-title" style="margin:0;flex:1">订阅汇总（点行看趋势）</div>
+          <label class="muted" for="subs-days">统计范围</label>
           <select id="subs-days">
             <option value="7">近 7 天</option>
             <option value="30" selected>近 30 天</option>

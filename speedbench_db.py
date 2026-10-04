@@ -1118,7 +1118,7 @@ def ip_reputation_changes(db_path, name: str, node_key: str = "", node_id: str =
         else:
             where, params = "n.name = ?", (name,)
         rows = conn.execute(
-            "SELECT r.id AS run_id, r.ts, n.id AS node_result_id, n.name, "
+            "SELECT r.id AS run_id, r.node_count AS run_node_count, r.ts, n.id AS node_result_id, n.name, "
             "n.node_key, n.exit_ipv4, n.exit_ipv6, "
             "p.exit_ip, p.country, p.country_code, p.isp, p.org, p.asn, "
             "p.asname, p.kind, p.proxy, p.hosting, p.mobile "
@@ -1150,6 +1150,7 @@ def ip_reputation_changes(db_path, name: str, node_key: str = "", node_id: str =
     for row in rows:
         d = dict(row)
         run_id = d.pop("run_id")
+        run_node_count = d.pop("run_node_count")
         d.pop("node_result_id", None)
         # New family columns are preferred, but old ip_profiles remains the
         # canonical fallback.  The list allows both IPv4 and IPv6 intel rows
@@ -1161,10 +1162,10 @@ def ip_reputation_changes(db_path, name: str, node_key: str = "", node_id: str =
                 ips.append(value)
         matches = [intel_by_run_ip[(run_id, ip)] for ip in ips
                    if (run_id, ip) in intel_by_run_ip]
-        if not matches and not ips:
+        if not matches and not ips and run_node_count == 1:
             # A malformed/partial new row may have only an intelligence IP;
-            # attach it only when this run has a single intel row, avoiding
-            # cross-node duplication in a multi-node run.
+            # attach it only when the entire run has one node and one intel
+            # row. One intel row alone does not identify a failed sibling.
             candidates = [row for (rid, _), row in intel_by_run_ip.items()
                           if rid == run_id]
             if len(candidates) == 1:
