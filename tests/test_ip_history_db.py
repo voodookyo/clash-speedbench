@@ -206,6 +206,57 @@ class IpHistoryDbTest(unittest.TestCase):
         # Reopening must not produce duplicate columns or fail on the new tables.
         self.assertEqual(db.import_jsonl(self.db_path, self.jsonl), 0)
 
+    def test_migration_backfills_node_result_id_only_for_unique_names(self):
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.executescript("""
+                CREATE TABLE runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL UNIQUE, mb REAL, rounds INTEGER,
+                    node_count INTEGER NOT NULL DEFAULT 0, raw TEXT NOT NULL);
+                CREATE TABLE node_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL, name TEXT NOT NULL,
+                    proto TEXT, provider TEXT, latency_ms REAL,
+                    jitter_ms REAL, connect_ms REAL, median_mbps REAL,
+                    best_mbps REAL, multi_mbps REAL, sample_mb REAL,
+                    score REAL, stars TEXT, status TEXT, tags TEXT);
+                CREATE TABLE ip_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL, name TEXT NOT NULL,
+                    exit_ip TEXT, country TEXT, country_code TEXT,
+                    isp TEXT, org TEXT, asn TEXT, asname TEXT, kind TEXT,
+                    ok INTEGER, proxy INTEGER, hosting INTEGER, mobile INTEGER);
+            """)
+            conn.execute(
+                "INSERT INTO runs(ts, raw, node_count) VALUES (?,?,?)",
+                ("2026-08-20T00:00:00", "{}", 4))
+            run_id = conn.execute("SELECT id FROM runs").fetchone()[0]
+            for name in ("solo", "dup", "dup"):
+                conn.execute(
+                    "INSERT INTO node_results(run_id,name,status) VALUES (?,?,?)",
+                    (run_id, name, "ok"))
+            for name in ("solo", "dup", "missing"):
+                conn.execute(
+                    "INSERT INTO ip_profiles(run_id,name) VALUES (?,?)",
+                    (run_id, name))
+            conn.commit()
+        finally:
+            conn.close()
+        self.write([])
+        self.assertEqual(db.import_jsonl(self.db_path, self.jsonl), 0)
+        solo_id = self.query(
+            "SELECT id FROM node_results WHERE name='solo'")[0][0]
+        # Unique match links; ambiguous and absent names stay NULL.
+        self.assertEqual(self.query(
+            "SELECT name, node_result_id FROM ip_profiles ORDER BY name"),
+            [("dup", None), ("missing", None), ("solo", solo_id)])
+        # Reopening preserves the existing link without changing it.
+        self.assertEqual(db.import_jsonl(self.db_path, self.jsonl), 0)
+        self.assertEqual(self.query(
+            "SELECT node_result_id FROM ip_profiles WHERE name='solo'"),
+            [(solo_id,)])
+
     def test_reputation_change_marks_same_ip_residential_proxy_and_score_drop(self):
         first = {
             "ip": "203.0.113.50", "ip_version": 4,

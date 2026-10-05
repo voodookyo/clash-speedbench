@@ -232,10 +232,13 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ctype}")
                     if table=='ip_profiles' and col=='node_result_id':
                         # A reused name is not sufficient identity evidence.
+                        # CASE WHEN instead of HAVING: older SQLite rejects
+                        # HAVING without GROUP BY; COUNT(*)=1 keeps the
+                        # unique-match-only semantics (ambiguous/zero → NULL).
                         conn.execute('''UPDATE ip_profiles SET node_result_id=(
-                            SELECT MIN(n.id) FROM node_results n
-                            WHERE n.run_id=ip_profiles.run_id AND n.name=ip_profiles.name
-                            HAVING COUNT(*)=1)''')
+                            SELECT CASE WHEN COUNT(*)=1 THEN MIN(n.id) ELSE NULL END
+                            FROM node_results n
+                            WHERE n.run_id=ip_profiles.run_id AND n.name=ip_profiles.name)''')
 
 
 def _run_time(value):
