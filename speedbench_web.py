@@ -17,13 +17,14 @@ import os
 import re
 import secrets
 import signal
+import socketserver
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
 import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -50,6 +51,16 @@ from speedbench_preferences import Preferences, PreferenceError
 from speedbench_transfer import HistoryTransfer, TransferError, PENDING as IMPORT_PENDING
 import speedbench_releases
 from speedbench_config import ENV as ROOT_ENV, RootChoice, validate_root, ConfigRootError
+
+
+class ThreadingHTTPServer(_ThreadingHTTPServer):
+    """Numeric loopback binding needs no reverse DNS to start the panel."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
+
 
 SCRIPT = HERE / "clash_speedbench.py"
 # 数据目录：默认脚本同级；打包成 .app 时由启动器用 SPEEDBENCH_HOME 指到

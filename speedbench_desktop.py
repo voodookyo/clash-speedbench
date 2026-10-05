@@ -11,7 +11,6 @@ import threading
 import time
 import secrets
 from collections import deque
-from http.server import ThreadingHTTPServer
 
 from speedbench_owner import BackendLease, LeaseError
 import speedbench_power as power
@@ -175,7 +174,9 @@ def main():
                 stage='history_recovery'
                 web.recover_history_import()
                 stage='loopback_bind'
-                server=ThreadingHTTPServer(('127.0.0.1',0),web.Handler)
+                # web.ThreadingHTTPServer binds the numeric loopback without
+                # socket.getfqdn(); a stalled resolver cannot hang startup.
+                server=web.ThreadingHTTPServer(('127.0.0.1',0),web.Handler)
                 server.daemon_threads=True
                 web.DESKTOP_IDENTITY=public_identity(lease.instance_id)
                 try:preferences=web.Preferences(web.DATA_HOME).read()

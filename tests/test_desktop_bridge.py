@@ -77,7 +77,7 @@ class DesktopBridgeTest(unittest.TestCase):
             # No inherited third-party credentials belong in a CI fixture.
             for key in list(env):
                 if key.startswith('SPEEDBENCH_IP') or key.startswith('SPEEDBENCH_SCAMALYTICS'):env.pop(key)
-            proc=subprocess.Popen([sys.executable,'-u','-c',"import faulthandler,runpy; faulthandler.dump_traceback_later(4); runpy.run_path('speedbench_desktop.py',run_name='__main__')"],stdin=subprocess.PIPE,
+            proc=subprocess.Popen([sys.executable,'-u','speedbench_desktop.py'],stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,text=True,encoding='utf-8')
             try:
                 proc.stdin.write(json.dumps({'protocol':1,'parent_pid':os.getpid(),'nonce':'b'*64})+'\n');proc.stdin.flush()
@@ -110,18 +110,41 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertNotIn(frame['nonce'],out+err)
                 self.assertFalse((Path(folder)/'speedbench-history.jsonl').exists())
             finally:
+                diagnostic=None
                 if proc.poll() is None:
                     proc.kill();_,diagnostic=proc.communicate(timeout=5)
-                    raise AssertionError('Owned backend failed before readiness: '+diagnostic)
                 for stream in (proc.stdin,proc.stdout,proc.stderr):
                     if stream:stream.close()
+                if diagnostic is not None:
+                    raise AssertionError('Owned backend failed before readiness: '+diagnostic)
+
+    def test_loopback_bind_never_reverse_dns_resolves_server_name(self):
+        # Regression: stdlib HTTPServer.server_bind derives server_name via
+        # socket.getfqdn(); a stalled resolver hung the native backend and
+        # every UI fixture at startup. With DNS unusable the stdlib server
+        # fails to bind, while the panel server binds the numeric loopback
+        # and real HTTP keeps working (auth is covered by the HTTP suite).
+        import http.server
+        with mock.patch('socket.getfqdn',side_effect=OSError('fixture resolver stalled')):
+            with self.assertRaises(OSError):
+                http.server.ThreadingHTTPServer(('127.0.0.1',0),web.Handler)
+            server=web.ThreadingHTTPServer(('127.0.0.1',0),web.Handler)
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.server_name,'127.0.0.1')
+        self.assertGreater(server.server_port,0)
+        thread=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.05},daemon=True)
+        thread.start();self.addCleanup(thread.join,2);self.addCleanup(server.shutdown)
+        conn=http.client.HTTPConnection('127.0.0.1',server.server_port,timeout=5)
+        self.addCleanup(conn.close)
+        conn.request('GET','/')
+        response=conn.getresponse();self.assertEqual(response.status,200);response.read()
 
     def test_bootstrap_and_exit_in_one_pipe_write_do_not_lose_the_control_frame(self):
         with tempfile.TemporaryDirectory() as folder:
             env=dict(os.environ,SPEEDBENCH_HOME=folder)
             for key in list(env):
                 if key.startswith(('SPEEDBENCH_IP','SPEEDBENCH_SCAMALYTICS')):env.pop(key)
-            proc=subprocess.Popen([sys.executable,'-u','-c',"import faulthandler,runpy; faulthandler.dump_traceback_later(4); runpy.run_path('speedbench_desktop.py',run_name='__main__')"],stdin=subprocess.PIPE,
+            proc=subprocess.Popen([sys.executable,'-u','speedbench_desktop.py'],stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
             try:
                 bootstrap=json.dumps({'protocol':1,'parent_pid':os.getpid(),'nonce':'e'*64}).encode()+b'\n'
@@ -131,10 +154,13 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertEqual(json.loads(proc.stdout.read())['protocol'],1)
                 self.assertNotIn(b'Fatal Python error',proc.stderr.read())
             finally:
+                diagnostic=None
                 if proc.poll() is None:
                     proc.kill();proc.wait(timeout=5)
-                    raise AssertionError('Owned backend failed to exit: '+proc.stderr.read().decode('utf-8','replace'))
+                    diagnostic=proc.stderr.read().decode('utf-8','replace')
                 for stream in (proc.stdin,proc.stdout,proc.stderr):stream.close()
+                if diagnostic is not None:
+                    raise AssertionError('Owned backend failed to exit: '+diagnostic)
 
     def test_authenticated_http_quit_with_parent_stdin_open_exits_cleanly(self):
         # Regression: a daemon control thread blocked in BufferedReader.readline
@@ -145,7 +171,7 @@ class DesktopBridgeTest(unittest.TestCase):
             env=dict(os.environ,SPEEDBENCH_HOME=folder)
             for key in list(env):
                 if key.startswith('SPEEDBENCH_IP') or key.startswith('SPEEDBENCH_SCAMALYTICS'):env.pop(key)
-            proc=subprocess.Popen([sys.executable,'-u','-c',"import faulthandler,runpy; faulthandler.dump_traceback_later(4); runpy.run_path('speedbench_desktop.py',run_name='__main__')"],stdin=subprocess.PIPE,
+            proc=subprocess.Popen([sys.executable,'-u','speedbench_desktop.py'],stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,text=True,encoding='utf-8')
             frame=None
             try:
@@ -166,9 +192,10 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertIsNotNone(proc.poll(),'backend did not exit after authenticated quit')
                 out,err=proc.stdout.read(),proc.stderr.read()
             finally:
+                diagnostic=None
                 if proc.poll() is None:
                     proc.kill();proc.wait(timeout=5)
-                    raise AssertionError('Owned backend failed before readiness/quit: '+proc.stderr.read())
+                    diagnostic=proc.stderr.read()
                 if proc.stdin is not None:
                     try:proc.stdin.close()
                     except OSError:pass
@@ -210,7 +237,7 @@ class DesktopBridgeTest(unittest.TestCase):
                 before=(home/'speedbench-history.jsonl').read_bytes()
                 env=dict(os.environ,SPEEDBENCH_HOME=str(home))
                 frame=json.dumps({'protocol':1,'parent_pid':os.getpid(),'nonce':'b'*64})+'\n'
-                result=subprocess.run([sys.executable,'-u','-c',"import faulthandler,runpy; faulthandler.dump_traceback_later(4); runpy.run_path('speedbench_desktop.py',run_name='__main__')"],input=frame,
+                result=subprocess.run([sys.executable,'-u','speedbench_desktop.py'],input=frame,
                     capture_output=True,env=env,text=True,encoding='utf-8',timeout=10)
                 self.assertEqual(result.returncode,2 if changed else 0,result.stderr)
                 if changed:
@@ -317,7 +344,7 @@ class DesktopExitCodeTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as folder,contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.object(
                     desktop,'BackendLease',lease_factory or (lambda home:_FakeLease())))
-                stack.enter_context(mock.patch.object(desktop,'ThreadingHTTPServer',server_factory or _FakeBackendServer))
+                stack.enter_context(mock.patch.object(web,'ThreadingHTTPServer',server_factory or _FakeBackendServer))
                 stack.enter_context(mock.patch.object(desktop,'time',clock))
                 # A deterministic native clock keeps lifecycle tests portable.
                 stack.enter_context(mock.patch.object(
