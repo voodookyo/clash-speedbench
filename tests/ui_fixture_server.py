@@ -4,6 +4,7 @@ Run explicitly (not unittest discovery): python -m tests.ui_fixture_server
 All synthetic rows are labelled fixture. This is never a production fallback.
 """
 import argparse
+import faulthandler
 import copy
 import json
 from contextlib import ExitStack
@@ -83,6 +84,7 @@ document.getElementById('leak-environment').textContent='fixture 合成传输：
 
 
 def main():
+    faulthandler.dump_traceback_later(4)
     if hasattr(sys.stdout,'reconfigure'):sys.stdout.reconfigure(encoding='utf-8')
     parser=argparse.ArgumentParser()
     parser.add_argument('--port',type=int,default=8964)
@@ -225,6 +227,7 @@ def main():
                                       'application/javascript; charset=utf-8')
                 return super().do_GET()
         server=FixtureServer(('127.0.0.1',args.port),FixtureHandler)
+        faulthandler.cancel_dump_traceback_later()
         print('Isolated UI fixture http://127.0.0.1:'+str(server.server_port),flush=True)
         try: server.serve_forever()
         except KeyboardInterrupt: pass

@@ -159,25 +159,32 @@ def main():
     except power.PowerClockError:
         print(POWER_CLOCK_STARTUP_ERROR,file=sys.stderr)
         return 2
+    stage='bootstrap'
     try:
         control=control_reader()
         frame=control.readline(4097)
         if not frame.endswith(b'\n') or len(frame)>4096:raise DesktopError('Bootstrap frame too large')
         bootstrap=validate_bootstrap(json.loads(frame))
+        stage='imports'
         import speedbench_web as web
         monitor=web.PowerMonitor(clock)
+        stage='lease'
         with BackendLease(web.DATA_HOME) as lease:
             web.DATA_OWNER=lease
             try:
+                stage='history_recovery'
                 web.recover_history_import()
+                stage='loopback_bind'
                 server=ThreadingHTTPServer(('127.0.0.1',0),web.Handler)
                 server.daemon_threads=True
                 web.DESKTOP_IDENTITY=public_identity(lease.instance_id)
                 try:preferences=web.Preferences(web.DATA_HOME).read()
                 except web.PreferenceError:preferences={}
                 web.DESKTOP_ACTIONS=DesktopActions(preferences.get('sb_notifications')=='on')
+                stage='database'
                 web.sync_db();web.speedbench_db.interrupt_tasks(web.db_path())
                 web.DESKTOP_POWER=monitor
+                stage='power_monitor'
                 monitor.start()
                 response={**web.DESKTOP_IDENTITY,'port':server.server_port,
                           'nonce':bootstrap['nonce'],'token':web.WEB_TOKEN}
@@ -235,7 +242,7 @@ def main():
                 if server is not None:server.server_close()
     except Exception:
         # Never dump arbitrary input, nonce, env, credentials or exception URL.
-        print('Desktop backend startup or ownership failed',file=sys.stderr)
+        print('Desktop backend startup or ownership failed: '+stage,file=sys.stderr)
         return 2
     finally:
         if web is not None:web.DATA_OWNER=None

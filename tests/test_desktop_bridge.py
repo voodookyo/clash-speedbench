@@ -61,7 +61,7 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertIsNone(desktop.read_control(reader))
 
     def test_unbuffered_reader_bounds_malformed_and_oversized_frames(self):
-        for raw in (b'{"command":"exit"}',b'x'*4096+b'\n'):
+        for raw in (b'{"command":"exit"}',b'x'*258+b'\n'):
             with self.subTest(size=len(raw)):
                 read_fd,write_fd=os.pipe()
                 try:
@@ -77,7 +77,7 @@ class DesktopBridgeTest(unittest.TestCase):
             # No inherited third-party credentials belong in a CI fixture.
             for key in list(env):
                 if key.startswith('SPEEDBENCH_IP') or key.startswith('SPEEDBENCH_SCAMALYTICS'):env.pop(key)
-            proc=subprocess.Popen([sys.executable,'-u','speedbench_desktop.py'],stdin=subprocess.PIPE,
+            proc=subprocess.Popen([sys.executable,'-u','-c',"import faulthandler,runpy; faulthandler.dump_traceback_later(4); runpy.run_path('speedbench_desktop.py',run_name='__main__')"],stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,text=True,encoding='utf-8')
             try:
                 proc.stdin.write(json.dumps({'protocol':1,'parent_pid':os.getpid(),'nonce':'b'*64})+'\n');proc.stdin.flush()
@@ -110,7 +110,9 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertNotIn(frame['nonce'],out+err)
                 self.assertFalse((Path(folder)/'speedbench-history.jsonl').exists())
             finally:
-                if proc.poll() is None:proc.kill();proc.communicate(timeout=5)
+                if proc.poll() is None:
+                    proc.kill();_,diagnostic=proc.communicate(timeout=5)
+                    raise AssertionError('Owned backend failed before readiness: '+diagnostic)
                 for stream in (proc.stdin,proc.stdout,proc.stderr):
                     if stream:stream.close()
 
@@ -119,7 +121,7 @@ class DesktopBridgeTest(unittest.TestCase):
             env=dict(os.environ,SPEEDBENCH_HOME=folder)
             for key in list(env):
                 if key.startswith(('SPEEDBENCH_IP','SPEEDBENCH_SCAMALYTICS')):env.pop(key)
-            proc=subprocess.Popen([sys.executable,'-u','speedbench_desktop.py'],stdin=subprocess.PIPE,
+            proc=subprocess.Popen([sys.executable,'-u','-c',"import faulthandler,runpy; faulthandler.dump_traceback_later(4); runpy.run_path('speedbench_desktop.py',run_name='__main__')"],stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
             try:
                 bootstrap=json.dumps({'protocol':1,'parent_pid':os.getpid(),'nonce':'e'*64}).encode()+b'\n'
@@ -129,7 +131,9 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertEqual(json.loads(proc.stdout.read())['protocol'],1)
                 self.assertNotIn(b'Fatal Python error',proc.stderr.read())
             finally:
-                if proc.poll() is None:proc.kill();proc.wait(timeout=5)
+                if proc.poll() is None:
+                    proc.kill();proc.wait(timeout=5)
+                    raise AssertionError('Owned backend failed to exit: '+proc.stderr.read().decode('utf-8','replace'))
                 for stream in (proc.stdin,proc.stdout,proc.stderr):stream.close()
 
     def test_authenticated_http_quit_with_parent_stdin_open_exits_cleanly(self):
@@ -141,7 +145,7 @@ class DesktopBridgeTest(unittest.TestCase):
             env=dict(os.environ,SPEEDBENCH_HOME=folder)
             for key in list(env):
                 if key.startswith('SPEEDBENCH_IP') or key.startswith('SPEEDBENCH_SCAMALYTICS'):env.pop(key)
-            proc=subprocess.Popen([sys.executable,'-u','speedbench_desktop.py'],stdin=subprocess.PIPE,
+            proc=subprocess.Popen([sys.executable,'-u','-c',"import faulthandler,runpy; faulthandler.dump_traceback_later(4); runpy.run_path('speedbench_desktop.py',run_name='__main__')"],stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,text=True,encoding='utf-8')
             frame=None
             try:
@@ -162,7 +166,9 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertIsNotNone(proc.poll(),'backend did not exit after authenticated quit')
                 out,err=proc.stdout.read(),proc.stderr.read()
             finally:
-                if proc.poll() is None:proc.kill();proc.wait(timeout=5)
+                if proc.poll() is None:
+                    proc.kill();proc.wait(timeout=5)
+                    raise AssertionError('Owned backend failed before readiness/quit: '+proc.stderr.read())
                 if proc.stdin is not None:
                     try:proc.stdin.close()
                     except OSError:pass
@@ -204,7 +210,7 @@ class DesktopBridgeTest(unittest.TestCase):
                 before=(home/'speedbench-history.jsonl').read_bytes()
                 env=dict(os.environ,SPEEDBENCH_HOME=str(home))
                 frame=json.dumps({'protocol':1,'parent_pid':os.getpid(),'nonce':'b'*64})+'\n'
-                result=subprocess.run([sys.executable,'-u','speedbench_desktop.py'],input=frame,
+                result=subprocess.run([sys.executable,'-u','-c',"import faulthandler,runpy; faulthandler.dump_traceback_later(4); runpy.run_path('speedbench_desktop.py',run_name='__main__')"],input=frame,
                     capture_output=True,env=env,text=True,encoding='utf-8',timeout=10)
                 self.assertEqual(result.returncode,2 if changed else 0,result.stderr)
                 if changed:

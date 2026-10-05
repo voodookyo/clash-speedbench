@@ -43,7 +43,7 @@ def fixture(*args):
         try:proc.wait(timeout=6)
         except subprocess.TimeoutExpired:
             proc.kill();proc.wait(timeout=3)
-            raise AssertionError('Owned fixture failed to stop cleanly')
+            raise AssertionError('Owned fixture failed to stop cleanly: '+proc.stderr.read())
         finally:
             proc.stdout.close();proc.stderr.close();reader.join(timeout=1)
         if proc.returncode!=0:raise AssertionError('Fixture exit '+str(proc.returncode))

@@ -257,6 +257,8 @@ impl Backend {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(test)]
+        command.stderr(Stdio::inherit()); // Fixed startup stages only; never the private stdout frame.
         // -E protects this process; removing inherited Python overrides also
         // protects its worker descendants (without removing provider keys).
         for (key, _) in std::env::vars_os() {
