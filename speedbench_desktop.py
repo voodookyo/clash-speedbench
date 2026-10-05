@@ -82,6 +82,51 @@ def public_identity(instance_id):
     return dict(app_id=APP_ID,version=VERSION,protocol=PROTOCOL,instance_id=instance_id,pid=os.getpid())
 
 
+class UnbufferedControlReader:
+    """Bounded line reader over the inherited private control descriptor.
+
+    The daemon control thread waits on a private stdin pipe that the parent
+    normally keeps open for the whole session. A ``BufferedReader.readline``
+    blocked there still holds the buffered-reader lock, so when the backend
+    exits (for example on authenticated ``POST /api/quit``) interpreter
+    finalization aborts with ``Fatal Python error: _enter_buffered_busy``.
+    Reading the raw descriptor never takes that lock, so the parent staying
+    connected no longer prevents a clean finalization. Each call is bounded by
+    the readline limit and the pending buffer is bounded the same way.
+    """
+    def __init__(self,fd,read_size=4096):
+        self._fd=fd;self._read_size=read_size;self._pending=bytearray()
+
+    def readline(self,limit=-1):
+        limit=257 if (limit is None or limit<0) else limit
+        while True:
+            newline=self._pending.find(b'\n')
+            if 0<=newline<limit:end=newline+1
+            elif len(self._pending)>=limit:end=limit
+            else:end=None
+            if end is not None:
+                line=bytes(self._pending[:end]);del self._pending[:end];return line
+            try:
+                chunk=os.read(self._fd,self._read_size)
+            except InterruptedError:
+                continue
+            if not chunk:
+                line=bytes(self._pending);self._pending.clear();return line
+            self._pending.extend(chunk)
+
+
+def control_reader():
+    """Unbuffered reader for the current private stdin descriptor."""
+    stream=sys.stdin
+    if sys.platform=='win32':
+        # An inherited Windows std handle may still translate CRLF at the CRT
+        # layer; force binary so a bounded frame is never silently rewritten.
+        import msvcrt
+        try:msvcrt.setmode(stream.fileno(),os.O_BINARY)
+        except OSError:pass
+    return UnbufferedControlReader(stream.fileno())
+
+
 def read_control(stream):
     """Read one bounded private frame; a malformed transport fails closed."""
     raw=stream.readline(257)
@@ -115,7 +160,8 @@ def main():
         print(POWER_CLOCK_STARTUP_ERROR,file=sys.stderr)
         return 2
     try:
-        frame=sys.stdin.buffer.readline(4097)
+        control=control_reader()
+        frame=control.readline(4097)
         if not frame.endswith(b'\n') or len(frame)>4096:raise DesktopError('Bootstrap frame too large')
         bootstrap=validate_bootstrap(json.loads(frame))
         import speedbench_web as web
@@ -159,10 +205,12 @@ def main():
                     # an independent owned-process-tree timeout and final wait.
                     server.shutdown()
                 web.DESKTOP_SHUTDOWN=shutdown
+                # Reuse the bootstrap reader so any already-read control bytes
+                # remain owned by this same bounded, unbuffered transport.
                 def controls():
                     try:
                         while True:
-                            command=read_control(sys.stdin.buffer)
+                            command=read_control(control)
                             if command=='cancel':web.cancel_benchmark()
                             elif command is None or command=='exit':return
                             elif isinstance(command,dict):web.DESKTOP_ACTIONS.finish(command['request_id'],command['ok'])

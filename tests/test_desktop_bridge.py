@@ -3,6 +3,7 @@ import io
 import os
 import json
 import sys
+import time
 import tempfile
 import subprocess
 import http.client
@@ -44,6 +45,31 @@ class DesktopBridgeTest(unittest.TestCase):
             stream=io.BytesIO(raw)
             with self.assertRaises(desktop.DesktopError):desktop.read_control(stream)
             self.assertLessEqual(stream.tell(),257)
+
+    def test_unbuffered_reader_decodes_frames_and_parent_eof(self):
+        read_fd,write_fd=os.pipe()
+        self.addCleanup(os.close,read_fd)
+        reader=desktop.UnbufferedControlReader(read_fd)
+        acknowledged={'command':'action_result','request_id':'a'*32,'ok':True}
+        os.write(write_fd,b'{"command":"cancel"}\n{"command":"exit"}\n'
+                 +json.dumps(acknowledged).encode()+b'\nnot-json\n')
+        os.close(write_fd)
+        self.assertEqual(desktop.read_control(reader),'cancel')
+        self.assertEqual(desktop.read_control(reader),'exit')
+        self.assertEqual(desktop.read_control(reader),acknowledged)
+        self.assertEqual(desktop.read_control(reader),'ignore')
+        self.assertIsNone(desktop.read_control(reader))
+
+    def test_unbuffered_reader_bounds_malformed_and_oversized_frames(self):
+        for raw in (b'{"command":"exit"}',b'x'*4096+b'\n'):
+            with self.subTest(size=len(raw)):
+                read_fd,write_fd=os.pipe()
+                try:
+                    reader=desktop.UnbufferedControlReader(read_fd)
+                    os.write(write_fd,raw);os.close(write_fd)
+                    with self.assertRaises(desktop.DesktopError):desktop.read_control(reader)
+                finally:
+                    os.close(read_fd)
 
     def test_real_private_bootstrap_dynamic_port_guard_and_parent_eof(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -87,6 +113,67 @@ class DesktopBridgeTest(unittest.TestCase):
                 if proc.poll() is None:proc.kill();proc.communicate(timeout=5)
                 for stream in (proc.stdin,proc.stdout,proc.stderr):
                     if stream:stream.close()
+
+    def test_bootstrap_and_exit_in_one_pipe_write_do_not_lose_the_control_frame(self):
+        with tempfile.TemporaryDirectory() as folder:
+            env=dict(os.environ,SPEEDBENCH_HOME=folder)
+            for key in list(env):
+                if key.startswith(('SPEEDBENCH_IP','SPEEDBENCH_SCAMALYTICS')):env.pop(key)
+            proc=subprocess.Popen([sys.executable,'-u','speedbench_desktop.py'],stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+            try:
+                bootstrap=json.dumps({'protocol':1,'parent_pid':os.getpid(),'nonce':'e'*64}).encode()+b'\n'
+                proc.stdin.write(bootstrap+b'{"command":"exit"}\n');proc.stdin.flush()
+                # Keep stdin open: EOF must not disguise losing the queued exit.
+                self.assertEqual(proc.wait(timeout=5),0)
+                self.assertEqual(json.loads(proc.stdout.read())['protocol'],1)
+                self.assertNotIn(b'Fatal Python error',proc.stderr.read())
+            finally:
+                if proc.poll() is None:proc.kill();proc.wait(timeout=5)
+                for stream in (proc.stdin,proc.stdout,proc.stderr):stream.close()
+
+    def test_authenticated_http_quit_with_parent_stdin_open_exits_cleanly(self):
+        # Regression: a daemon control thread blocked in BufferedReader.readline
+        # on a still-open parent stdin held the buffered-reader lock and aborted
+        # finalization (Fatal Python error _enter_buffered_busy, exit -6) after
+        # an authenticated quit. Parent stdin stays open until the child exits.
+        with tempfile.TemporaryDirectory() as folder:
+            env=dict(os.environ,SPEEDBENCH_HOME=folder)
+            for key in list(env):
+                if key.startswith('SPEEDBENCH_IP') or key.startswith('SPEEDBENCH_SCAMALYTICS'):env.pop(key)
+            proc=subprocess.Popen([sys.executable,'-u','speedbench_desktop.py'],stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,text=True,encoding='utf-8')
+            frame=None
+            try:
+                proc.stdin.write(json.dumps({'protocol':1,'parent_pid':os.getpid(),'nonce':'d'*64})+'\n')
+                proc.stdin.flush()
+                received=queue.Queue(maxsize=1)
+                threading.Thread(target=lambda:received.put(proc.stdout.readline(4097)),daemon=True).start()
+                frame=json.loads(received.get(timeout=10))
+                conn=http.client.HTTPConnection('127.0.0.1',frame['port'],timeout=3)
+                self.addCleanup(conn.close)
+                conn.request('POST','/api/quit',json.dumps({}),headers={
+                    'X-SpeedBench-Token':frame['token'],'Host':f"127.0.0.1:{frame['port']}",
+                    'Origin':f"http://127.0.0.1:{frame['port']}",'Content-Length':'2'})
+                response=conn.getresponse();self.assertEqual(response.status,200);response.read()
+                # Parent stdin is deliberately not closed; poll the owned child.
+                deadline=time.time()+15
+                while time.time()<deadline and proc.poll() is None:time.sleep(.05)
+                self.assertIsNotNone(proc.poll(),'backend did not exit after authenticated quit')
+                out,err=proc.stdout.read(),proc.stderr.read()
+            finally:
+                if proc.poll() is None:proc.kill();proc.wait(timeout=5)
+                if proc.stdin is not None:
+                    try:proc.stdin.close()
+                    except OSError:pass
+                    proc.stdin=None
+                for stream in (proc.stdout,proc.stderr):
+                    if stream:stream.close()
+            self.assertEqual(proc.returncode,0,err)
+            self.assertNotIn('_enter_buffered_busy',err)
+            self.assertNotIn('Fatal Python error',err)
+            self.assertNotIn(frame['token'],out+err)
+            self.assertNotIn(frame['nonce'],out+err)
 
     def test_handshake_requires_parent_nonce_and_bounded_fields(self):
         data={'protocol':1,'nonce':'a'*64,'parent_pid':os.getppid()}
@@ -138,12 +225,21 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertNotIn('key',str(identity))
 
 
-class _FakeParentPipe:
-    """Private stdin transport: one bootstrap frame, then parent EOF."""
+class _FakeParentStdin:
+    """Real anonymous-pipe stdin: one buffered bootstrap frame, then EOF.
+
+    ``fileno`` exposes the descriptor to the bounded unbuffered reader used
+    for bootstrap and controls. Main exercises the production descriptor path
+    instead of a mocked readline.
+    """
     def __init__(self,frame):
-        self._lock=threading.Lock();self._frames=[frame]
-    def readline(self,limit=-1):
-        with self._lock:return self._frames.pop(0) if self._frames else b''
+        read_fd,write_fd=os.pipe()
+        self.buffer=os.fdopen(read_fd,'rb')
+        os.write(write_fd,frame);os.close(write_fd)
+    def fileno(self):return self.buffer.fileno()
+    def close(self):
+        try:self.buffer.close()
+        except OSError:pass
 
 
 class _FakeHandshakeStdout:
@@ -209,7 +305,8 @@ class DesktopExitCodeTest(unittest.TestCase):
             state_snapshot=dict(web.STATE)
             web.STATE.clear();web.STATE.update(state)
         saved_stdin,saved_stdout=sys.stdin,sys.stdout
-        sys.stdin=type('stdin',(),{'buffer':_FakeParentPipe(frame)})();sys.stdout=handshake
+        stdin=_FakeParentStdin(frame)
+        sys.stdin=stdin;sys.stdout=handshake
         try:
             with tempfile.TemporaryDirectory() as folder,contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.object(
@@ -236,6 +333,7 @@ class DesktopExitCodeTest(unittest.TestCase):
             return code,handshake.text,cancelled
         finally:
             sys.stdin,sys.stdout=saved_stdin,saved_stdout
+            stdin.close()
             with web.STATE_LOCK:
                 web.STATE.clear();web.STATE.update(state_snapshot)
             for name,value in snapshot.items():setattr(web,name,value)
