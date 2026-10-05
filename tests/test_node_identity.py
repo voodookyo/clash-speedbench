@@ -1,4 +1,5 @@
 import concurrent.futures
+import ctypes
 import os
 import tempfile
 import unittest
@@ -93,6 +94,43 @@ class IdentityTest(unittest.TestCase):
              mock.patch.object(identity, '_windows_private', verify):
             identity._secure_new_windows_file('C:\\tmp\\identity-seed', 'S-1-5-21-1')
         self.assertEqual(order, ['owner', 'dacl', 'verify'])
+
+    def test_windows_owner_alias_is_accepted_only_for_the_actual_current_user(self):
+        import speedbench_identity as identity
+        from ctypes import wintypes
+        current = 'S-1-5-21-100-200-300-500'
+        cases = (
+            (current, 'O:LAD:P(A;;FA;;;LA)', True),
+            (current, 'O:' + current + 'D:P(A;;FA;;;' + current + ')', True),
+            ('S-1-5-32-544', 'O:BAD:P(A;;FA;;;BA)', False),
+            (current, 'O:LAD:P(A;;FA;;;LA)(A;;FR;;;WD)', False),
+        )
+        for actual, sddl, safe in cases:
+            with self.subTest(safe=safe, owner_matches=actual == current):
+                owner_text = ctypes.create_unicode_buffer(actual)
+                descriptor_text = ctypes.create_unicode_buffer(sddl)
+                advapi, kernel = mock.Mock(), mock.Mock()
+                def get_info(path, kind, flags, owner, group, dacl, sacl, descriptor):
+                    ctypes.cast(owner, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(1)
+                    ctypes.cast(descriptor, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(2)
+                    return 0
+                def convert_owner(owner, output):
+                    ctypes.cast(output, ctypes.POINTER(wintypes.LPWSTR))[0] = ctypes.cast(owner_text, wintypes.LPWSTR)
+                    return True
+                def convert_descriptor(descriptor, revision, flags, output, size):
+                    ctypes.cast(output, ctypes.POINTER(wintypes.LPWSTR))[0] = ctypes.cast(descriptor_text, wintypes.LPWSTR)
+                    return True
+                advapi.GetNamedSecurityInfoW.side_effect = get_info
+                advapi.ConvertSidToStringSidW.side_effect = convert_owner
+                advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW.side_effect = convert_descriptor
+                libraries = {'advapi32': advapi, 'kernel32': kernel}
+                with mock.patch.object(ctypes, 'WinDLL', create=True,
+                                       side_effect=lambda name, **kwargs: libraries[name]):
+                    if safe:
+                        identity._windows_private('fixture.identity', current)
+                    else:
+                        with self.assertRaises(IdentityError):
+                            identity._windows_private('fixture.identity', current)
 
     def test_new_file_owner_failure_never_touches_dacl_or_reverifies(self):
         import speedbench_identity as identity

@@ -202,6 +202,8 @@ class DesktopBridgeTest(unittest.TestCase):
                     proc.stdin=None
                 for stream in (proc.stdout,proc.stderr):
                     if stream:stream.close()
+                if diagnostic is not None:
+                    raise AssertionError('Owned backend failed before readiness/quit: '+diagnostic)
             self.assertEqual(proc.returncode,0,err)
             self.assertNotIn('_enter_buffered_busy',err)
             self.assertNotIn('Fatal Python error',err)

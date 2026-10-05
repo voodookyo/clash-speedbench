@@ -60,21 +60,34 @@ def _windows_private(path, sid):
     convert.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                         ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(wintypes.DWORD)]
     convert.restype = wintypes.BOOL
+    sid_string = advapi.ConvertSidToStringSidW
+    sid_string.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    sid_string.restype = wintypes.BOOL
     kernel.LocalFree.argtypes = [ctypes.c_void_p]
     kernel.LocalFree.restype = ctypes.c_void_p
     descriptor = ctypes.c_void_p()
+    owner_sid = ctypes.c_void_p()
+    numeric_owner = wintypes.LPWSTR()
     output = wintypes.LPWSTR()
     try:
-        if get_info(str(path), 1, 5, None, None, None, None, ctypes.byref(descriptor)):
+        if get_info(str(path), 1, 5, ctypes.byref(owner_sid), None, None, None,
+                    ctypes.byref(descriptor)):
             raise IdentityError('Cannot inspect identity file permissions')
+        if not owner_sid or not sid_string(owner_sid, ctypes.byref(numeric_owner)):
+            raise IdentityError('Cannot inspect identity file owner')
+        if numeric_owner.value != sid:
+            raise IdentityError('Identity file owner or permissions are unsafe')
         if not convert(descriptor, 1, 5, ctypes.byref(output), None):
             raise IdentityError('Cannot inspect identity file permissions')
         sddl = output.value or ''
         owner = re.search(r'O:(.*?)(?=[GDS]:|$)', sddl)
         allowed = {sid, 'SY', 'BA', 'S-1-5-18', 'S-1-5-32-544'}
         entries = re.findall(r'\(([^()]*)\)', sddl)
-        if not owner or owner.group(1) != sid or 'D:' not in sddl or not entries:
+        if not owner or 'D:' not in sddl or not entries:
             raise IdentityError('Identity file owner or permissions are unsafe')
+        # SDDL may abbreviate this same verified user (for example, LA for
+        # the local Administrator). Trust only the actual owner's alias.
+        allowed.add(owner.group(1))
         for entry in entries:
             fields = entry.split(';')
             if len(fields) != 6 or fields[0] not in ('A', 'D'):
@@ -82,6 +95,8 @@ def _windows_private(path, sid):
             if fields[0] == 'A' and fields[5] not in allowed:
                 raise IdentityError('Identity file permissions are too broad')
     finally:
+        if numeric_owner:
+            kernel.LocalFree(ctypes.cast(numeric_owner, ctypes.c_void_p))
         if output:
             kernel.LocalFree(ctypes.cast(output, ctypes.c_void_p))
         if descriptor:

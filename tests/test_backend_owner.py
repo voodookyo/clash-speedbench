@@ -51,4 +51,3 @@ class BackendOwnerTest(unittest.TestCase):
                 self.assertTrue(lease.path.exists())
             with BackendLease(nested) as lease:
                 self.assertEqual(lease.path.name,'backend-owner.lock')
-

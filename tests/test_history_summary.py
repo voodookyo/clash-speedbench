@@ -52,7 +52,7 @@ class HistorySummaryJsTest(unittest.TestCase):
     def describe(self,rec):
         module=Path(__file__).resolve().parents[1]/'web'/'history-view.js'
         code='const h=require('+json.dumps(str(module))+');console.log(JSON.stringify(h.describe('+json.dumps(rec)+')));'
-        proc=subprocess.run([NODE,'-e',code],capture_output=True,text=True,timeout=5)
+        proc=subprocess.run([NODE,'-e',code],capture_output=True,text=True,encoding='utf-8',timeout=5)
         self.assertEqual(proc.returncode,0,proc.stderr)
         return json.loads(proc.stdout)
 
