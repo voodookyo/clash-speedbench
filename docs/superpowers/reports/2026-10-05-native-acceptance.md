@@ -257,3 +257,17 @@ NSMenuTrackingSession的菜单事件循环，不提供Rust互斥锁死锁证据�
 这不是默认目录完整前后快照，不宣称其schema/衍生数据未改变。新增文件保留，未尝试
 删除seed、回退SQLite或覆盖用户数据。真实历史内容、种子值及截图未上传公共仓库。
 此后退出验证改用已知进程/退出码，避免在已退出实例上继续界面观察触发非计划启动。
+
+## 本地 Apple Silicon 签名与 Gatekeeper
+
+检查ccbcf56的原始构建.app与隔离副本，版本均为1.1.0-alpha.1。`codesign -dvvv
+--entitlements :-`显示ARM64主程序为Signature=adhoc、TeamIdentifier=not set；
+两个bundle均没有Contents/_CodeSignature/CodeResources资源签名封装。
+`spctl -a -vv`对隔离副本返回1，实际诊断为“code has no resources but signature
+indicates they must be present”。这是当前未完整签名bundle的系统评估失败，不能将
+已有CLI启动/退出成功当作Gatekeeper放行。此结论仅覆盖该本地ARM包，不推断其他包。
+
+正式分发的最小后续路径是使用获授权的Developer ID身份完整签名bundle并完成公证，
+再验证系统信任；当前没有提供此类凭据，规格允许明确标识的unsigned alpha。
+本次只读检查未修补签名、添加权限、关闭Gatekeeper或绕过系统提示。
+系统图形安装/提示流程及其他平台生命周期仍保留未验收。

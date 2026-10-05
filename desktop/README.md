@@ -31,6 +31,10 @@ Python PATH; it does not prove interactive tray, notifications or suspend.
   and suspend acceptance remain pending.
 
 All current packages are **unsigned**. No automatic update plugin is enabled.
+The local Apple Silicon ccbcf56 bundle has an ad-hoc main binary without a sealed
+bundle resource envelope; Gatekeeper assessment rejects it. Local CLI launch
+checks do not establish system trust. Trusted distribution needs proper
+Developer ID bundle signing and notarization; see the acceptance report.
 Official release links support manual upgrade; there is no silent download or
 installation. Settings now offers an **explicit click-to-check stable Release**
 using the fixed public GitHub endpoint documented at
