@@ -967,8 +967,13 @@ async function loadLatest(){
   if(activeTask && typeof SBTasks!=='undefined' && !SBTasks.terminal(activeTask.status)) return;
   if(rec && rec.results){
     latestData = rec;
+    const sample = rec.task?.mode==='ip'
+      ? '不请求带宽'
+      : (Number.isFinite(rec.mb) && rec.mb>0 && Number.isSafeInteger(rec.rounds) && rec.rounds>0)
+        ? `${rec.mb}MB×${rec.rounds}轮`
+        : '带宽样本参数未知';
     document.getElementById('latest-meta').textContent =
-      `上次测速：${rec.ts} · ${rec.results.length} 个节点 · ${rec.mb}MB×${rec.rounds}轮`;
+      `上次测速：${rec.ts} · ${rec.results.length} 个节点 · ${sample}`;
   }else{
     latestData = {};
     document.getElementById('latest-meta').textContent = '暂无测速记录';

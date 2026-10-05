@@ -171,3 +171,36 @@ class HistorySummaryJsTest(unittest.TestCase):
         self.assertIn('B 月度名',out['ranged']);self.assertNotIn('旧范围名',out['ranged'])
         self.assertIn('没有名称快照',out['noSnapshots'])
         self.assertIn('读取名称记录失败',out['failed']);self.assertIn('刷新',out['failed'])
+
+    def test_latest_meta_uses_task_mode_and_valid_sample_params_only(self):
+        base={'ts':'2026-10-05T00:00:00','results':[{'latency_ms':10,'median_mbps':50,'score':99}]}
+        cases=[
+            (dict(base,mb=None,rounds=None,task={'mode':'ip'}),'不请求带宽'),
+            (dict(base,mb=10,rounds=1,task={'mode':'ip'}),'不请求带宽'),
+            (dict(base,mb=10,rounds=1),'10MB×1轮'),
+            (dict(base,mb=10,rounds=1,task={'mode':'quick'}),'10MB×1轮'),
+            (dict(base,mb=10.5,rounds=2),'10.5MB×2轮'),
+            (dict(base),'带宽样本参数未知'),
+            (dict(base,mb=None,rounds=1),'带宽样本参数未知'),
+            (dict(base,mb=10),'带宽样本参数未知'),
+            (dict(base,mb='10',rounds=1),'带宽样本参数未知'),
+            (dict(base,mb=True,rounds=1),'带宽样本参数未知'),
+            (dict(base,mb=0,rounds=1),'带宽样本参数未知'),
+            (dict(base,mb=-5,rounds=1),'带宽样本参数未知'),
+            (dict(base,mb=10,rounds=0),'带宽样本参数未知'),
+            (dict(base,mb=10,rounds=1.5),'带宽样本参数未知'),
+            (dict(base,mb=10,rounds='1'),'带宽样本参数未知'),
+        ]
+        driver="""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const recs=__CASES__;const texts=[];
+            for(const rec of recs){
+              getJSON=async url=>url==='/api/latest'?rec:{};
+              await loadLatest();
+              texts.push(__el('latest-meta').textContent);
+            }
+            console.log(JSON.stringify(texts));})();
+        """.replace('__CASES__',json.dumps([rec for rec,_ in cases],ensure_ascii=False))
+        out=task_ui.TaskUiJsTest.run_app(self,driver)
+        for (_,suffix),text in zip(cases,out):
+            self.assertEqual(text,f'上次测速：2026-10-05T00:00:00 · 1 个节点 · {suffix}')
