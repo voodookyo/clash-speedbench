@@ -12,7 +12,8 @@ B 核心规格验收完成；C6 和 D3–D6/D8 的完整人工验收仍保留待
 对应首轮最终测试冻结 `8f1b8742f2d98e50f9e03bd4bc3d2da4e47edc5e`。
 两者 Git diff 仅为 tests/test_history_summary.py 的旧夹具修正，运行资产无差异。
 工具全部安装于外层 .toolchain 或自有 Linux VM；未修改全局 ai-dev 路由、
-认证、原生 AI 工具设置、Verge 配置或系统代理。测试历史位于专用 .acceptance。
+认证、原生 AI 工具设置、Verge 配置或系统代理。受控验收历史位于专用 .acceptance；
+后续一次非计划默认目录启动及其数据写入单列于文末，不能据此声称全程未写默认目录。
 
 桌面退出子任务由 normal-code --write 执行，run_id
 `e0b53f87-3d4f-4605-b5f8-26eefbe312f9`，最终为 OpenCode/DeepSeek flash。
@@ -233,3 +234,26 @@ dist/desktop-artifacts/ccbcf56527c1。该包实际七页导航、崩溃任务par
 恢复相同50958端口与同一native/backend PID；认证退出后两者均消失、native exit=0。
 CUA在隐藏窗口状态无法返回窗口快照，当前工具没有可操作的菜单栏托盘入口；
 没有据此判定产品托盘失败，也没有把重复启动恢复当成托盘菜单通过。
+
+## macOS 隔离同路径替换与回退
+
+在中文/空格测试安装路径中，实际替换同一个Clash SpeedBench.app目录，依次运行
+前驱3b8a3a6 → 候选ccbcf56 → 回退3b8a3a6。三个受控实例均使用同一隔离SPEEDBENCH_HOME、
+PATH=/usr/bin:/bin；各次退出=0后才替换应用目录，没有新增测量或覆盖稳定安装。
+`python3 /tmp/speedbench-native-upgrade-roundtrip.py`完成三次逐字节JSONL/seed/偏好比较，
+SQLite只读比较每个id与runs.raw，全部保持原值。前驱与回退窗口实际回放原有四轮历史；
+候选首页显示相同最近轮次及新的“不请求带宽”文案。
+这是两个1.1.0-alpha.1开发冻结点间的Mac ARM包替换/回退，不是正式版本迁移、
+Windows安装器/缺WebView2或其他平台迁移的完整验收，D6仍待验。
+
+候选阶段操作系统Window菜单后，页面点击未生效。定向sample显示主线程停在
+NSMenuTrackingSession的菜单事件循环，不提供Rust互斥锁死锁证据。菜单尺寸项目当时禁用，
+未完成真实窄窗口操作；原生应用菜单Quit成功退出候选，候选完整历史页面操作未计通过。
+
+退出后的界面观察出现额外测试副本：该安装路径的新native/backend使用默认数据目录，
+超出隔离范围。控制器核对完整自有安装路径后只停止这个副本，两个进程均已回收。
+默认目录的既有SQLite被启动写入，新建identity-seed和ui-preferences.json；
+原JSONL修改时间仍为旧日期，随后只读对拍确认SQLite每条runs.raw与原JSONL文本一致。
+这不是默认目录完整前后快照，不宣称其schema/衍生数据未改变。新增文件保留，未尝试
+删除seed、回退SQLite或覆盖用户数据。真实历史内容、种子值及截图未上传公共仓库。
+此后退出验证改用已知进程/退出码，避免在已退出实例上继续界面观察触发非计划启动。

@@ -239,6 +239,13 @@ the old installation after a backup without deleting newer raw history. Never
 run old/new writers simultaneously; legacy source entry remains a fallback,
 not evidence of native platform acceptance.
 
+An Apple Silicon same-path replacement and rollback between development
+bundles 3b8a3a6 and ccbcf56 preserved JSONL, SQLite raw rows, identity seed and
+preferences, with native exit 0 at each step. This covers two alpha freezes;
+the full installer/platform migration matrix remains pending. The acceptance
+report separately records one unintended default-directory startup during UI
+observation and its data writes.
+
 Registered worker reaping is now bounded to at most 16 concurrent cleanup
 attempts; existing per-process terminate/kill waits overlap instead of summing.
 Every attempt is joined and persistent errors are propagated, including dynamic
