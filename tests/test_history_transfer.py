@@ -34,6 +34,24 @@ def fixture_task(db_path):
     return snapshot
 
 
+def held_bytes(path, *leases):
+    """Fixture bytes; a held owner lock is read through its own lease stream.
+
+    Windows mandatory byte-range locking forbids reading byte 0 through a
+    second handle, so the owning stream is reused without unlocking; other
+    files keep the plain path.read_bytes() fixture read.
+    """
+    for lease in leases:
+        if lease is not None and Path(path).resolve() == lease.path:
+            position = lease.stream.tell()
+            lease.stream.seek(0)
+            try:
+                return lease.stream.read()
+            finally:
+                lease.stream.seek(position)
+    return Path(path).read_bytes()
+
+
 class HistoryTransferTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -98,18 +116,18 @@ class HistoryTransferTest(unittest.TestCase):
                 ledger(self.source,'2026-10-01T01:00:00')
                 preview=self.preview()
                 ledger(root,'2026-10-02T01:00:00')
-                before={p.name:p.read_bytes() for p in self.home.iterdir() if p.is_file()}
+                before={p.name:held_bytes(p,self.owner) for p in self.home.iterdir() if p.is_file()}
                 with self.assertRaises(TransferError):self.service.apply(preview['token'],self.owner)
-                self.assertEqual(before,{p.name:p.read_bytes() for p in self.home.iterdir() if p.is_file()})
+                self.assertEqual(before,{p.name:held_bytes(p,self.owner) for p in self.home.iterdir() if p.is_file()})
                 (root/'speedbench-history.jsonl').unlink()
 
     def test_active_source_owner_is_rejected_without_changing_lock_metadata(self):
         ledger(self.source,'2026-10-01T01:00:00')
         with BackendLease(self.source) as source_owner:
             lock=source_owner.path
-            before=(lock.read_bytes(),lock.stat().st_mtime_ns,lock.stat().st_ino)
+            before=(held_bytes(lock,source_owner),lock.stat().st_mtime_ns,lock.stat().st_ino)
             with self.assertRaises(TransferError):self.preview()
-            self.assertEqual((lock.read_bytes(),lock.stat().st_mtime_ns,lock.stat().st_ino),before)
+            self.assertEqual((held_bytes(lock,source_owner),lock.stat().st_mtime_ns,lock.stat().st_ino),before)
 
     def test_sqlite_only_wal_source_is_read_without_modifying_original(self):
         path=self.source/'speedbench-history.db'
@@ -290,7 +308,7 @@ class HistoryTransferTest(unittest.TestCase):
         self.service.apply(self.preview()['token'],self.owner)
         with closing(sqlite3.connect(self.home/'speedbench-history.db')) as conn:
             self.assertEqual(conn.execute('SELECT raw FROM runs').fetchone()[0],raw)
-        self.assertEqual((self.home/'speedbench-history.jsonl').read_text(),raw+'\n')
+        self.assertEqual((self.home/'speedbench-history.jsonl').read_text(encoding='utf-8'),raw+'\n')
 
     def test_crash_after_applied_receipt_recovers_backup_pointer_and_rollback(self):
         import speedbench_transfer as transfer
@@ -309,7 +327,7 @@ class HistoryTransferTest(unittest.TestCase):
         self.assertFalse((self.home/'speedbench-history.jsonl').exists())
 
     def _home_state(self):
-        return ({p.name:p.read_bytes() for p in self.home.iterdir() if p.is_file()},
+        return ({p.name:held_bytes(p,self.owner) for p in self.home.iterdir() if p.is_file()},
                 {p.name for p in self.home.iterdir() if p.is_dir()})
 
     def _assert_preview_rejected_without_write(self, error_fragment):

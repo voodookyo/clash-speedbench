@@ -27,7 +27,8 @@ class PrepareCancellationTest(unittest.TestCase):
                 api.get('/providers/proxies')
                 return {'nodes':[],'sources':[]}
             api=Api() if discovery else transport
-            with mock.patch.object(core,'clear_cancel_request'), \
+            with mock.patch.object(core.signal,'signal'), \
+                 mock.patch.object(core,'clear_cancel_request'), \
                  mock.patch.object(core,'cancel_requested',cancelled.is_set), \
                  mock.patch.object(core,'connect_controller',return_value=api), \
                  mock.patch.object(core.source_catalog,'discover_catalog',side_effect=catalog):
