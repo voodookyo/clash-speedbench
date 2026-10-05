@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "icon": ["generated-icons/icon.icns", "generated-icons/icon.png"],
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "files": { "Resources/PrivacyInfo.xcprivacy": "PrivacyInfo.xcprivacy" }
+    }
+  }
+}

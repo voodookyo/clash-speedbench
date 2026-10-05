@@ -418,6 +418,7 @@ class BenchmarkPopenFlagsTest(WebStateCase):
                 mock.patch.object(web.subprocess, "Popen",
                                   return_value=proc) as m_popen, \
                 mock.patch.object(web, "sync_db"), \
+                mock.patch.object(web, "connect_controller"), \
                 mock.patch.object(subprocess, "CREATE_NO_WINDOW",
                                   self.FAKE_NO_WINDOW, create=True), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -513,11 +514,13 @@ class SigbreakRegistrationTest(unittest.TestCase):
     FAKE_SIGBREAK = getattr(signal, "SIGBREAK", 21)
 
     def run_main(self, platform):
-        with mock.patch.object(sys, "platform", platform), \
+        with tempfile.TemporaryDirectory() as cli_data, \
+                mock.patch.dict(os.environ, {"SPEEDBENCH_HOME": cli_data}), \
+                mock.patch.object(sys, "platform", platform), \
                 mock.patch.object(signal, "SIGBREAK", self.FAKE_SIGBREAK,
                                   create=True), \
                 mock.patch.object(sys, "argv", ["clash_speedbench.py", "--yes"]), \
-                mock.patch.object(csb, "detect_controller",
+                mock.patch.object(csb, "connect_controller",
                                   side_effect=csb.ApiError("停止于 controller 探测")), \
                 contextlib.redirect_stderr(io.StringIO()):
             return csb.main()
@@ -526,7 +529,7 @@ class SigbreakRegistrationTest(unittest.TestCase):
         old_handler = signal.getsignal(self.FAKE_SIGBREAK)
         try:
             rc = self.run_main("win32")
-            self.assertEqual(rc, 1)  # detect_controller 失败路径，注册已发生
+            self.assertEqual(rc, 1)  # connect_controller 失败路径，注册已发生
             handler = signal.getsignal(self.FAKE_SIGBREAK)
             self.assertTrue(callable(handler))
             self.assertNotIn(handler, (signal.SIG_DFL, signal.SIG_IGN,
@@ -721,7 +724,10 @@ class TrayModuleTest(unittest.TestCase):
                 return None
 
         with mock.patch.object(web, "ThreadingHTTPServer", return_value=FakeServer()), \
+                mock.patch.object(web, 'BackendLease'), \
+                mock.patch.object(web, 'recover_history_import'), \
                 mock.patch.object(web, "sync_db", return_value=0), \
+                mock.patch.object(web.speedbench_db, "interrupt_tasks"), \
                 mock.patch.object(web, "write_token_file"), \
                 mock.patch.object(web.webbrowser, "open"), \
                 mock.patch.object(sys, "argv", ["speedbench_web.py", "--no-browser"]), \
@@ -758,7 +764,7 @@ class TrayModuleTest(unittest.TestCase):
         但 macOS App 或 Windows zip 在用户机器上启动即失败。因此这里
         同时钉住 macOS copy/完整性校验、Windows Copy-Item 和 CI AST 清单。
         """
-        modules = ("speedbench_ip_intel.py", "speedbench_leak.py")
+        modules = ("speedbench_ip_intel.py", "speedbench_leak.py", "speedbench_controller.py")
         release = (self.ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8")
         build = (self.ROOT / "build_app.sh").read_text(encoding="utf-8")

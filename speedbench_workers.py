@@ -43,6 +43,7 @@ fallback.
 from __future__ import annotations
 
 import json
+import math
 import ipaddress
 import os
 import re
@@ -53,12 +54,18 @@ import subprocess
 import sys
 import tempfile
 import threading
+from speedbench_sources import apply_origin
+from speedbench_progress import DownloadCounter, phase, publish_result, measure, milestone
 import time
+import copy
+import queue
+from speedbench_process import cancellation_scope
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from clash_speedbench import (
+    run_external,
     DEFAULT_DOWNLOAD_URL,
     IpInfo,
     MihomoAPI,
@@ -79,11 +86,13 @@ from clash_speedbench import (
     multi_stream_speed,
     node_key_of,
     probe_latency,
+    observed_probe,
     start_intelligence_enrichment,
     finish_intelligence_enrichment,
     _apply_probe_stats,
     _coerce_probe_stats,
     _probe_count_from_args,
+    stamp_metric,
     warmup_speed,
 )
 from speedbench_ip_intel import load_provider_config
@@ -91,6 +100,10 @@ from speedbench_ip_intel import load_provider_config
 
 class WorkerUnavailable(RuntimeError):
     pass
+
+
+class WorkerCleanupError(RuntimeError):
+    """Owned resources remain; must not trigger a serial fallback measurement."""
 
 
 class VirtualDefaultRoute(WorkerUnavailable):
@@ -157,6 +170,10 @@ def find_mihomo_bin() -> Optional[str]:
 
 
 def find_config_file() -> Optional[str]:
+    from speedbench_config import ENV as root_env, validate_root, ConfigRootError
+    if os.environ.get(root_env):
+        try:return str(Path(validate_root(os.environ[root_env]))/'clash-verge.yaml')
+        except ConfigRootError:raise WorkerUnavailable('自定义 Verge 配置目录不可用；未回退到其他配置') from None
     for p in CONFIG_CANDIDATES:
         if os.path.isfile(p):
             return p
@@ -636,6 +653,12 @@ class _BlockYaml:
                 else:
                     out.append(None)
                 continue
+            # A flow collection after '-' is one value, not a block mapping
+            # whose first ':' belongs to the outer sequence. Real subscription
+            # files commonly use '- {name: ..., password: ...}'.
+            if rest[:1] in ('{', '['):
+                out.append(_parse_yaml_scalar(rest, lineno))
+                continue
             try:
                 key_value = _split_yaml_key(rest, lineno)
             except _NotYamlMappingEntry:
@@ -688,7 +711,7 @@ def _extract_proxies_ruby(config_path: str) -> List[dict]:
         "puts JSON.generate({'proxies' => cfg['proxies'] || []})"
     )
     try:
-        p = subprocess.run([ruby, "-e", script, config_path],
+        p = run_external([ruby, "-e", script, config_path],
                            capture_output=True, text=True, timeout=30,
                            **_no_window_kwargs())
     except subprocess.TimeoutExpired:
@@ -791,7 +814,7 @@ def physical_interface() -> Optional[str]:
         ]
         for c in cmds:
             try:
-                p = subprocess.run(
+                p = run_external(
                     [ps, "-NoProfile", "-Command",
                      "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + c],
                     capture_output=True, timeout=10,
@@ -804,7 +827,7 @@ def physical_interface() -> Optional[str]:
                 pass
         return None
     try:
-        p = subprocess.run(["route", "get", "default"],
+        p = run_external(["route", "get", "default"],
                            capture_output=True, text=True, timeout=5)
         for line in p.stdout.splitlines():
             if "interface:" in line:
@@ -846,7 +869,7 @@ def doh_resolve(domain: str, record_type: str = "A") -> Optional[str]:
         try:
             # 钉 UTF-8：与 fetch_ip_info/curl_speed 保持一致，避免中文 Windows
             # 上 GBK 解码遇到非 GBK 字节在读取线程里炸 UnicodeDecodeError
-            p = subprocess.run(
+            p = run_external(
                 ["curl", "-s", "-m", "6",
                  "--resolve", f"{host}:443:{ip}",
                  "-H", "accept: application/dns-json",
@@ -872,6 +895,7 @@ def build_hosts(proxies: List[dict]) -> Dict[str, str]:
     provider is enabled.  IPv4/IPv6 ipify exit discovery stays required in
     either mode.
     """
+    if cancel_requested():raise KeyboardInterrupt
     ip_api_enabled = load_provider_config().ip_api_enabled
     required_domains = tuple(
         domain for domain in TEST_DOMAINS
@@ -883,17 +907,40 @@ def build_hosts(proxies: List[dict]) -> Dict[str, str]:
         if srv and not _is_ip(srv):
             domains.add(srv)
     hosts: Dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for domain, ip in zip(domains, pool.map(doh_resolve, domains)):
-            if ip:
-                hosts[domain] = ip
+    stopped=threading.Event();failure_lock=threading.Lock();failures=[]
+    def cancelled():return stopped.is_set() or cancel_requested()
+    def resolve(domain,*args):
+        try:
+            with cancellation_scope(cancelled):
+                if cancelled():raise KeyboardInterrupt
+                return doh_resolve(domain,*args)
+        except BaseException as error:
+            with failure_lock:
+                if not failures:failures.append(error)
+                stopped.set()
+            raise
+    pool=ThreadPoolExecutor(max_workers=8);pending={}
+    try:
+        pending={domain:pool.submit(resolve,domain) for domain in domains}
+        for domain,future in pending.items():
+            ip=future.result()
+            if ip:hosts[domain]=ip
+    except BaseException as error:
+        stopped.set()
+        for future in pending.values():future.cancel()
+        # A sibling abort must not disguise the initiating resolver failure
+        # as user cancellation. Without a recorded initiating error, preserve
+        # the owner/main-thread exception instead.
+        with failure_lock:original=failures[0] if failures else error
+        raise original from None
+    finally:pool.shutdown(wait=True,cancel_futures=True)
     # Pin the IPv4 endpoint normally and pin the IPv6-only endpoint when an
     # AAAA record is available.  A missing AAAA is normal and does not affect
     # the required IPv4 worker hosts.
-    api4 = doh_resolve("api.ipify.org", "A")
+    api4 = resolve("api.ipify.org", "A")
     if api4:
         hosts["api.ipify.org"] = api4
-    api6 = doh_resolve("api6.ipify.org", "AAAA")
+    api6 = resolve("api6.ipify.org", "AAAA")
     if api6:
         hosts["api6.ipify.org"] = api6
     missing = [d for d in required_domains if d not in hosts]
@@ -916,6 +963,39 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+class _WorkerDirectory:
+    """Explicitly-owned private config; never GC-delete beneath a live process.
+
+    Unlike TemporaryDirectory, finalization cannot silently remove a config
+    after process reaping failed. Worker.stop remains the sole cleanup owner.
+    A failed cleanup keeps the exact private directory for an explicit retry.
+    """
+    def __init__(self):
+        self.name=tempfile.mkdtemp(prefix='speedbench-worker-')
+
+    def cleanup(self):
+        if os.path.lexists(self.name):shutil.rmtree(self.name)
+
+
+def stop_workers(registered) -> None:
+    """Stop this registry concurrently, join every attempt, then report failure.
+
+    At most the configured maximum 16 workers are reaped concurrently. Their
+    existing 3s terminate + 3s kill waits overlap rather than accumulate per
+    process. This is not a hard deadline for OS calls or filesystem cleanup.
+    No detached cleanup threads, global process lookup, or name-based killing.
+    """
+    unique={id(worker):worker for worker in registered}
+    if not unique:return
+    failed=False
+    with ThreadPoolExecutor(max_workers=min(16,len(unique))) as cleanup:
+        pending=[cleanup.submit(worker.stop) for worker in unique.values()]
+        for future in pending:
+            try:future.result()
+            except Exception:failed=True
+    if failed:raise WorkerCleanupError('Registered temporary worker cleanup incomplete') from None
+
+
 class Worker:
     """One throwaway mihomo process: mixed-port + tiny external controller."""
 
@@ -926,13 +1006,15 @@ class Worker:
         self.hosts = hosts
         self.iface = iface
         self.proc: Optional[subprocess.Popen] = None
-        self.dir: Optional[tempfile.TemporaryDirectory] = None
+        self.dir: Optional[_WorkerDirectory] = None
         self.api: Optional[MihomoAPI] = None
         self.proxy_url = ""
         # stop() 幂等保护：中断路径（run_pool 的 worker 注册表统一清理）与
         # shard_loop 的 finally 可能并发/重复调用，必须只真正执行一次
         self._stop_lock = threading.Lock()
         self._stopped = False
+        self._process_reaped = False
+        self._cleanup_done = False
 
     def start(self) -> None:
         # Serialize only resource initialization with stop().  Phase 1
@@ -941,6 +1023,7 @@ class Worker:
         # prevent cancellation from terminating the process promptly.
         try:
             with self._stop_lock:
+                if cancel_requested():raise KeyboardInterrupt
                 if self._stopped:
                     raise WorkerUnavailable("worker startup cancelled")
                 deadline, mix_port = self._initialize_unlocked()
@@ -953,7 +1036,7 @@ class Worker:
             raise
 
     def _initialize_unlocked(self) -> Tuple[float, int]:
-        self.dir = tempfile.TemporaryDirectory(prefix="speedbench-worker-")
+        self.dir = _WorkerDirectory()
         mix_port = _free_port()
         ctl_port = _free_port()
         while ctl_port == mix_port:
@@ -994,6 +1077,7 @@ class Worker:
     def _wait_until_ready(self, deadline: float, mix_port: int) -> None:
         """Poll readiness without holding the lifecycle lock."""
         while time.time() < deadline:
+            if cancel_requested():raise KeyboardInterrupt
             with self._stop_lock:
                 if self._stopped:
                     raise WorkerUnavailable("worker startup cancelled")
@@ -1004,7 +1088,8 @@ class Worker:
             if proc.poll() is not None:
                 raise WorkerUnavailable(f"worker 进程启动后立即退出（端口 {mix_port}）")
             try:
-                api.get("/version")
+                with cancellation_scope(lambda:self._stopped or cancel_requested()):
+                    api.get("/version")
             except Exception:
                 with self._stop_lock:
                     if self._stopped:
@@ -1012,6 +1097,7 @@ class Worker:
                 time.sleep(0.25)
                 continue
             with self._stop_lock:
+                if cancel_requested():raise KeyboardInterrupt
                 if self._stopped:
                     raise WorkerUnavailable("worker startup cancelled")
             return
@@ -1019,20 +1105,35 @@ class Worker:
 
     def stop(self) -> None:
         with self._stop_lock:
-            if self._stopped:
+            if self._cleanup_done:
                 return
+            # Prevent startup immediately, but do not claim that cleanup
+            # succeeded until the owned process is reaped and config removed.
+            # An incomplete stop remains retryable under this same lock.
             self._stopped = True
-            if self.proc and self.proc.poll() is None:
+            if self.proc and not self._process_reaped:
                 try:
-                    self.proc.terminate()
-                    self.proc.wait(timeout=3)
-                except Exception:
-                    try:
-                        self.proc.kill()
-                    except Exception:
-                        pass
+                    if self.proc.poll() is None:
+                        try:
+                            self.proc.terminate()
+                            self.proc.wait(timeout=3)
+                        except (OSError, subprocess.TimeoutExpired):
+                            # kill is asynchronous too; wait before touching
+                            # files a running Mihomo might still be reading.
+                            try:
+                                self.proc.kill()
+                            except OSError:
+                                pass  # A raced exit is confirmed by wait.
+                            self.proc.wait(timeout=3)
+                    self._process_reaped = True
+                except (OSError, subprocess.TimeoutExpired):
+                    raise WorkerCleanupError('Temporary worker process cleanup incomplete') from None
             if self.dir:
-                self.dir.cleanup()
+                try:
+                    self.dir.cleanup()
+                except OSError:
+                    raise WorkerCleanupError('Temporary worker configuration cleanup incomplete') from None
+            self._cleanup_done = True
 
     def select(self, name: str) -> None:
         assert self.api is not None
@@ -1040,7 +1141,8 @@ class Worker:
 
 
 def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
-                       max_workers: int = 10, probe_count: int = 3
+                       max_workers: int = 10, probe_count: int = 3, on_result=None,
+                       progress_args=None,proto_by_name=None,provider_by_name=None,on_probe_update=None
                        ) -> Dict[str, ProbeStats]:
     """Phase 1 第 1 步：经主实例 /delay API 并发测全部节点延迟，
     返回 {节点名: ProbeStats}；对象可继续解包为旧的 (latency, jitter) pair，
@@ -1055,15 +1157,12 @@ def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
     lock = threading.Lock()
     done = {"n": 0}
     total = len(names)
+    cancelled=threading.Event()
 
-    def one(name: str) -> None:
-        try:
-            raw = probe_latency(api, name, timeout_ms, count=probe_count)
-        except TypeError:
-            # Keep tiny legacy test doubles/callers that only accept three
-            # positional arguments working during the transition.
-            raw = probe_latency(api, name, timeout_ms)
-        stats = _coerce_probe_stats(raw, attempts=probe_count)
+    def measure_one(name: str) -> None:
+        stats=observed_probe(api,name,timeout_ms,progress_args,source='main',count=probe_count,
+            proto=(proto_by_name or {}).get(name,''),provider=(provider_by_name or {}).get(name,''),
+            on_update=on_probe_update,probe_function=probe_latency,cancel=cancelled.is_set)
         lat, jit = stats
         with lock:
             out[name] = stats
@@ -1074,9 +1173,29 @@ def probe_latency_pool(api: MihomoAPI, names: List[str], timeout_ms: int,
                       if stats.loss_pct is not None else "")
         print(f"Phase 1 粗筛 [{idx:>3}/{total}] {name} | "
               f"{fmt_ms(lat)}{jitter_brief} ms（主实例{loss_brief}）")
+        if on_result is not None:
+            on_result(name,stats,idx,total)
 
-    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, total))) as pool:
-        list(pool.map(one, names))
+    def one(name):
+        if cancelled.is_set():return
+        try:measure_one(name)
+        except BaseException:
+            # Set inside the failing worker before it can claim queued nodes;
+            # main-thread Ctrl+C takes the identical path below.
+            cancelled.set();raise
+    pool=ThreadPoolExecutor(max_workers=min(max_workers,max(1,total)))
+    pending=[]
+    try:
+        pending=[pool.submit(one,name) for name in names]
+        for future in pending:future.result()
+    except BaseException:
+        cancelled.set()
+        for future in pending:future.cancel()
+        raise
+    finally:
+        # Active HTTP calls still obey their controller timeout; join them
+        # before any worker phase starts. No next sample or queued node runs.
+        pool.shutdown(wait=True,cancel_futures=True)
     return out
 
 
@@ -1089,18 +1208,8 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
     assert worker.api is not None
     probe_stats: Optional[ProbeStats] = None
     if latency is None:
-        try:
-            raw = probe_latency(
-                worker.api, name, args.delay_timeout,
-                count=_probe_count_from_args(args),
-            )
-        except TypeError:
-            # Keep tiny legacy test doubles/callers that only accept three
-            # positional arguments working during the transition.
-            raw = probe_latency(worker.api, name, args.delay_timeout)
-        probe_stats = _coerce_probe_stats(
-            raw, attempts=_probe_count_from_args(args)
-        )
+        probe_stats=observed_probe(worker.api,name,args.delay_timeout,args,
+            source='worker',metric='probe',proto=proto,probe_function=probe_latency)
         latency, jitter = probe_stats
     if latency is None:
         result = Result(name=name, provider="", proto=proto, latency_ms=None,
@@ -1113,13 +1222,27 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
     ip: Optional[IpInfo] = None
     exit_ipv4: Optional[str] = None
     exit_ipv6: Optional[str] = None
+    partial = Result(name=name,provider='',proto=proto,latency_ms=latency,jitter_ms=jitter,
+                     speeds_mbps=[],median_mbps=None,best_mbps=None,status='probe-only')
+    apply_origin(partial,getattr(args,'source_origins',{}).get(name))
+    partial.exit_status = dict(ipv4='not_requested' if args.no_ip else 'pending',
+                               ipv6='not_requested' if args.no_ip else 'pending')
+    if probe_stats is not None:
+        _apply_probe_stats(partial,probe_stats)
+    def early_exit(family,address,status):
+        if family=='legacy':
+            partial.exit_status['basic'] = status
+        else:
+            setattr(partial,'exit_'+family,address)
+            partial.exit_status[family] = status
+            if address:stamp_metric(partial,'exit')
+        publish_result(args,'node_exit',partial,phase_name='probing')
     if not args.no_ip:
         try:
             worker.select(name)
             time.sleep(args.settle)
-            exit_ipv4, exit_ipv6, data = fetch_exit_ips(
-                worker.proxy_url, args.ip_timeout
-            )
+            extra = dict(on_result=early_exit,progress_args=args) if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
+            exit_ipv4, exit_ipv6, data = fetch_exit_ips(worker.proxy_url,args.ip_timeout,**extra)
             if data:
                 ip = classify_ip(data)
         except Exception:
@@ -1128,6 +1251,8 @@ def _probe_node_in_worker(worker: Worker, name: str, proto: str, args,
                     speeds_mbps=[], median_mbps=None, best_mbps=None,
                     status="ok", ip=ip, jitter_ms=jitter,
                     exit_ipv4=exit_ipv4, exit_ipv6=exit_ipv6)
+    result.exit_status = partial.exit_status if getattr(args,'progress',None) is not None else None
+    result.metric_updated_at = dict(partial.metric_updated_at or {}) or None
     if probe_stats is not None:
         _apply_probe_stats(result, probe_stats)
     return result
@@ -1145,37 +1270,63 @@ def _speed_node_in_worker(worker: Worker, r: Result, args) -> None:
     # --mb 未显式指定时先 ~1MB 预热估速，再自适应样本大小
     mb = args.mb
     max_time = args.max_time
+    r.download_bytes = 0
     if mb is None:
-        rough = warmup_speed(worker.proxy_url, min(3.0, args.max_time))
+        with measure(args,'warmup') as counts:
+            if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None:
+                counter=DownloadCounter(args,r,counts)
+                rough = warmup_speed(worker.proxy_url,min(3.0,args.max_time),
+                    on_attempt=counter.start,on_sample=counter.finish)
+            else:
+                rough = warmup_speed(worker.proxy_url, min(3.0, args.max_time))
         mb, max_time = adaptive_sample(rough, args.max_time)
     r.sample_mb = mb
 
     speeds: List[float] = []
     statuses: List[str] = []
     for round_i in range(args.rounds):
+        if cancel_requested():
+            raise KeyboardInterrupt
         byte_count = mb * 1_000_000
         url = (DEFAULT_DOWNLOAD_URL.format(bytes=byte_count)
                + f"&measId={int(time.time()*1000)}-p2-{round_i}")
-        speed, status, c_ms, _sz = curl_speed(
-            proxy_url=worker.proxy_url,
-            download_url=url,
-            max_time=max_time,
-            connect_timeout=min(3.0, max_time),
-        )
+        with measure(args,'download') as counts:
+            counter=DownloadCounter(args,r,counts);counter.start()
+            speed, status, c_ms, _sz = curl_speed(
+                proxy_url=worker.proxy_url,
+                download_url=url,
+                max_time=max_time,
+                connect_timeout=min(3.0, max_time),
+            )
+            counter.finish(speed,_sz)
         statuses.append(status)
         if r.connect_ms is None and c_ms is not None:
             r.connect_ms = c_ms
         if speed is not None:
             speeds.append(speed)
+        # Keep each completed round in the shared result immediately. An
+        # interrupted later round must not discard prior real samples.
+        r.speeds_mbps = list(speeds)
+        r.median_mbps = statistics.median(speeds) if speeds else None
+        r.best_mbps = max(speeds) if speeds else None
+        r.status = 'ok' if speeds else ';'.join(statuses)[:160]
+        r.measurement_scope=dict(r.measurement_scope or {},mode=getattr(args,'mode',None) or 'legacy',bandwidth='partial')
+        stamp_metric(r,'bandwidth','network')
+        publish_result(args,'node_measurement',r,phase_name='measuring')
 
     if getattr(args, "multi", False):
-        r.multi_mbps = multi_stream_speed(worker.proxy_url, mb * 1_000_000,
-                                          max_time, min(3.0, max_time))
+        with measure(args,'download') as counts:
+            counter=DownloadCounter(args,r,counts)
+            extra = dict(on_attempt=counter.start,on_sample=counter.finish) if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
+            r.multi_mbps = multi_stream_speed(worker.proxy_url, mb * 1_000_000,
+                                              max_time, min(3.0, max_time),**extra)
 
     r.speeds_mbps = speeds
     r.median_mbps = statistics.median(speeds) if speeds else None
     r.best_mbps = max(speeds) if speeds else None
     r.status = "ok" if speeds else ";".join(statuses)[:160]
+    if r.measurement_scope is not None:r.measurement_scope['bandwidth']='completed' if speeds else 'failed'
+    stamp_metric(r,'bandwidth','network')
 
 
 def select_phase2_nodes(results: List[Result], top_n: int,
@@ -1185,6 +1336,41 @@ def select_phase2_nodes(results: List[Result], top_n: int,
                        key=lambda r: r.latency_ms or 0)
     top_n = max(1, top_n)
     return reachable if measure_all else reachable[:top_n]
+
+
+def choose_task_nodes(results, args):
+    config = getattr(args, 'task_config', None)
+    if config is None or config.mode == 'legacy':
+        return select_phase2_nodes(results, getattr(args,'top_n',15), getattr(args,'all',False))
+    if not config.bandwidth:
+        return []
+    from speedbench_tasks import select_candidates
+    if not hasattr(args, '_candidate_history'):
+        from speedbench_db import candidate_history_hints
+        ids = [(r.origin or {}).get('node_id') for r in results
+               if (r.origin or {}).get('identity_strength') == 'strong']
+        history = getattr(args, 'history', None)
+        args._candidate_history = (candidate_history_hints(Path(history).with_suffix('.db'), ids,
+                                                           target_profile=config.target_profile)
+                                   if history and ids and not config.measure_all else {})
+    by_name = {r.name:r for r in results}
+    rows = []
+    for r in results:
+        origin = r.origin or {}
+        strong = origin.get('identity_strength') == 'strong'
+        hint = args._candidate_history.get(origin.get('node_id'), {}) if strong else {}
+        row = dict(name=r.name, latency_ms=r.latency_ms, node_id=origin.get('node_id',''),
+                   jitter_ms=r.jitter_ms,probe_loss_pct=r.probe_loss_pct,
+                   identity_strength=origin.get('identity_strength'),
+                   subscription_ids=origin.get('subscription_ids',[]),
+                   recent_mbps=hint.get('recent_mbps'), history_age_days=hint.get('history_age_days'),
+                   recent_ip_quality=hint.get('recent_ip_quality'),
+                   recent_ip_category=hint.get('recent_ip_category'),recent_ip_confidence=hint.get('recent_ip_confidence'),
+                   region=r.ip.country_code if r.ip and r.ip.ok else hint.get('region'))
+        rows.append(row)
+    selected = select_candidates(rows, config.top_n, measure_all=config.measure_all,
+                                 target_profile=config.target_profile)
+    return [by_name[row['name']] for row in selected]
 
 
 def relabel_unmeasured(r: Result) -> None:
@@ -1228,6 +1414,24 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     print(f"Worker 模式: {mihomo_bin}")
     print(f"配置文件: {config_file}")
     all_proxies = extract_proxies(config_file)
+    origins = getattr(args, 'source_origins', {})
+    if origins:
+        import os
+        from speedbench_identity import load_seed, IdentityError
+        from speedbench_sources import revalidate_origins, SourceSelectionChanged
+        try:
+            seed = load_seed(Path(os.environ.get('SPEEDBENCH_HOME') or
+                                 str(Path(args.history).resolve().parent)) / 'identity-seed')
+            checked = revalidate_origins(origins, all_proxies, seed=seed,
+                                        namespace=os.path.normcase(str(Path(config_file).resolve().parent)))
+        except IdentityError:
+            checked = {}
+        changed = set(origins) - set(checked)
+        if changed.intersection(candidates) and (getattr(args, 'subscription_id', []) or
+                                                getattr(args, 'node_id', [])):
+            raise SourceSelectionChanged('节点配置已变化，请刷新目录后重试')
+        # Non-ID legacy runs may continue, but may not retain stale provenance.
+        args.source_origins = checked
     by_name = {p.get("name"): p for p in all_proxies if isinstance(p, dict)}
     selected = [by_name[n] for n in candidates if n in by_name]
     missing = [n for n in candidates if n not in by_name]
@@ -1245,10 +1449,12 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
             f"worker 模式测速无意义")
     if not iface:
         print("⚠️ 无法确定物理网卡，worker 拨号可能被主实例 TUN 截获（结果可能不准）")
-    print("正在解析测试域名与节点服务器域名（DoH）…")
-    # 依赖闭包内前置节点的 server 域名也要钉住，否则前置节点拨号会拿到 fake-ip
-    hosts = build_hosts(with_dependencies(selected, all_proxies))
-
+    config = getattr(args,'task_config',None)
+    hosts = None
+    if config is None or config.mode == 'legacy':
+        print("正在解析测试域名与节点服务器域名（DoH）…")
+        with measure(args,'dns'):
+            hosts = build_hosts(with_dependencies(selected, all_proxies))
     started = time.time()
     total = len(selected)
 
@@ -1257,22 +1463,51 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     # IP 画像再计第二轮 [N/M]——Web 端只认最后一条 [N/M] 计数（app.js 正则），
     # 表现为进度条涨满后回退再涨，阶段标签始终是「Phase 1 粗筛」，无需改 Web。
     latency_map: Dict[str, ProbeStats] = {}
+    phase(args,'probing')
+    published_probe = set()
+    delay_counts=None
+    delay_metric_lock=threading.Lock()
+    probe_accounting={}
+    def update_probe_counts(name,stats,started):
+        with delay_metric_lock:
+            probe_accounting[name]=(started,stats.successes if stats is not None else 0)
+            if delay_counts is not None:
+                delay_counts.update(attempts=sum(v[0] for v in probe_accounting.values()),
+                                    successes=sum(v[1] for v in probe_accounting.values()))
+    def publish_probe(name,stats,idx,count):
+        r = Result(name=name,provider=(provider_by_name or {}).get(name,''),proto=proto_by_name.get(name,''),
+                   latency_ms=stats.latency_ms,speeds_mbps=[],median_mbps=None,best_mbps=None,
+                   jitter_ms=stats.jitter_ms,status='ok' if stats.latency_ms is not None else 'unreachable')
+        _apply_probe_stats(r,stats)
+        apply_origin(r,getattr(args,'source_origins',{}).get(name))
+        publish_result(args,'node_probe',r,phase_name='probing',completed=idx,total=count)
+        with delay_metric_lock:
+            published_probe.add(name)
+        if name not in probe_accounting:update_probe_counts(name,stats,stats.attempts)
     if main_api is not None:
         print(f"Phase 1 粗筛 · 延迟探测: 经主实例 /delay 并发测 {total} 个节点"
               f"（Clash Verge ping 同口径，不切换节点）…")
         try:
-            try:
-                latency_map = probe_latency_pool(
-                    main_api, [str(p.get("name")) for p in selected],
-                    args.delay_timeout,
-                    probe_count=_probe_count_from_args(args),
-                )
-            except TypeError:
-                # Preserve compatibility with older injected pool functions.
-                latency_map = probe_latency_pool(
-                    main_api, [str(p.get("name")) for p in selected],
-                    args.delay_timeout,
-                )
+            callback = dict(on_result=publish_probe,progress_args=args,proto_by_name=proto_by_name,
+                provider_by_name=provider_by_name,on_probe_update=update_probe_counts) if getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None else {}
+            with measure(args,'delay') as counts:
+                delay_counts=counts
+                try:
+                    latency_map = probe_latency_pool(
+                        main_api, [str(p.get("name")) for p in selected],
+                        args.delay_timeout,
+                        probe_count=_probe_count_from_args(args),
+                        **callback,
+                    )
+                except TypeError:
+                    # Preserve compatibility with older injected pool functions.
+                    latency_map = probe_latency_pool(
+                        main_api, [str(p.get("name")) for p in selected],
+                        args.delay_timeout,
+                    )
+                stats=[_coerce_probe_stats(s,attempts=_probe_count_from_args(args)) for s in latency_map.values()]
+                counts.update(attempts=sum(s.attempts for s in stats),successes=sum(s.successes for s in stats))
+            delay_counts=None
         except KeyboardInterrupt:
             print("\n\n收到 Ctrl+C，停止测速……")
             raise
@@ -1280,13 +1515,29 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         print(f"Phase 1 延迟探测完成: {n_ok}/{total} 连通"
               + (f"；主实例失败的 {total - n_ok} 个将在 worker 内兜底重测"
                  if n_ok < total else ""))
+        for i,(name,stats) in enumerate(latency_map.items(),1):
+            if name not in published_probe:
+                publish_probe(name,_coerce_probe_stats(stats,attempts=_probe_count_from_args(args)),i,total)
 
     # ---- Phase 1 第 2 步：worker 池出口 IP 画像 + 延迟兜底 ----
     # 需进 worker 的节点：未跳过 IP 画像时是全部节点；--no-ip 时只剩主实例
     # /delay 失败、需要 worker 兜底复测的节点（main_api 缺省时 latency_map 为空，
     # 全部节点都进 worker 测延迟，即旧行为）。全部连通且 --no-ip 时 worker 无活可干，
     # 直接跳过，省得起一批临时 mihomo 进程。
-    if args.no_ip:
+    scoped_ip = bool(config and config.ip_scope == 'selected' and main_api is not None)
+    # Select exits after main-instance probes, not for every node in fast modes.
+    provisional = []
+    for p in selected:
+        name = str(p.get('name'))
+        stats = _coerce_probe_stats(latency_map.get(name,(None,None)),attempts=_probe_count_from_args(args))
+        r = Result(name=name,provider='',proto=str(p.get('type','')),latency_ms=stats.latency_ms,
+                   speeds_mbps=[],median_mbps=None,best_mbps=None,status='ok')
+        _apply_probe_stats(r,stats)
+        apply_origin(r,getattr(args,'source_origins',{}).get(name))
+        provisional.append(r)
+    initial_chosen = choose_task_nodes(provisional,args)
+    ip_names = {r.name for r in initial_chosen} if scoped_ip else {str(p.get('name')) for p in selected}
+    if args.no_ip or scoped_ip:
         # ``probe_latency_pool`` returns ProbeStats in production.  Resolve its
         # legacy tuple-compatible value explicitly rather than relying on
         # indexing (old injected test doubles may still return a tuple).
@@ -1296,7 +1547,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                 latency_map.get(str(p.get("name")), (None, None)),
                 attempts=_probe_count_from_args(args),
             )
-            if stats.latency_ms is None:
+            if stats.latency_ms is None or (scoped_ip and str(p.get('name')) in ip_names):
                 ip_pending.append(p)
     else:
         ip_pending = list(selected)
@@ -1304,9 +1555,11 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     results: List[Result] = []
     results_lock = threading.Lock()
     done_counter = {"n": 0}
-
-    if not ip_pending:
-        for p in selected:
+    pending_names = {str(p.get('name')) for p in ip_pending}
+    # Retain every successful probe, including nodes outside the detail scope
+    # or mixed-success --no-ip runs. Older code silently omitted these rows.
+    for p in selected:
+        if str(p.get('name')) not in pending_names:
             name = str(p.get("name"))
             stats = _coerce_probe_stats(
                 latency_map.get(name, (None, None)),
@@ -1320,7 +1573,12 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                             jitter_ms=jit)
             _apply_probe_stats(result, stats)
             results.append(result)
-    else:
+    dns_names = pending_names | {r.name for r in initial_chosen}
+    if hosts is None:
+        print("正在解析入选节点及依赖域名（DoH）…")
+        with measure(args,'dns'):
+            hosts = build_hosts(with_dependencies([p for p in selected if p.get('name') in dns_names], all_proxies))
+    if ip_pending:
         worker_count = max(1, min(args.workers, len(ip_pending)))
         print(f"Phase 1 粗筛 · IP 画像: 启动 {worker_count} 个并发 worker"
               f"（{len(ip_pending)} 节点，仅出口 IP 探测/延迟兜底，不下载，"
@@ -1330,6 +1588,21 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         shards: List[List[dict]] = [[] for _ in range(worker_count)]
         for i, p in enumerate(ip_pending):
             shards[i % worker_count].append(p)
+        dynamic = bool(config and config.mode != 'legacy')
+        pending_queue = queue.Queue()
+        if dynamic:
+            for p in ip_pending:
+                pending_queue.put(p)
+
+        def claim_nodes(shard):
+            if not dynamic:
+                yield from shard
+                return
+            while not cancelled():
+                try:
+                    yield pending_queue.get_nowait()
+                except queue.Empty:
+                    return
 
         ip_total = len(ip_pending)
 
@@ -1354,18 +1627,15 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
         def stop_live_workers() -> None:
             with workers_lock:
                 ws = list(live_workers)
-            for w in ws:
-                try:
-                    w.stop()  # Worker.stop 幂等，与 shard_loop 的 finally 不冲突
-                except Exception:
-                    pass
+            stop_workers(ws)  # Idempotent; independent waits overlap, failures are not swallowed.
 
         def shard_loop(shard: List[dict]) -> None:
             if cancelled():
                 return
-            # worker 配置 = 分片节点 + 各自的 dialer-proxy 依赖闭包；
-            # 探测仍只针对分片内的入选节点，依赖节点仅供链式拨号、不计入结果
-            worker = Worker(mihomo_bin, with_dependencies(shard, all_proxies), hosts, iface)
+            # Legacy workers load one shard; dynamic workers load the entire
+            # pending scope and dependency closure before claiming any node.
+            # Dependencies are dial-only and never additional result rows.
+            worker = Worker(mihomo_bin, with_dependencies(ip_pending if dynamic else shard, all_proxies), hosts, iface)
             with workers_lock:
                 # Register before startup: Worker.start() creates its temporary
                 # directory/process incrementally, so a startup exception or
@@ -1373,8 +1643,11 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                 # stop_live_workers().
                 live_workers.append(worker)
             try:
-                worker.start()
-                for p in shard:
+                with measure(args,'worker_start') as timing:
+                    timing['attempts']=1
+                    worker.start()
+                    timing.update(successes=1,counters={'worker_count':1})
+                for p in claim_nodes(shard):
                     if cancelled():  # 节点间检查取消标志，尽快收队
                         return
                     name = str(p.get("name"))
@@ -1385,31 +1658,43 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                     )
                     lat, jit = stats
                     try:
-                        r = _probe_node_in_worker(worker, name, proto, args, lat, jit)
+                        probe_args = args
+                        if scoped_ip and name not in ip_names:
+                            probe_args = copy.copy(args)
+                            probe_args.no_ip = True
+                        r = _probe_node_in_worker(worker, name, proto, probe_args, lat, jit)
                         # Main-instance stats are authoritative when the main
                         # probe succeeded.  A failed main probe lets the worker
                         # fallback retain its own independent ProbeStats.
                         if lat is not None:
                             _apply_probe_stats(r, stats)
                     except Exception as e:
-                        r = Result(name=name, provider="", proto=proto, latency_ms=None,
+                        r = Result(name=name, provider="", proto=proto, latency_ms=lat,
                                    speeds_mbps=[], median_mbps=None, best_mbps=None,
-                                   status=f"error: {e}"[:160])
+                                   status=f"error: {e}"[:160], jitter_ms=jit)
+                        _apply_probe_stats(r, stats)
                     with results_lock:
                         results.append(r)
                         done_counter["n"] += 1
                         idx = done_counter["n"]
+                    apply_origin(r,getattr(args,'source_origins',{}).get(name))
+                    publish_result(args,'node_exit',r,phase_name='probing',completed=idx,total=ip_total)
                     ip_txt = f" | {ip_brief(r.ip)}" if r.ip and r.ip.ok else ""
                     jitter_brief = f"±{r.jitter_ms:.0f}" if r.jitter_ms else ""
                     print(f"Phase 1 粗筛 [{idx:>3}/{ip_total}] {name} | "
                           f"{fmt_ms(r.latency_ms)}{jitter_brief} ms{ip_txt}")
             finally:
-                worker.stop()
+                with measure(args,'cleanup'):
+                    worker.stop()
 
         def guarded(shard: List[dict]) -> None:
             try:
                 shard_loop(shard)
             except Exception as e:
+                if dynamic:
+                    # Other live workers can claim unstarted nodes. Final
+                    # reconciliation below records only truly missing nodes.
+                    return
                 # 整 shard 失败：给每个节点登记失败结果
                 for p in shard:
                     with results_lock:
@@ -1432,7 +1717,25 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
             stop_live_workers()
             raise
         finally:
-            pool.shutdown(wait=True)
+            try:
+                pool.shutdown(wait=True)
+            finally:
+                # Guarded dynamic shards can fail independently. Reconcile
+                # every registered resource, including failed start/stop,
+                # before proceeding to Phase 2 or claiming a finished task.
+                with measure(args,'cleanup'):
+                    stop_live_workers()
+        if dynamic:
+            existing = {r.name for r in results}
+            for p in ip_pending:
+                if str(p.get('name')) not in existing:
+                    stats = _coerce_probe_stats(latency_map.get(str(p.get('name')),(None,None)),
+                                                attempts=_probe_count_from_args(args))
+                    r = Result(name=str(p.get('name')),provider='',proto=str(p.get('type','')),
+                               latency_ms=stats.latency_ms,speeds_mbps=[],median_mbps=None,best_mbps=None,
+                               jitter_ms=stats.jitter_ms,status='worker-failed: startup or processing unavailable')
+                    _apply_probe_stats(r,stats)
+                    results.append(r)
     print(f"Phase 1 粗筛完成，耗时 {time.time() - started:.1f}s（{total} 节点）")
 
     # 订阅维度回填（集中一处，覆盖 Phase 1 各正常/异常分支产出的全部 Result）：
@@ -1441,6 +1744,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     provider_map = provider_by_name or {}
     for r in results:
         r.provider = provider_map.get(r.name, "")
+        apply_origin(r, getattr(args, 'source_origins', {}).get(r.name))
         cred = by_name.get(r.name)
         if cred:
             r.node_key = node_key_of(str(cred.get("type", "")),
@@ -1455,23 +1759,32 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     intel_enricher = start_intelligence_enrichment(results, args)
 
     # Phase 2 选节点：剔除不通节点后按延迟升序，取 Top N（--all 时取全部连通节点）
-    chosen = select_phase2_nodes(results, getattr(args, "top_n", 15),
-                                 getattr(args, "all", False))
+    chosen = choose_task_nodes(results,args)
+    if chosen:
+        phase(args,'measuring')
 
     if not chosen:
-        print("Phase 2 精测: 没有连通节点，跳过带宽精测。")
+        print("Phase 2 精测: IP 专项不请求带宽。" if config and not config.bandwidth else
+              "Phase 2 精测: 没有连通节点，跳过带宽精测。")
     else:
         # scope 只出「全部/Top」字样，个数由后面的 {len(chosen)} 表达，避免「Top 15 15 个节点」
         scope = "全部" if getattr(args, "all", False) else "Top"
         print(f"Phase 2 精测: {scope} {len(chosen)} 个节点，单 worker 严格串行"
               f"（同一时刻只有一路测速下载）…")
         chosen_proxies = [by_name[r.name] for r in chosen if r.name in by_name]
+        new_dns = [p for p in chosen_proxies if p.get('name') not in dns_names]
+        if config and config.mode != 'legacy' and new_dns:
+            with measure(args,'dns'):
+                hosts.update(build_hosts(with_dependencies(new_dns,all_proxies)))
         worker2: Optional[Worker] = None
         try:
             # Phase 2 单 worker 同样并入 dialer-proxy 依赖闭包
             worker2 = Worker(mihomo_bin, with_dependencies(chosen_proxies, all_proxies),
                              hosts, iface)
-            worker2.start()
+            with measure(args,'worker_start') as timing:
+                timing['attempts']=1
+                worker2.start()
+                timing.update(successes=1,counters={'worker_count':1})
         except Exception as e:
             print(f"⚠️ Phase 2 worker 启动失败，保留 Phase 1 粗筛结果: {e}",
                   file=sys.stderr)
@@ -1482,6 +1795,14 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                     if cancel_requested():  # 面板哨兵文件：节点间检查
                         raise KeyboardInterrupt
                     try:
+                        if scoped_ip and r.name not in ip_names and not args.no_ip:
+                            # A worker fallback can enter the final detail set.
+                            # Its own exit requests finish before this worker
+                            # changes nodes; no cross-node in-flight requests.
+                            extra = _probe_node_in_worker(worker2,r.name,r.proto,args,r.latency_ms,r.jitter_ms)
+                            r.ip, r.exit_ipv4, r.exit_ipv6 = extra.ip, extra.exit_ipv4, extra.exit_ipv6
+                            if intel_enricher is not None:
+                                intel_enricher.submit_result(r)
                         _speed_node_in_worker(worker2, r, args)
                     except Exception as e:
                         r.status = f"error: {e}"[:160]
@@ -1489,6 +1810,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
                     # final Overall is recomputed after Intelligence joins.
                     r.score = compute_score(r)
                     r.tags = make_tags(r)
+                    publish_result(args,'node_measurement',r,phase_name='measuring',completed=i,total=len(chosen))
                     ip_txt = f" | {ip_brief(r.ip)}" if r.ip and r.ip.ok else ""
                     multi_brief = f" / {r.multi_mbps:.0f}" if r.multi_mbps else ""
                     mb_brief = f"（{r.sample_mb}MB 样本）" if r.sample_mb else ""
@@ -1501,21 +1823,53 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
             except KeyboardInterrupt:
                 # 保留已完成的精测结果，继续走报告
                 print("\n\n收到 Ctrl+C，停止精测（保留已完成结果，正在清理 worker）……")
+                args.cancelled = True
             finally:
-                worker2.stop()
+                with measure(args,'cleanup'):
+                    worker2.stop()
 
     # 汇总打分/标签：Phase 2 节点已算分；连通但未精测的标「未精测」而非「不通」
     measured = {r.name for r in chosen}
     for r in results:
+        if config:
+            r.measurement_scope = dict(mode=config.mode,
+                probe='completed' if r.probe_successes else 'failed',
+                bandwidth=('partial' if getattr(args,'cancelled',False) and (r.measurement_scope or {}).get('bandwidth')=='partial' else
+                           'completed' if r.median_mbps is not None else
+                           'cancelled' if getattr(args,'cancelled',False) and r.name in {c.name for c in chosen} else
+                           'failed' if r.sample_mb is not None else
+                           'not_selected' if config.bandwidth else 'not_requested'),
+                exit=('not_requested' if args.no_ip else
+                      'completed' if r.exit_ipv4 or r.exit_ipv6 else
+                      'failed' if r.name in ip_names or r.name in measured else 'not_selected'),
+                intel=('not_requested' if args.no_ip else
+                       (r.measurement_scope or {}).get('intel','pending') if r.name in ip_names or r.name in measured else 'not_selected'))
         if r.name in measured:
             continue
         r.score = compute_score(r)
         r.tags = make_tags(r)
         relabel_unmeasured(r)
 
+    for r in results:
+        scope=dict(r.measurement_scope or {})
+        scope['intel']='not_requested' if args.no_ip else scope.get('intel','pending')
+        if not config:
+            scope['bandwidth']=('partial' if scope.get('bandwidth')=='partial' and getattr(args,'cancelled',False) else
+                'completed' if r.median_mbps is not None else 'failed' if r.sample_mb is not None else
+                'cancelled' if getattr(args,'cancelled',False) and r.name in measured else 'not_selected')
+        r.measurement_scope=scope
+
     # Wait for the bounded, deduplicated provider pool only after all network
     # work has completed, then derive node-level worst-IP quality and Overall.
-    finish_intelligence_enrichment(intel_enricher, results)
+    if intel_enricher is None:
+        intel_enricher = start_intelligence_enrichment(results,args)
+    if not getattr(args,'cancelled',False) and not cancel_requested():milestone(args,'network_complete')
+    phase(args,'enriching')
+    with measure(args,'provider_wait'):
+        finish_intelligence_enrichment(intel_enricher, results)
+    if not getattr(args,'cancelled',False) and not cancel_requested():milestone(args,'intelligence_complete')
+    for r in results:
+        publish_result(args,'node_intelligence',r,phase_name='enriching')
 
     sample_desc = f"{args.mb}MB" if args.mb else "自适应10~95MB"
     if getattr(args, "multi", False):
@@ -1523,5 +1877,7 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
     scope = f"全部 {len(chosen)}" if getattr(args, "all", False) else f"Top {len(chosen)}"
     args.mode_summary = (f"两阶段：Phase1 {total} 节点并发粗筛 → "
                          f"Phase2 {scope} 节点串行精测（{sample_desc} ×{args.rounds} 轮）")
+    if config and not config.bandwidth:
+        args.mode_summary = f'IP 专项：{total} 节点连通性与出口画像，不请求带宽样本（带宽 N/A）'
     print(f"两阶段测速完成，总耗时 {time.time() - started:.1f}s")
     return results

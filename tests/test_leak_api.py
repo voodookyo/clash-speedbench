@@ -66,6 +66,24 @@ class CandidateEvaluatorTest(unittest.TestCase):
 
 
 class LeakApiTest(WebServerCase):
+    def test_csp_allows_only_explicit_browser_exit_sources_without_remote_scripts(self):
+        status,headers,_=self.request_full('GET','/')
+        self.assertEqual(status,200)
+        csp=headers['content-security-policy']
+        self.assertIn("script-src 'self';",csp)
+        self.assertIn("connect-src 'self' https://api.ipify.org https://api6.ipify.org;",csp)
+        self.assertNotIn('connect-src *',csp)
+
+    def test_saved_environment_is_bounded_reported_label_not_server_assertion(self):
+        for environment,expected in (('webview','webview'),('browser','browser'),('CANARY-KEY','unknown')):
+            captured=[]
+            with mock.patch.object(web,'_save_leak_audit',side_effect=lambda audit:captured.append(audit) or {'saved':True}),mock.patch.object(web,'LEAK_BASIC_LOOKUP',return_value={}):
+                status,_=self.post_eval({'candidates':[],'client_environment':environment},'/api/leak/audit')
+            self.assertEqual(status,200)
+            self.assertEqual(captured[0]['details']['client_environment'],expected)
+            self.assertTrue(captured[0]['details']['environment_reported_by_client'])
+            self.assertNotIn('CANARY-KEY',json.dumps(captured[0]))
+
     def post_eval(self, payload, path="/api/leak/evaluate", headers=None):
         h = {"X-SpeedBench-Token": web.WEB_TOKEN}
         h.update(headers or {})

@@ -7,7 +7,7 @@
     python3 speedbench_switch.py --name '节点名'   # 切换到指定节点
 
 历史记录默认读取同目录的 speedbench-history.jsonl，
-可用环境变量 SPEEDBENCH_HISTORY 覆盖；API secret 用环境变量 MIHOMO_SECRET 提供。
+可用环境变量 SPEEDBENCH_HISTORY 覆盖；控制器认证自动读取本机 Verge，MIHOMO_SECRET 可覆盖。
 """
 
 import argparse
@@ -18,11 +18,11 @@ from pathlib import Path
 
 from clash_speedbench import (
     ApiError,
-    MihomoAPI,
     build_selectable_graph,
-    detect_controller,
+    connect_controller,
     pick_switch_group,
 )
+from speedbench_controller import redact_text
 
 REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_HISTORY = REPO_DIR / "speedbench-history.jsonl"
@@ -30,7 +30,7 @@ ROOT_GROUP = "GLOBAL"
 
 
 def fail(msg: str) -> int:
-    print(f"❌ {msg}", file=sys.stderr)
+    print(redact_text(f"❌ {msg}"), file=sys.stderr)
     return 1
 
 
@@ -61,15 +61,10 @@ def load_best_name(history: Path) -> str:
 
 
 def switch_to(name: str) -> int:
-    secret = os.environ.get("MIHOMO_SECRET", "")
     try:
-        base, needs_secret = detect_controller(secret, None)
+        api = connect_controller()
     except ApiError as e:
         return fail(str(e))
-    if needs_secret and not secret:
-        return fail(f"{base} 需要访问密钥，请先设置环境变量 MIHOMO_SECRET 再重试。")
-
-    api = MihomoAPI(base, secret=secret)
     try:
         data = api.get("/proxies")
         proxies = data.get("proxies", {}) if isinstance(data, dict) else {}
@@ -85,12 +80,12 @@ def switch_to(name: str) -> int:
 
     try:
         if proxies.get(group, {}).get("now") == name:
-            print(f"✅ {group} 已是 {name}，无需变更。")
+            print(redact_text(f"✅ {group} 已是 {name}，无需变更。"))
             return 0
         api.select(group, name)
     except ApiError as e:
         return fail(f"切换失败: {e}")
-    print(f"✅ 已切换 {group} → {name}")
+    print(redact_text(f"✅ 已切换 {group} → {name}"))
     return 0
 
 

@@ -51,6 +51,14 @@ class TraversalTest(WebServerCase):
 
 
 class WhitelistTest(WebServerCase):
+    def test_shared_modules_served_with_javascript_mime_and_host_guard(self):
+        for name in ('profiles.js','tasks.js','view.js','preferences.js','releases.js','config-root.js'):
+            status, headers, body=self.request_full('GET','/static/'+name)
+            self.assertEqual(status,200)
+            self.assertIn('application/javascript',headers['content-type'])
+            self.assertEqual(body,(web.WEB_DIR/name).read_bytes())
+            self.assertEqual(self.request('GET','/static/'+name,headers={'Host':'evil.example'})[0],403)
+
     def test_non_whitelisted_paths_404(self):
         for path in ("/static/index.html",  # web/ 里真实存在，但不在白名单
                      "/static/other.txt",   # 白名单外文件名

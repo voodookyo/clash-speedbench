@@ -1,0 +1,7 @@
+{
+  "name": "clash-speedbench-desktop-build",
+  "version": "1.1.0-alpha.1",
+  "private": true,
+  "scripts": { "tauri": "tauri" },
+  "devDependencies": { "@tauri-apps/cli": "2.12.1" }
+}

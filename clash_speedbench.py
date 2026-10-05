@@ -26,6 +26,7 @@ import http.client
 import ipaddress
 import io
 import json
+import math
 import os
 import re
 import signal
@@ -33,14 +34,24 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import speedbench_controller as controller_config
+import speedbench_sources as source_catalog
+import speedbench_tasks
+import speedbench_profiles
+from speedbench_process import run_cancellable, cancellation_scope, current_cancellation, SocketCancellation, connect_socket
+from speedbench_progress import ProgressEmitter, DownloadCounter, ProbeObserver, phase, publish_result, measure, emit_metric, milestone
+from speedbench_jobs import safe_probe_sources, observed_metric_count, safe_metric_updated_at
 
 from speedbench_ip_intel import (
     IpIntelCache,
@@ -71,6 +82,7 @@ DEFAULT_CONTROLLERS = tuple(
 )
 DEFAULT_DELAY_URL = "https://cp.cloudflare.com/generate_204"
 DEFAULT_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
+CLEANUP_FAILED_EXIT = 3  # Owned worker cleanup failed; distinct from successful cancellation.
 DEFAULT_IPIFY4_URL = "https://api.ipify.org?format=json"
 DEFAULT_IPIFY6_URL = "https://api6.ipify.org?format=json"
 # ip-api.com 免费端点（仅 HTTP）；每个节点经各自出口 IP 查询，45 次/分钟限制足够
@@ -103,7 +115,9 @@ class UnixHTTPConnection(http.client.HTTPConnection):
     def connect(self) -> None:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
-        self.sock.connect(self.socket_path)
+        cancel=current_cancellation()
+        if cancel is None:self.sock.connect(self.socket_path)
+        else:connect_socket(self.sock,self.socket_path,cancel,time.monotonic()+self.timeout)
 
 
 # ---------------- Windows 命名管道传输（external-controller-pipe） ----------------
@@ -145,7 +159,7 @@ def _pipe_kernel32():
     return ctypes.WinDLL("kernel32", use_last_error=True)
 
 
-def _open_pipe_handle(pipe_name: str) -> int:
+def _open_pipe_handle(pipe_name: str, *, overlapped: bool = False) -> int:
     """打开命名管道，返回 Win32 句柄；失败抛 OSError。
 
     先试标准的 CreateFileW(\\\\.\\pipe\\<name>)；真机验收实测：mihomo 以服务
@@ -160,8 +174,9 @@ def _open_pipe_handle(pipe_name: str) -> int:
     kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                                      wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
                                      wintypes.HANDLE]
+    flags = 0x40000000 if overlapped else 0  # FILE_FLAG_OVERLAPPED
     handle = kernel32.CreateFileW("\\\\.\\pipe\\" + pipe_name, _PIPE_GENERIC_RW,
-                                  _PIPE_SHARE_RW, None, _PIPE_OPEN_EXISTING, 0, None)
+                                  _PIPE_SHARE_RW, None, _PIPE_OPEN_EXISTING, flags, None)
     if handle != _INVALID_HANDLE_VALUE:
         return handle
     # Win32 路径解析失败（真机实测 err 3）：回退原生 NT 路径
@@ -183,6 +198,8 @@ def _open_pipe_handle(pipe_name: str) -> int:
     attrs.Attributes = _PIPE_CASE_INSENSITIVE
     out_handle = wintypes.HANDLE()
     iosb = _IO_STATUS_BLOCK()
+    # CreateOptions=0 keeps the NT fallback asynchronous (no synchronous-I/O
+    # option); scoped callers can use the same OVERLAPPED operations here.
     status = ntdll.NtCreateFile(ctypes.byref(out_handle),
                                 _PIPE_GENERIC_RW | _PIPE_SYNCHRONIZE,
                                 ctypes.byref(attrs), ctypes.byref(iosb),
@@ -238,15 +255,18 @@ class _PipeRawReader(io.RawIOBase):
     由本对象的 close() 在响应读完时真正关句柄。
     """
 
-    def __init__(self, handle: int):
+    def __init__(self, handle: int, pipe_io=None):
         super().__init__()
         self._handle: Optional[int] = handle
+        self._pipe_io = pipe_io
 
     def readable(self) -> bool:
         return True
 
     def readinto(self, b) -> int:
-        data = _pipe_read(self._handle, len(b))
+        if self.closed:
+            raise ValueError("I/O on closed pipe reader")
+        data = self._pipe_io.read(len(b)) if self._pipe_io is not None else _pipe_read(self._handle, len(b))
         b[: len(data)] = data
         return len(data)
 
@@ -262,30 +282,34 @@ class _PipeSock:
 
     http.client 只调用 sendall()/makefile("rb")/close()。makefile("rb") 把句柄
     所有权移交给返回的文件对象（见 _PipeRawReader），此后 close() 不再管句柄。
-    管道读写是阻塞式 Win32 调用、没有 socket 意义上的超时（settimeout 收下来
-    但不生效）；/delay 等 API 的服务端 timeout 参数兜底，mihomo 总会在有限
-    时间内应答。
+    取消作用域内使用独立 OVERLAPPED 读写；作用域外保留原同步 plumbing，
+    不使恢复写操作依赖任务取消标志。
     """
 
-    def __init__(self, handle: int):
+    def __init__(self, handle: int, pipe_io=None):
         self._handle: Optional[int] = handle
+        self._pipe_io = pipe_io
 
     def sendall(self, data) -> None:
         if self._handle is None:
             raise OSError("管道句柄已移交或关闭")
-        _pipe_write_all(self._handle, bytes(data))
+        if self._pipe_io is not None:
+            self._pipe_io.write_all(bytes(data))
+        else:
+            _pipe_write_all(self._handle, bytes(data))
 
     def makefile(self, mode, buffering=None):
         if mode != "rb":
             raise ValueError("管道 socket 外观只支持 makefile(\"rb\")")
         if self._handle is None:
             raise OSError("管道句柄已移交或关闭")
-        rfile = io.BufferedReader(_PipeRawReader(self._handle), buffer_size=65536)
+        rfile = io.BufferedReader(_PipeRawReader(self._handle, self._pipe_io), buffer_size=65536)
         self._handle = None  # 句柄所有权随读侧文件移交
         return rfile
 
-    def settimeout(self, _timeout) -> None:
-        pass  # 命名管道不支持，见类注释
+    def settimeout(self, timeout) -> None:
+        if self._pipe_io is not None:
+            self._pipe_io.timeout = timeout
 
     def close(self) -> None:
         if self._handle is not None:
@@ -301,12 +325,28 @@ class WinPipeHTTPConnection(http.client.HTTPConnection):
         self.pipe_name = pipe_name
 
     def connect(self) -> None:
-        self.sock = _PipeSock(_open_pipe_handle(self.pipe_name))
+        cancel = current_cancellation()
+        if cancel is None:
+            self.sock = _PipeSock(_open_pipe_handle(self.pipe_name))
+            return
+        if cancel():
+            raise KeyboardInterrupt
+        from speedbench_pipe import PipeIO
+        handle = _open_pipe_handle(self.pipe_name, overlapped=True)
+        try:
+            pipe_io = PipeIO(handle, cancel, self.timeout)
+            if cancel():
+                raise KeyboardInterrupt
+            self.sock = _PipeSock(handle, pipe_io)
+        except BaseException:
+            _pipe_close(handle)
+            raise
 
 
 class MihomoAPI:
     def __init__(self, base: str, secret: str = "", timeout: float = 5.0):
         base = base.rstrip("/")
+        self.controller_base = base
         self.unix_path: Optional[str] = None
         self.pipe_name: Optional[str] = None
         if base.startswith("unix://"):
@@ -319,6 +359,9 @@ class MihomoAPI:
         else:
             self.base = base
         self.secret = secret
+        if not controller_config.valid_secret(secret):
+            raise ApiError("Controller Secret 含非法字符，请检查密钥")
+        controller_config.remember_secret(secret)
         self.timeout = timeout
 
     def request(self, method: str, path: str, data: Optional[dict] = None) -> Any:
@@ -344,24 +387,33 @@ class MihomoAPI:
                 conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80,
                                                   timeout=self.timeout)
 
+        resp=None
+        monitor=SocketCancellation(conn,current_cancellation())
         try:
-            conn.request(method, path, body=body, headers=headers)
-            resp = conn.getresponse()
-            raw = resp.read()
+            with monitor:
+                conn.request(method, path, body=body, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+                monitor.check()
         except (OSError, http.client.HTTPException) as e:
-            raise ApiError(f"{method} {path}: {e}") from e
+            monitor.check()
+            raise ApiError(controller_config.redact_text(f"{method} {path}: {e}", (self.secret,))) from None
         finally:
+            if resp is not None:resp.close()
             conn.close()
 
         if resp.status in (401, 403):
             raise Unauthorized(f"Controller returned HTTP {resp.status}")
         if resp.status >= 400:
-            detail = raw.decode("utf-8", "replace")[:500]
+            detail = controller_config.redact_text(raw.decode("utf-8", "replace"), (self.secret,))[:500]
             raise ApiError(f"{method} {path}: HTTP {resp.status}: {detail}")
         if not raw:
             return None
         if raw[:1] in (b"{", b"["):
-            return json.loads(raw.decode("utf-8"))
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                raise ApiError(f"{method} {path}: Controller 返回了无效 JSON") from None
         return raw.decode("utf-8", "replace")
 
     def get(self, path: str) -> Any:
@@ -385,7 +437,10 @@ class MihomoAPI:
     def proxy_delay(self, name: str, url: str, timeout_ms: int) -> Optional[int]:
         params = urllib.parse.urlencode({"url": url, "timeout": timeout_ms})
         try:
-            result = self.get(self.encoded_proxy_path(name) + "/delay?" + params)
+            # Only the read-only probe is cancellable. Restoration/selection
+            # calls outside this scope must still run after cancellation.
+            with cancellation_scope(cancel_requested):
+                result = self.get(self.encoded_proxy_path(name) + "/delay?" + params)
             return int(result["delay"])
         except Exception:
             return None
@@ -425,6 +480,7 @@ class ProbeStats:
     attempts: int = 0
     successes: int = 0
     failures: int = 0
+    updated_at_ms: Optional[int] = None  # actual probe observation, never a duration
 
     def __post_init__(self) -> None:
         self.attempts = max(0, int(self.attempts))
@@ -537,6 +593,52 @@ class Result:
     ip_quality_score: Optional[float] = None
     ip_grade: Optional[str] = None
     dual_stack_inconsistent: bool = False
+    origin: Optional[dict] = None          # safe, versioned source/identity fields
+    measurement_scope: Optional[dict] = None
+    download_bytes: Optional[int] = None  # observed curl bytes, not requested sample size
+    exit_status: Optional[dict] = None
+    probe_sources: Optional[dict] = None  # independent main/worker/serial observations
+    metric_updated_at: Optional[dict] = None  # display-only epoch ms per measured metric
+
+
+# Display-only update boundaries.  These timestamps describe *when* a raw
+# dimension was last observed; they never feed durations, budgets or ranking,
+# which keep their existing monotonic clocks.
+METRIC_UPDATE_KEYS = ('probe', 'bandwidth', 'exit', 'intel', 'network', 'ip_grade')
+# The raw observed dimensions counted by ``measured_metric_count``.  Derived
+# score/network_score/grade are deliberately excluded.
+
+
+def metric_updated_now() -> int:
+    """Wall-clock epoch milliseconds for display metadata only."""
+    return int(time.time() * 1000)
+
+
+def stamp_metric(result: Optional[Result], *keys: str,
+                 advance: bool = True) -> Optional[Result]:
+    """Record display completion times for the given supported metric keys.
+
+    ``advance=False`` keeps the first observation so re-applying already
+    measured probe stats (for example while finalizing a serial result) cannot
+    move a network boundary that enrichment did not observe.
+    """
+    if result is None:
+        return result
+    value = metric_updated_now()
+    current = dict(getattr(result, 'metric_updated_at', None) or {})
+    for key in keys:
+        if key not in METRIC_UPDATE_KEYS:
+            continue
+        if advance or key not in current:
+            current[key] = value
+    if current:
+        result.metric_updated_at = current
+    return result
+
+
+def metric_updated_dict(result: Optional[Result]) -> dict:
+    """Whitelisted, finite, non-negative display timestamps only."""
+    return safe_metric_updated_at(getattr(result, 'metric_updated_at', None)) or {}
 
 
 def detect_controller(secret: str, explicit: Optional[str]) -> Tuple[str, bool]:
@@ -564,9 +666,97 @@ def get_secret_if_needed(base: str, secret: str, needs_secret: bool) -> str:
         return secret
     if secret:
         return secret
+    if sys.stdin is None or not sys.stdin.isatty():
+        raise ApiError("Controller 需要访问密钥；请检查本机 Clash Verge 配置或设置 MIHOMO_SECRET")
     print(f"\n检测到 {base}，但 API 需要访问密钥。")
     print("可在 Clash Verge Rev → Clash 设置 → 外部控制 中查看/设置访问密钥。")
     return getpass.getpass("请输入 External Controller Secret（输入时不显示）: ").strip()
+
+
+def connect_controller(secret: Optional[str] = None, explicit: Optional[str] = None,
+                       interactive: bool = False, config_root: Optional[str] = None) -> MihomoAPI:
+    """Resolve endpoint/key together and verify before any business operation.
+
+    None means no command-line override. An explicitly empty argument or
+    environment variable deliberately disables auto credentials. Refresh is
+    bounded and only applies to auto configuration, never to API writes.
+    """
+    from speedbench_config import ENV as root_env, validate_root, ConfigRootError
+    selected=os.environ.get(root_env,'') if config_root is None else config_root
+    try:selected=validate_root(selected)
+    except ConfigRootError:raise ApiError('自定义 Verge 配置目录不可用；请重新选择，未回退到默认目录') from None
+    manual = secret if secret is not None else os.environ.get("MIHOMO_SECRET")
+    if manual is not None and not controller_config.valid_secret(manual):
+        raise ApiError("Controller Secret 含非法字符，请检查 --secret / MIHOMO_SECRET")
+    if manual is not None:
+        controller_config.remember_secret(manual)
+    explicit_base = controller_config.canonical_explicit(explicit) if explicit else None
+    unauthorized = None
+    warnings = []
+    attempted = []
+    for refresh in range(2):
+        try:
+            discovered, warnings = (controller_config.discover_targets(config_root=selected)
+                                    if config_root is not None or os.environ.get(root_env) else
+                                    controller_config.discover_targets())
+        except ConfigRootError:
+            raise ApiError('自定义 Verge 目录已失效；未连接其他控制器') from None
+        targets = []
+        if explicit_base:
+            bound = [t for t in discovered if t.base == explicit_base]
+            if selected and not bound:
+                raise ApiError('指定控制器与自定义目录不匹配；不会连接其他控制器')
+            if bound:
+                targets = bound
+            else:
+                targets = [controller_config.ControllerTarget(explicit_base)]
+        else:
+            targets = list(discovered)
+            declared = {t.base for t in targets}
+            if not selected:
+                targets.extend(controller_config.ControllerTarget(base) for base in DEFAULT_CONTROLLERS
+                               if base not in declared)
+        seen = set()
+        auto_failed = False
+        for target in targets:
+            actual_secret = manual if manual is not None else target.secret
+            identity = (target.base, actual_secret)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if target.base.startswith("unix://") and not os.path.exists(target.base[7:]):
+                continue
+            attempted.append(target.base)
+            api = MihomoAPI(target.base, secret=actual_secret)
+            api.controller_source = "manual" if manual is not None else target.source
+            try:
+                api.get("/version")
+                return api
+            except Unauthorized:
+                if unauthorized is None:
+                    unauthorized = api
+                if manual is None and target.source == "verge_config":
+                    auto_failed = True
+            except ApiError:
+                continue
+        if refresh or not auto_failed:
+            break
+    if unauthorized is not None:
+        if manual is None and interactive and sys.stdin is not None and sys.stdin.isatty():
+            entered = getpass.getpass("请输入 External Controller Secret（输入时不显示）: ")
+            api = MihomoAPI(unauthorized.controller_base, secret=entered.strip())
+            try:
+                api.get("/version")
+                return api
+            except ApiError:
+                raise ApiError("Controller 认证失败，请检查输入的访问密钥") from None
+        if manual is not None:
+            raise ApiError("Controller 认证失败：请检查 --secret / MIHOMO_SECRET；手动设置优先于自动配置")
+        raise ApiError("Controller 需要有效访问密钥；请检查 Clash Verge 外部控制设置、本机运行配置或设置 MIHOMO_SECRET")
+    detail = "；".join(warnings)
+    candidates = controller_config.redact_text(", ".join(dict.fromkeys(attempted)))
+    raise ApiError("找不到 Mihomo External Controller。已尝试: " + candidates
+                   + "\n请确认 Clash Verge 正在运行并开启外部控制。" + detail)
 
 
 def leaf_nodes(proxies: Dict[str, dict]) -> Dict[str, dict]:
@@ -659,13 +849,14 @@ _CANCEL_FILE = os.environ.get("SPEEDBENCH_CANCEL_FILE", "")
 
 
 def cancel_requested() -> bool:
-    """面板是否请求中断（哨兵文件出现）。未设置环境变量时恒为 False。"""
-    return bool(_CANCEL_FILE) and os.path.exists(_CANCEL_FILE)
+    """哨兵取消或私有父进程管道断开；独立 CLI 没有隐式父进程监控。"""
+    from speedbench_owner import parent_disconnected
+    return parent_disconnected() or (bool(_CANCEL_FILE) and os.path.exists(_CANCEL_FILE))
 
 
 def clear_cancel_request() -> None:
     """启动时清掉上一轮残留的哨兵文件，否则一开场就会被误判为已取消。"""
-    if not _CANCEL_FILE:
+    if not _CANCEL_FILE or os.environ.get('SPEEDBENCH_CANCEL_PRIMED') == '1':
         return
     try:
         os.unlink(_CANCEL_FILE)
@@ -683,6 +874,16 @@ def _no_window_kwargs() -> dict:
         if flags:
             return {"creationflags": flags}
     return {}
+
+
+def run_external(cmd, **kwargs):
+    from speedbench_owner import delegated_active
+    channel=cancel_requested if _CANCEL_FILE or delegated_active() else None
+    scoped=current_cancellation()
+    if scoped is not None:
+        callback=lambda:scoped() or (channel is not None and channel())
+    else:callback=channel
+    return run_cancellable(cmd,cancel=callback,**kwargs)
 
 
 def curl_speed(proxy_url: str, download_url: str, max_time: float,
@@ -710,7 +911,7 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
     try:
         # 钉 UTF-8：中文 Windows 的默认 GBK 解码遇到 curl 输出里的非 GBK 字节
         # 会在 subprocess 读取线程里炸 UnicodeDecodeError（真机实测）
-        p = subprocess.run(cmd, text=True, capture_output=True,
+        p = run_external(cmd, text=True, capture_output=True,
                            encoding="utf-8", errors="replace",
                            timeout=max_time + connect_timeout + 5,
                            **_no_window_kwargs())
@@ -755,12 +956,15 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
 WARMUP_BYTES = 1_000_000  # ~1MB 预热请求，用于估粗速度
 
 
-def warmup_speed(proxy_url: str, connect_timeout: float) -> Optional[float]:
+def warmup_speed(proxy_url: str, connect_timeout: float, on_sample=None, on_attempt=None) -> Optional[float]:
     """~1MB 轻量下载估粗速度（Mbps），供自适应样本大小参考；失败返回 None。"""
     url = (DEFAULT_DOWNLOAD_URL.format(bytes=WARMUP_BYTES)
            + f"&measId=warmup-{int(time.time()*1000)}")
-    mbps, _, _, _ = curl_speed(proxy_url, url, max_time=5.0,
+    if on_attempt is not None:on_attempt()
+    mbps, _, _, size = curl_speed(proxy_url, url, max_time=5.0,
                                connect_timeout=connect_timeout)
+    if on_sample is not None:
+        on_sample(mbps,size)
     return mbps
 
 
@@ -784,12 +988,15 @@ def adaptive_sample(rough_mbps: Optional[float],
 
 
 def multi_stream_speed(proxy_url: str, byte_count: int, max_time: float,
-                       connect_timeout: float, streams: int = 4) -> Optional[float]:
+                       connect_timeout: float, streams: int = 4, on_sample=None, on_attempt=None) -> Optional[float]:
     """同一节点 streams 路并发 curl，合计带宽 Mbps（峰值参考）；全部失败返回 None。"""
     def one(i: int) -> Optional[float]:
         url = (DEFAULT_DOWNLOAD_URL.format(bytes=byte_count)
                + f"&measId=multi-{int(time.time()*1000)}-{i}")
-        mbps, _, _, _ = curl_speed(proxy_url, url, max_time, connect_timeout)
+        if on_attempt is not None:on_attempt()
+        mbps, _, _, size = curl_speed(proxy_url, url, max_time, connect_timeout)
+        if on_sample is not None:
+            on_sample(mbps,size)
         return mbps
 
     with ThreadPoolExecutor(max_workers=streams) as pool:
@@ -826,7 +1033,7 @@ def _coerce_probe_stats(value: Any, attempts: Optional[int] = None) -> ProbeStat
 
 
 def probe_latency(api: MihomoAPI, name: str, timeout_ms: int,
-                  count: int = 3) -> ProbeStats:
+                  count: int = 3, on_sample=None, on_attempt=None,cancel=None) -> ProbeStats:
     """Run independent application-level probes and retain failure counters.
 
     A failed HTTP/HTTPS probe does not stop the remaining attempts.  The
@@ -834,31 +1041,59 @@ def probe_latency(api: MihomoAPI, name: str, timeout_ms: int,
     pair, while exposing attempts/successes/failures and percentages for new
     callers.  This is *not* ICMP packet loss measurement.
     """
-    attempts = max(1, int(count))
+    requested = max(1, int(count))
     vals: List[float] = []
     failures = 0
-    for _ in range(attempts):
-        try:
-            d = api.proxy_delay(name, DEFAULT_DELAY_URL, timeout_ms)
-        except Exception:
-            d = None
-        if d is None:
-            failures += 1
-            continue
-        try:
-            vals.append(float(d))
-        except (TypeError, ValueError):
-            failures += 1
-    if not vals:
-        return ProbeStats(None, None, attempts, 0, failures)
-    jitter = statistics.stdev(vals) if len(vals) > 1 else 0.0
-    return ProbeStats(
-        int(round(statistics.median(vals))),
-        round(jitter, 1),
-        attempts,
-        len(vals),
-        failures,
-    )
+    def snapshot():
+        return ProbeStats(int(round(statistics.median(vals))) if vals else None,
+            round(statistics.stdev(vals),1) if len(vals)>1 else 0.0 if vals else None,
+            len(vals)+failures,len(vals),failures,
+            metric_updated_now() if vals or failures else None)
+    try:
+        for index in range(requested):
+            if cancel_requested() or (cancel is not None and cancel()):raise KeyboardInterrupt
+            if on_attempt is not None:on_attempt()
+            try:
+                with cancellation_scope(cancel):
+                    d=api.proxy_delay(name,DEFAULT_DELAY_URL,timeout_ms)
+            except Exception:d=None
+            try:
+                value=float(d)
+                if isinstance(d,bool) or not math.isfinite(value) or value<0:raise ValueError
+                vals.append(value)
+            except (TypeError,ValueError,OverflowError):failures+=1
+            if on_sample is not None:on_sample(snapshot(),index==requested-1)
+    except KeyboardInterrupt:
+        if on_sample is not None:on_sample(snapshot(),False)
+        raise
+    return snapshot()
+
+
+def observed_probe(api,name,timeout_ms,args,*,source,metric='',proto='',provider='',
+                   count=None,on_update=None,probe_function=None,cancel=None):
+    """Adapt the unchanged probe requests to retention/metrics, no retry after I/O."""
+    requested=_probe_count_from_args(args) if count is None else max(1,int(count))
+    function=probe_latency if probe_function is None else probe_function
+    enabled=(getattr(args,'progress',None) is not None or getattr(args,'_result_journal',None) is not None
+             or on_update is not None)
+    with measure(args,metric) if metric else nullcontext(None) as counts:
+        observer=ProbeObserver(args,name,proto,provider,source,requested,counts,on_update) if enabled else None
+        options=dict(count=requested)
+        if cancel is not None:options['cancel']=cancel
+        if observer is not None:options.update(on_sample=observer.sample,on_attempt=observer.start)
+        try:raw=function(api,name,timeout_ms,**options)
+        except TypeError:
+            # A tiny old adapter may reject the observer keywords. Once a real
+            # request began, TypeError is NOT permission to repeat probes.
+            if observer is not None and observer.started:raise
+            if observer is not None:
+                try:raw=function(api,name,timeout_ms,count=requested)
+                except TypeError:raw=function(api,name,timeout_ms)
+            else:raw=function(api,name,timeout_ms)
+        stats=_coerce_probe_stats(raw,attempts=requested)
+        if observer is not None and not observer.observed:observer.sample(stats,True)
+        elif counts is not None and observer is None:counts.update(attempts=stats.attempts,successes=stats.successes)
+        return stats
 
 
 def _apply_probe_stats(result: Result, stats: Any,
@@ -876,6 +1111,13 @@ def _apply_probe_stats(result: Result, stats: Any,
         result.latency_ms = probe.latency_ms
     if result.jitter_ms is None and probe.jitter_ms is not None:
         result.jitter_ms = probe.jitter_ms
+    if probe.attempts > 0:
+        if probe.updated_at_ms is None:probe.updated_at_ms=metric_updated_now()
+        times=dict(result.metric_updated_at or {})
+        times.setdefault('probe',probe.updated_at_ms);times.setdefault('network',probe.updated_at_ms)
+        result.metric_updated_at=times
+        result.measurement_scope=dict(result.measurement_scope or {},
+            probe='completed' if probe.successes else 'failed')
     return result
 
 
@@ -896,7 +1138,7 @@ def fetch_ip_info(proxy_url: str, timeout: float) -> Optional[dict]:
     try:
         # 钉 UTF-8：ip-api 返回体是 UTF-8 JSON（lang=zh-CN 时含中文地名），
         # 中文 Windows 按 GBK 解码必炸 UnicodeDecodeError（真机实测）
-        p = subprocess.run(cmd, text=True, capture_output=True,
+        p = run_external(cmd, text=True, capture_output=True,
                            encoding="utf-8", errors="replace",
                            timeout=timeout + 5,
                            **_no_window_kwargs())
@@ -932,7 +1174,7 @@ def fetch_exit_ip(proxy_url: str, timeout: float,
         "--max-time", str(timeout), url,
     ]
     try:
-        p = subprocess.run(
+        p = run_external(
             cmd, text=True, capture_output=True, encoding="utf-8",
             errors="replace", timeout=timeout + 5, **_no_window_kwargs()
         )
@@ -970,7 +1212,7 @@ def _coerce_exit_family(value: Any, version: int) -> Optional[str]:
     return str(parsed) if parsed.version == version else None
 
 
-def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
+def fetch_exit_ips(proxy_url: str, timeout: float, on_result=None, progress_args=None) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
     """Return ``(IPv4, IPv6, legacy ip-api payload)`` for one tested node.
 
     The independent exit requests run together so a slow IPv6-only endpoint
@@ -982,6 +1224,14 @@ def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optio
     ip-api leaves both ipify probes active and returns a ``None`` legacy value.
     """
     ip_api_enabled = load_provider_config().ip_api_enabled
+    values = {}
+    def request(name,function,*params):
+        metric_name = dict(ipv4='exit_v4',ipv6='exit_v6',legacy='basic_intel')[name]
+        with measure(progress_args,metric_name) as counts:
+            counts['attempts'] = 1
+            value = function(*params)
+            counts['successes'] = int(value is not None)
+            return value
     # Keep the legacy ip-api self lookup alongside both ipify calls only when
     # enabled: it remains the documented IPv4 fallback, while a slow/failed
     # source cannot multiply the per-node timeout.  Each worker is independent
@@ -989,21 +1239,30 @@ def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optio
     # node measurement.
     with ThreadPoolExecutor(max_workers=3 if ip_api_enabled else 2) as pool:
         futures = {
-            "ipv4": pool.submit(fetch_exit_ip, proxy_url, timeout, False),
-            "ipv6": pool.submit(fetch_exit_ip, proxy_url, timeout, True),
+            "ipv4": pool.submit(request,'ipv4',fetch_exit_ip, proxy_url, timeout, False),
+            "ipv6": pool.submit(request,'ipv6',fetch_exit_ip, proxy_url, timeout, True),
         }
         if ip_api_enabled:
-            futures["legacy"] = pool.submit(fetch_ip_info, proxy_url, timeout)
+            futures["legacy"] = pool.submit(request,'legacy',fetch_ip_info, proxy_url, timeout)
 
-        def read(name: str):
+        names = {future:name for name,future in futures.items()}
+        for future in as_completed(names):
+            name = names[future]
             try:
-                return futures[name].result()
+                value = future.result()
             except Exception:
-                return None
+                value = None
+            if name != 'legacy':
+                value = _coerce_exit_family(value,4 if name=='ipv4' else 6)
+            elif not isinstance(value,dict):
+                value = None
+            values[name] = value
+            if on_result is not None:
+                on_result(name,value,'completed' if value else 'failed')
 
-    ipv4 = _coerce_exit_family(read("ipv4"), 4)
-    legacy = read("legacy") if ip_api_enabled else None
-    ipv6 = _coerce_exit_family(read("ipv6"), 6)
+    ipv4 = values.get('ipv4')
+    legacy = values.get('legacy')
+    ipv6 = values.get('ipv6')
 
     # Keep the fallback after all requests are joined.  Do not trust an
     # arbitrary ip-api query value: validate that it really is IPv4 so a
@@ -1014,6 +1273,8 @@ def fetch_exit_ips(proxy_url: str, timeout: float) -> Tuple[Optional[str], Optio
             parsed = ipaddress.ip_address(str(candidate).strip())
             if parsed.version == 4:
                 ipv4 = str(parsed)
+                if on_result is not None:
+                    on_result('ipv4',ipv4,'completed')
         except (TypeError, ValueError):
             pass
     return ipv4, ipv6, legacy
@@ -1254,6 +1515,23 @@ def _apply_intelligence(result: Result, intel_by_ip: Dict[str, IpIntelligence]) 
     worst = min(usable, key=_intel_risk_key) if usable else None
     result.ip_quality_score = worst.ip_quality_score if worst else None
     result.ip_grade = worst.ip_grade if worst else None
+    # Only actual attached provider results count as an intelligence
+    # completion; a reporting/node_intelligence event or a pending/cancelled
+    # request must not fabricate a timestamp.  A grade stamp needs a real grade.
+    attached=[i for i in (result.intel_v4,result.intel_v6) if i is not None]
+    statuses=[status for i in attached for status in i.provider_status.values()]
+    usable_grade=(isinstance(result.ip_quality_score,(int,float)) and not isinstance(result.ip_quality_score,bool)
+        and math.isfinite(result.ip_quality_score) and 0<=result.ip_quality_score<=100 and result.ip_grade in ('S','A','B','C','D'))
+    if attached:
+        state='completed' if usable_grade or 'ok' in statuses else 'not_requested' if statuses and all(
+            status in ('disabled','key_missing') for status in statuses) else 'failed'
+        if state=='completed' and any(address and intel is None for address,intel in (
+                (result.exit_ipv4,result.intel_v4),(result.exit_ipv6,result.intel_v6))):state='partial'
+        result.measurement_scope=dict(result.measurement_scope or {},intel=state)
+        if state!='not_requested' and (statuses or usable_grade):stamp_metric(result,'intel')
+    elif (result.measurement_scope or {}).get('intel') not in ('not_requested','not_selected','cancelled','interrupted'):
+        result.measurement_scope=dict(result.measurement_scope or {},intel='failed')
+    if usable_grade:stamp_metric(result,'ip_grade')
 
     comparable: Dict[str, set] = {"country": set(), "asn": set(), "category": set()}
     for intel in (result.intel_v4, result.intel_v6):
@@ -1279,13 +1557,17 @@ class _IntelEnrichment:
     """
 
     def __init__(self, args: Any):
+        self.args=args
+        self._cancelled=threading.Event()
         history_value = getattr(args, "history", None)
         history = Path(history_value) if history_value else Path(__file__).with_name(
             "speedbench-history.jsonl"
         )
-        self.cache = IpIntelCache(history.with_suffix(".db"))
+        with measure(args,'intel_cache'):
+            self.cache = IpIntelCache(history.with_suffix(".db"),observer=self._observe)
         timeout = float(getattr(args, "ip_timeout", 8.0) or 8.0)
         self.providers = make_default_providers(timeout=timeout)
+        for provider in self.providers:provider.observer=self._observe
         configured = getattr(args, "intel_workers", 3)
         try:
             workers = max(2, min(4, int(configured)))
@@ -1294,12 +1576,19 @@ class _IntelEnrichment:
         self.pool = ThreadPoolExecutor(max_workers=workers)
         self.futures: Dict[str, Any] = {}
         self.values: Dict[str, IpIntelligence] = {}
+        owned=getattr(args,'_owned_intel_pools',None)
+        if owned is not None:owned.append(self)
 
     def _query_one(self, ip: str) -> IpIntelligence:
+        self._observe('intel_cache',dict(counters={'unique_ips':1}))
         provider_results = self.cache.query_many(
-            ip, self.providers, max_workers=1
+            ip, self.providers, max_workers=1,cancel=lambda:self._cancelled.is_set() or
+                bool(getattr(self.args,'cancelled',False)) or cancel_requested()
         )
         return aggregate_ip_intelligence(ip, provider_results)
+
+    def _observe(self,name,metric):
+        emit_metric(self.args,name,metric)
 
     def submit_ip(self, ip: Optional[str]) -> None:
         if not ip or ip in self.futures:
@@ -1332,6 +1621,12 @@ class _IntelEnrichment:
                     self.values[ip] = value
         finally:
             self.pool.shutdown(wait=True)
+
+    def close(self) -> None:
+        """Cancel unstarted queries and join cache writers before lease release."""
+        self._cancelled.set()
+        for future in self.futures.values():future.cancel()
+        self.finish()
 
     def apply(self, results: List[Result]) -> None:
         for result in results:
@@ -1370,6 +1665,10 @@ def finish_intelligence_enrichment(enricher: Optional[_IntelEnrichment],
                                    results: List[Result]) -> None:
     if enricher is None:
         for result in results:
+            scope=dict(result.measurement_scope or {})
+            if scope.get('intel') not in ('not_requested','not_selected','cancelled','interrupted'):
+                scope['intel']='failed'
+            result.measurement_scope=scope
             compute_score(result)
             result.tags = make_tags(result)
         return
@@ -1387,7 +1686,9 @@ def star_str(score: float) -> str:
 def make_tags(r: Result) -> str:
     tags = []
     if r.median_mbps is None:
-        tags.append("不通")
+        scope = (r.measurement_scope or {}).get('bandwidth')
+        tags.append('未精测' if scope=='not_selected' else '未请求带宽' if scope=='not_requested' else
+                    '已取消' if scope=='cancelled' else '未完成' if scope in ('interrupted','partial') else "不通")
     else:
         if r.median_mbps < 5:
             tags.append("龟速")
@@ -1447,19 +1748,30 @@ def clip_disp(s: str, width: int) -> str:
     return "".join(out) + "…"
 
 
-def rank_results(results: List[Result]) -> List[Result]:
+def rank_results(results: List[Result], target_profile='balanced') -> List[Result]:
+    if target_profile!='balanced' or any((r.measurement_scope or {}).get('mode') in
+                                        ('quick','standard','deep','ip') for r in results):
+        pairs=[(result_to_dict(r),r) for r in results]
+        by_identity={id(row):r for row,r in pairs}
+        return [by_identity[id(row)] for row in speedbench_profiles.rank([row for row,_ in pairs],target_profile)]
+    def coverage(r):
+        scope = r.measurement_scope or {}
+        if scope.get('mode') in ('quick','standard','deep'):
+            return {'completed':2,'failed':1}.get(scope.get('bandwidth'),0)
+        return 0
     return sorted(
         results,
-        key=lambda r: (-r.score, r.latency_ms if r.latency_ms is not None else 999999),
+        key=lambda r: (-coverage(r), -r.score, r.latency_ms if r.latency_ms is not None else 999999),
     )
 
 
-def print_speedbench(results: List[Result], top: int) -> None:
-    ranked = rank_results(results)
+def print_speedbench(results: List[Result], top: int, target_profile='balanced') -> None:
+    ranked = rank_results(results,target_profile=target_profile)
     shown = ranked[:top] if top > 0 else ranked
 
     headers = ["节点", "延迟", "抖动", "建连", "带宽", "Network", "Overall",
                "IP Grade", "IP画像", "应用层失败率", "标签"]
+    if target_profile!='balanced':headers.append('目标分')
 
     def row_of(r: Result) -> List[str]:
         ip_desc = ip_brief(r.ip) if r.ip and r.ip.ok else "-"
@@ -1484,6 +1796,10 @@ def print_speedbench(results: List[Result], top: int) -> None:
         ]
 
     rows = [row_of(r) for r in shown]
+    if target_profile!='balanced':
+        for row,result in zip(rows,shown):
+            value=speedbench_profiles.score(result_to_dict(result),target_profile)
+            row.append('-' if value is None else f'{value:.1f}')
     n = len(headers)
     widths = [disp_width(h) for h in headers]
     for row in rows:
@@ -1510,24 +1826,26 @@ def print_speedbench(results: List[Result], top: int) -> None:
     print("  延迟/抖动/建连单位 ms │ 带宽 = 单流 Mbps（/ 后为 --multi 4 路合计峰值） │ 应用层失败率 = HTTP/HTTPS application-level probe failure rate（非 ICMP packet loss）")
 
 
-def write_csv(results: List[Result], path: Path) -> None:
-    ranked = rank_results(results)
+def write_csv(results: List[Result], path: Path, target_profile='balanced') -> None:
+    ranked = rank_results(results,target_profile=target_profile)
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["rank", "name", "provider", "protocol", "latency_ms", "jitter_ms",
+        headers=["rank", "name", "provider", "protocol", "latency_ms", "jitter_ms",
                     "connect_ms", "median_mbps", "multi_mbps", "best_mbps", "sample_mb",
                     "all_samples_mbps", "network_score", "ip_quality_score", "ip_grade",
                     "score", "stars", "tags", "probe_attempts", "probe_successes",
                     "probe_failures", "probe_success_rate", "probe_loss_pct",
                     "exit_ipv4", "exit_ipv6",
                     "exit_ip", "country", "asn", "asname", "isp", "org",
-                    "ip_kind", "ip_flags", "status"])
+                    "ip_kind", "ip_flags", "status"]
+        if target_profile!='balanced':headers+=['target_profile','target_score']
+        w.writerow(headers)
         for rank, r in enumerate(ranked, 1):
             ip = r.ip if r.ip and r.ip.ok else IpInfo()
             ip_flags = "|".join(f for f, on in (("proxy", ip.proxy),
                                                 ("hosting", ip.hosting),
                                                 ("mobile", ip.mobile)) if on)
-            w.writerow([
+            values=[
                 rank,
                 r.name,
                 r.provider,
@@ -1556,7 +1874,9 @@ def write_csv(results: List[Result], path: Path) -> None:
                 ip.exit_ip, ip.country, ip.asn, ip.asname, ip.isp, ip.org,
                 ip.kind, ip_flags,
                 r.status,
-            ])
+            ]
+            if target_profile!='balanced':values+=[target_profile,speedbench_profiles.score(result_to_dict(r),target_profile)]
+            w.writerow(values)
 
 
 def node_key_of(proto: str, server: str, port, name: str) -> str:
@@ -1594,9 +1914,17 @@ def classify_failure(status: str) -> str:
 
 def result_to_dict(r: Result) -> dict:
     ip = r.ip if r.ip and r.ip.ok else IpInfo()
+    updated = metric_updated_dict(r)
     return {
         "name": r.name,
         "provider": r.provider,
+        **source_catalog.result_origin(r.origin),
+        'measurement_scope':{'probe':'unknown','bandwidth':'unknown','intel':'unknown',**(r.measurement_scope or {})},
+        **({'download_bytes':r.download_bytes} if r.download_bytes is not None else {}),
+        **({'exit_status':r.exit_status} if r.exit_status is not None else {}),
+        **({'probe_sources':safe_probe_sources(r.probe_sources)} if r.probe_sources else {}),
+        'metric_updated_at':updated,
+        'measured_metric_count':observed_metric_count(r),
         "node_key": r.node_key,
         "proto": r.proto,
         "latency_ms": r.latency_ms,
@@ -1638,19 +1966,86 @@ def result_to_dict(r: Result) -> dict:
 
 
 def append_history(results: List[Result], path: Path, mb: Optional[int], rounds: int,
-                   csv_path: Optional[Path]) -> None:
+                   csv_path: Optional[Path], task=None) -> bool:
     record = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "mb": mb,
         "rounds": rounds,
         "csv": str(csv_path) if csv_path else "",
-        "results": [result_to_dict(r) for r in rank_results(results)],
+        "results": [result_to_dict(r) for r in rank_results(results,target_profile=(task or {}).get('target_profile','balanced'))],
     }
+    if task:
+        # Opt-in task metadata; old CLI/history consumers keep their exact
+        # record shape. No paths, credentials, raw stdout or arbitrary config.
+        record['task'] = {k:v for k,v in task.items() if k in
+                          ('job_id','mode','target_profile','partial') and isinstance(v,(str,bool))}
+        if task.get('status') in ('completed','cancelled','failed','interrupted'):
+            record['task']['status']=task['status']
+        count=task.get('selected_node_count')
+        if isinstance(count,int) and not isinstance(count,bool) and 0<=count<=3000:
+            record['task']['selected_node_count']=count
+        record['ts'] = datetime.now().isoformat(timespec='microseconds')
     try:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
     except OSError as e:
         print(f"⚠️ 历史记录写入失败: {e}", file=sys.stderr)
+        return False
+
+
+def save_partial_report(args,status):
+    with measure(args,'summary'):
+        return _save_partial_report(args,status)
+
+
+def _save_partial_report(args,status):
+    """One failure/cancel export under the CLI lease, never new measurement.
+
+    Only completed snapshots are retained. Missing work is not unreachable,
+    missing Intelligence remains N/A, and no automatic switching is attempted.
+    CSV failure must not prevent JSONL retention. Already committed history is
+    never rewritten/duplicated by an exception in a later reporting step.
+    """
+    if getattr(args,'_partial_exported',False) or getattr(args,'_history_saved',False):return
+    args._partial_exported=True
+    results=args._result_journal.snapshot()
+    if not results:return
+    for enricher in args._owned_intel_pools:enricher.apply(results)
+    for r in results:
+        scope=dict(r.measurement_scope or {})
+        scope.setdefault('mode',args.mode or 'legacy')
+        scope.setdefault('probe','completed' if r.latency_ms is not None else 'failed')
+        scope.setdefault('bandwidth','partial' if r.median_mbps is not None else
+                         'not_requested' if args.mode=='ip' else 'cancelled' if status=='cancelled' else 'interrupted')
+        scope.setdefault('exit','not_requested' if args.no_ip else
+                         'partial' if r.exit_ipv4 or r.exit_ipv6 else 'cancelled' if status=='cancelled' else 'interrupted')
+        scope.setdefault('intel','completed' if r.intel_v4 or r.intel_v6 else
+                         'not_requested' if args.no_ip else 'interrupted')
+        if r.exit_status is not None:
+            r.exit_status={key:('cancelled' if status=='cancelled' else 'interrupted') if value=='pending' else value
+                           for key,value in r.exit_status.items()}
+        r.measurement_scope=scope
+        compute_score(r);r.tags=make_tags(r)
+        if '任务部分结果' not in r.tags:r.tags=','.join(filter(None,(r.tags,'任务部分结果')))
+        publish_result(args,'node_intelligence',r,phase_name='enriching')
+    out=Path(args.output) if args.output else Path(
+        f"clash-speedtest-{datetime.now().strftime('%Y%m%d-%H%M%S')}-partial.csv")
+    csv_path=None
+    try:write_csv(results,out,target_profile=args.target_profile);csv_path=out
+    except (OSError,KeyboardInterrupt):
+        print('部分 CSV 未完整保存；仍尝试保留 JSONL 历史。',file=sys.stderr)
+    task=dict(mode=args.mode or 'legacy',target_profile=args.target_profile,partial=True,status=status)
+    if hasattr(args,'selected_node_count'):task['selected_node_count']=args.selected_node_count
+    if args.progress is not None:task['job_id']=args.progress.job_id
+    if not args.no_history:
+        args._history_saved=append_history(results,Path(args.history),args.mb,args.rounds,csv_path,task=task)
+    try:
+        retention='已保留' if csv_path is not None or getattr(args,'_history_saved',False) else '仅内存中存在，未持久化'
+        print(f'任务 {status}，{len(results)} 个节点的部分结果{retention}；未完成指标不代表网络不可达。')
+        print_speedbench(results,args.top,target_profile=args.target_profile)
+        if csv_path is not None:print(f'部分 CSV 已保存: {csv_path.resolve()}')
+    except (OSError,ValueError):pass # Closed console cannot undo committed history.
 
 
 def pick_switch_group(proxies: Dict[str, dict], graph: Dict[str, List[str]],
@@ -1667,51 +2062,105 @@ def pick_switch_group(proxies: Dict[str, dict], graph: Dict[str, List[str]],
 
 def auto_switch_best(api: MihomoAPI, proxies: Dict[str, dict],
                      graph: Dict[str, List[str]], root: str,
-                     results: List[Result], group_override: str = "") -> None:
-    ranked = rank_results(results)
+                     results: List[Result], group_override: str = "", target_profile='balanced',
+                     data_home=None, config_file='') -> None:
+    eligible=results
+    if target_profile in ('ip','residential'):
+        eligible=[r for r in results if isinstance(r.ip_quality_score,(int,float)) and
+            not isinstance(r.ip_quality_score,bool) and math.isfinite(r.ip_quality_score) and
+            0<=r.ip_quality_score<=100 and r.ip_grade in ('S','A','B','C','D')]
+    ranked = rank_results(eligible,target_profile=target_profile)
     best = ranked[0] if ranked else None
-    if not best or best.score <= 0:
+    value=speedbench_profiles.score(result_to_dict(best),target_profile) if best else None
+    if value is None or value<=0:
         print("自动切换：没有测出有效节点，保持当前选择。")
         return
-    group = group_override or pick_switch_group(proxies, graph, best.name, root)
+    best_name=best.name
+    if data_home is not None:
+        origin=best.origin or {}
+        if origin.get('identity_strength')!='strong' or not origin.get('node_id'):
+            print('自动切换：冠军身份不可核验，请刷新目录后手动选择。');return
+        try:
+            proxies=api.get('/proxies').get('proxies',{})
+            catalog=source_catalog.discover_catalog(api,data_home,config_file=config_file,snapshot=proxies)
+            matches=[n for n in catalog['nodes'] if n.get('node_id')==origin['node_id'] and
+                     n.get('identity_strength')=='strong']
+            if len(matches)!=1 or matches[0]['runtime_name'] not in proxies:
+                print('自动切换：节点身份或来源已改变，请刷新目录后重新确认。');return
+            best_name=matches[0]['runtime_name'];graph=build_selectable_graph(proxies)
+        except Exception:
+            print('自动切换：无法重新核验节点和策略组，保持当前选择。');return
+    group = group_override or pick_switch_group(proxies, graph, best_name, root)
     if not group:
-        print(f"自动切换：找不到包含 {best.name!r} 的 Selector 组，可用 --switch-group 指定。")
+        print(f"自动切换：找不到包含 {best_name!r} 的 Selector 组，可用 --switch-group 指定。")
         return
+    if data_home is not None and (proxies.get(group,{}).get('type')!='Selector' or best_name not in graph.get(group,[])):
+        print('自动切换：策略组已失效或不包含冠军，请重新确认。');return
     try:
         current = proxies.get(group, {}).get("now")
-        if current == best.name:
-            print(f"自动切换：{group} 已是 {best.name}，无需变更。")
+        if current == best_name:
+            print(f"自动切换：{group} 已是 {best_name}，无需变更。")
             return
-        api.select(group, best.name)
-        print(f"✅ 自动切换：{group} → {best.name}"
+        api.select(group, best_name)
+        print(f"✅ 自动切换：{group} → {best_name}"
               f"（{fmt_speed(best.median_mbps)} Mbps / {fmt_ms(best.latency_ms)} ms / {star_str(best.score)}）")
     except Exception as e:
         print(f"⚠️ 自动切换失败: {e}", file=sys.stderr)
 
 
 def report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]) -> int:
+    with measure(args,'summary'):
+        return _report(results,args,api,proxies)
+
+
+def _report(results: List[Result], args, api: MihomoAPI, proxies: Dict[str, dict]) -> int:
     """Shared reporting: box table + CSV + history + optional auto-switch."""
+    origins = getattr(args, 'source_origins', {})
+    for result in results:
+        source_catalog.apply_origin(result, origins.get(result.name))
+        publish_result(args,'node_intelligence',result,phase_name='enriching')
+    phase(args,'finalizing')
     if not results:
         print("没有产生有效测速结果。")
         return 0
     summary = getattr(args, "mode_summary", "")
     if summary:
         print(f"\n本次模式: {summary}")
-    print_speedbench(results, args.top)
+    target_profile=getattr(args,'target_profile','balanced')
+    print_speedbench(results, args.top,target_profile=target_profile)
     out = Path(args.output) if args.output else Path(
         f"clash-speedtest-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
     )
-    write_csv(results, out)
+    write_csv(results, out,target_profile=target_profile)
     print(f"\nCSV 已保存: {out.resolve()}")
-    print("排序规则：按 Overall（Network + 可用 IP Quality，未知 IP 不加分）从高到低。")
+    if target_profile!='balanced':
+        print(f'排序规则：按 {target_profile} 使用目标推荐，优先相同网络覆盖；Overall 与原始指标保持原值。仅推荐已测范围。')
+    elif getattr(args,'mode',None) in ('quick','standard','deep'):
+        print('排序规则：优先已完成带宽精测的覆盖范围，再按 Overall 排序；未知 IP 不加分。')
+    else:
+        print("排序规则：按 Overall（Network + 可用 IP Quality，未知 IP 不加分）从高到低。")
     if any("未精测" in (r.tags or "") for r in results):
         print("注：「未精测」节点仅完成 Phase 1 粗筛（延迟/连通性/IP 画像），未参与带宽精测。")
     if not args.no_history:
-        append_history(results, Path(args.history), args.mb, args.rounds, out)
-    if args.auto_switch:
+        task = None
+        partial=bool(getattr(args,'cancelled',False) or cancel_requested())
+        if getattr(args,'progress',None) is not None or getattr(args,'mode',None) or partial or target_profile!='balanced':
+            task = dict(mode=getattr(args,'mode',None) or 'legacy',
+                        target_profile=getattr(args,'target_profile','balanced'),
+                        partial=partial,status='cancelled' if partial else 'completed')
+            if hasattr(args,'selected_node_count'):task['selected_node_count']=args.selected_node_count
+            if getattr(args,'progress',None) is not None:
+                task['job_id'] = args.progress.job_id
+        args._history_saved=append_history(results, Path(args.history), args.mb, args.rounds, out,task=task)
+    if args.auto_switch and not getattr(args,'cancelled',False) and not cancel_requested():
         graph = build_selectable_graph(proxies)
-        auto_switch_best(api, proxies, graph, args.root_group, results, args.switch_group)
-    return 0
+        strict=bool(getattr(args,'mode',None) or getattr(args,'backend_child',False))
+        with cancellation_scope(cancel_requested):
+            auto_switch_best(api, proxies, graph, args.root_group, results, args.switch_group,
+                target_profile=target_profile,
+                data_home=(os.environ.get('SPEEDBENCH_HOME') or str(Path(args.history).resolve().parent)) if strict else None,
+                config_file=getattr(args,'config_file',''))
+    return 130 if getattr(args,'cancelled',False) or cancel_requested() else 0
 
 
 def _reconfigure_stdio_for_console() -> None:
@@ -1738,17 +2187,29 @@ def main() -> int:
     parser.add_argument("--controller",
                         help="External Controller，例如 http://127.0.0.1:9097、"
                              "unix:///tmp/verge/verge-mihomo.sock 或 pipe://verge-mihomo（Windows）")
-    parser.add_argument("--secret", default=os.environ.get("MIHOMO_SECRET", ""),
-                        help="API secret；建议用环境变量 MIHOMO_SECRET，避免写进 shell history")
+    parser.add_argument("--secret", default=None,
+                        help="API secret；默认自动读取本机 Verge，MIHOMO_SECRET 可覆盖；避免写入命令行")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="认证失败直接退出，不等待控制台密码输入（Web 面板使用）")
     parser.add_argument("--include", help="只测试名称匹配此正则的节点，例如 '香港|HK'")
     parser.add_argument("--exclude", default=r"(?i)(剩余|流量|到期|官网|套餐|公告|倍率|traffic|expire)",
                         help="排除名称匹配此正则的节点")
     parser.add_argument("--provider", help="只测试指定 provider-name（精确匹配）")
+    parser.add_argument("--subscription-id", action="append", default=[],
+                        help="只测指定已验证订阅 ID，可重复指定；不切换/下载订阅")
+    parser.add_argument("--node-id", action="append", default=[],
+                        help="只测指定当前节点身份 ID，可重复指定")
+    parser.add_argument('--mode', choices=('quick','standard','deep','ip'), default=None,
+                        help='任务模式；不指定保持旧 Top 15 行为。新模式目前要求隔离 worker')
+    parser.add_argument('--target-profile', choices=speedbench_tasks.PROFILES, default='balanced',
+                        help='候选目标，原始测量值不变')
+    parser.add_argument('--all-ip', action='store_true',
+                        help='quick/standard 对全部候选取得出口而不只精测候选')
     parser.add_argument("--mb", type=int, default=None,
                         help="单轮请求数据量 MB（1~95）；不指定时先 ~1MB 预热估速，"
                              "再自适应 10/30/60/95MB（目标单样本 2-4 秒）")
-    parser.add_argument("--rounds", type=int, default=1, help="每节点测速轮数，默认 1")
-    parser.add_argument("--max-time", type=float, default=4.0,
+    parser.add_argument("--rounds", type=int, default=None, help="每节点测速轮数，默认 1")
+    parser.add_argument("--max-time", type=float, default=None,
                         help="每轮下载最长秒数，默认 4（自适应模式下最多放宽到 6s）")
     parser.add_argument("--settle", type=float, default=0.35,
                         help="切换节点后等待秒数，默认 0.35")
@@ -1776,14 +2237,14 @@ def main() -> int:
     parser.add_argument("--switch-group", default="",
                         help="配合 --auto-switch 使用，手动指定要切换的策略组名")
     parser.add_argument("--history",
-                        default=str(Path(__file__).resolve().parent / "speedbench-history.jsonl"),
+                        default=str(Path(os.environ.get('SPEEDBENCH_HOME') or Path(__file__).resolve().parent).resolve() / "speedbench-history.jsonl"),
                         help="历史记录 JSONL 路径，默认在脚本目录下")
     parser.add_argument("--no-history", action="store_true",
                         help="不写入历史记录")
     parser.add_argument("--workers", type=int, default=6,
                         help="并发 worker 数（起多个临时 mihomo 实例并行做出口 IP 画像，不影响运行中的 Clash）；"
                              "1=关闭并发，回退到串行 GLOBAL 切换模式。默认 6")
-    parser.add_argument("--top-n", type=int, default=15,
+    parser.add_argument("--top-n", type=int, default=None,
                         help="两阶段模式：Phase 2 只对延迟最优的前 N 个连通节点串行精测带宽，默认 15")
     parser.add_argument("--all", action="store_true",
                         help="两阶段模式：跳过 Top-N 筛选，Phase 2 对所有连通节点串行精测")
@@ -1793,7 +2254,39 @@ def main() -> int:
                         help="并发模式用的完整配置文件路径（含节点凭据），默认自动找 Clash Verge 的运行配置")
     parser.add_argument("--yes", action="store_true",
                         help="不询问确认直接开始")
+    parser.add_argument('--deny-serial-fallback',action='store_true',help=argparse.SUPPRESS)
+    parser.add_argument('--backend-child',action='store_true',help=argparse.SUPPRESS)
     args = parser.parse_args()
+    from speedbench_config import ENV as root_env, validate_root, ConfigRootError
+    if os.environ.get(root_env):
+        try:
+            selected_root=validate_root(os.environ[root_env])
+            selected_file=Path(selected_root)/'clash-verge.yaml'
+            if args.config_file and Path(args.config_file).resolve()!=selected_file:
+                raise ConfigRootError('config-file 与自定义 Verge 目录不一致；未开始测速')
+            args.config_file=str(selected_file)
+        except (ConfigRootError,OSError,ValueError):
+            print('自定义 Verge 目录无效或与 --config-file 冲突；未开始测速，也未回退。',file=sys.stderr)
+            return 2
+    config_params = {key:value for key,value in vars(args).items()
+                     if key in set(speedbench_tasks.LIMITS) | set(speedbench_tasks.BOOLEAN_OPTIONS)
+                     | {'mode','target_profile'} and value is not None}
+    try:
+        task_config = speedbench_tasks.resolve_config(config_params)
+    except speedbench_tasks.TaskConfigError as e:
+        print(f'错误：{e}',file=sys.stderr)
+        return 2
+    for key in speedbench_tasks.LIMITS:
+        setattr(args,key,getattr(task_config,key))
+    args.all = task_config.measure_all
+    args.task_config = task_config if args.mode else None
+    args.progress = ProgressEmitter.from_environment()
+    if args.deny_serial_fallback and args.workers<=1:
+        print('串行测试需要在界面明确确认 GLOBAL 切换；未开始测速。',file=sys.stderr)
+        return 2
+    if args.mode and args.workers <= 1:
+        print('新模式需要隔离 worker；串行模式请暂时不指定 --mode。',file=sys.stderr)
+        return 2
 
     if args.mb is not None and (args.mb < 1 or args.mb > 95):
         print("错误：--mb 建议范围 1~95。", file=sys.stderr)
@@ -1811,6 +2304,36 @@ def main() -> int:
         print("错误：--top-n 至少为 1。", file=sys.stderr)
         return 2
 
+    from speedbench_owner import benchmark_ownership, LeaseError
+    from speedbench_progress import ResultJournal
+    args._owned_intel_pools=[]
+    args._result_journal=ResultJournal()
+    try:
+        with benchmark_ownership(args.history,delegated=args.backend_child):
+            try:
+                try:code=_execute_benchmark(args,task_config)
+                except KeyboardInterrupt:
+                    args.cancelled=True;code=130
+                except Exception:
+                    print('测速任务异常终止；保留已完成结果，不输出私有异常内容。',file=sys.stderr)
+                    code=1
+                for enricher in args._owned_intel_pools:enricher.close()
+                if code!=0:
+                    try:save_partial_report(args,'cancelled' if code==130 else 'failed')
+                    except (Exception,KeyboardInterrupt):
+                        # Export failures must never conceal the dedicated
+                        # cleanup failure code or authorize another task.
+                        try:print('部分结果导出失败；任务仍保留原失败／取消状态。',file=sys.stderr)
+                        except (OSError,ValueError):pass
+                return code
+            finally:
+                for enricher in args._owned_intel_pools:enricher.close()
+    except LeaseError:
+        print('SpeedBench 数据目录已被占用，或私有任务身份无法核验；未开始测速或写入历史。',file=sys.stderr)
+        return 2
+
+
+def _execute_benchmark(args,task_config):
     # Windows：命令行场景下用户可在控制台按 Ctrl+Break（Python 映射为
     # SIGBREAK）。本文件没有显式 SIGINT handler——Ctrl+C 靠解释器默认把 SIGINT
     # 转成 KeyboardInterrupt；这里给 SIGBREAK 注册同样的转换，让 CTRL_BREAK_EVENT
@@ -1824,20 +2347,34 @@ def main() -> int:
         signal.signal(signal.SIGBREAK, _on_sigbreak)
 
     clear_cancel_request()
+    phase(args,'preparing')
 
     try:
-        base, needs_secret = detect_controller(args.secret, args.controller)
-        secret = get_secret_if_needed(base, args.secret, needs_secret)
-        api = MihomoAPI(base, secret=secret)
-        version = api.get("/version")
-        config = api.get("/configs")
-        proxy_data = api.get("/proxies")
+        with measure(args,'connection') as counts,cancellation_scope(cancel_requested):
+            counts['attempts'] = 1
+            api = connect_controller(args.secret, args.controller, interactive=not args.non_interactive)
+            version = api.get("/version")
+            config = api.get("/configs")
+            proxy_data = api.get("/proxies")
+            counts['successes'] = 1
     except (ApiError, Unauthorized) as e:
         print(f"错误：{e}", file=sys.stderr)
         return 1
 
     proxies: Dict[str, dict] = proxy_data.get("proxies", {})
     leaves = leaf_nodes(proxies)
+    with measure(args,'discovery'),cancellation_scope(cancel_requested):
+        catalog = source_catalog.discover_catalog(
+            api, os.environ.get('SPEEDBENCH_HOME') or str(Path(args.history).resolve().parent),
+            config_file=args.config_file, snapshot=proxies)
+    args.source_origins = {n['runtime_name']: n for n in catalog['nodes']}
+    if args.subscription_id or args.node_id:
+        known_sources = {s['subscription_id'] for s in catalog['sources'] if s['loaded']}
+        known_nodes = {n['node_id'] for n in catalog['nodes']}
+        if (not set(args.subscription_id).issubset(known_sources) or
+                not set(args.node_id).issubset(known_nodes)):
+            print('来源/节点身份已失效或未加载，请刷新目录；不会切换订阅。', file=sys.stderr)
+            return 1
 
     # Filters
     include_re = re.compile(args.include) if args.include else None
@@ -1845,6 +2382,11 @@ def main() -> int:
 
     candidates = []
     for name, info in leaves.items():
+        origin = args.source_origins.get(name, {})
+        if args.subscription_id and not set(args.subscription_id).intersection(origin.get('subscription_ids', [])):
+            continue
+        if args.node_id and origin.get('node_id') not in args.node_id:
+            continue
         if include_re and not include_re.search(name):
             continue
         if exclude_re and exclude_re.search(name):
@@ -1856,6 +2398,7 @@ def main() -> int:
     candidates.sort()
     if args.limit > 0:
         candidates = candidates[:args.limit]
+    args.selected_node_count=len(candidates)
 
     if not candidates:
         print("没有找到符合筛选条件的实际代理节点。", file=sys.stderr)
@@ -1863,7 +2406,7 @@ def main() -> int:
 
     if args.workers > 1:
         try:
-            from speedbench_workers import WorkerUnavailable, run_pool
+            from speedbench_workers import WorkerUnavailable, WorkerCleanupError, run_pool
         except ImportError:
             print("错误：缺少 speedbench_workers.py（应与 clash_speedbench.py 同目录）。",
                   file=sys.stderr)
@@ -1878,8 +2421,8 @@ def main() -> int:
         else:
             sample_desc = "自适应 10~95 MB（~1MB 预热估速）"
             max_mb = 95
-        n_phase2 = len(candidates) if args.all else min(args.top_n, len(candidates))
-        est_mb = max_mb * args.rounds * n_phase2 * (5 if args.multi else 1)
+        n_phase2 = (len(candidates) if args.all else min(args.top_n, len(candidates))) if task_config.bandwidth else 0
+        est_mb = task_config.download_budget_mb(len(candidates))
         print("Clash SpeedBench（两阶段并发模式，不影响正在运行的 Clash）")
         print(f"候选节点: {len(candidates)}")
         print(f"流程: Phase 1 粗筛（延迟经主实例 /delay 并发探测 + worker 出口 IP 画像，不跑带宽） → "
@@ -1888,6 +2431,9 @@ def main() -> int:
               + ("，追加 4 路并发峰值" if args.multi else "")
               + ("，含出口 IP 画像" if not args.no_ip else "，已跳过 IP 画像"))
         print(f"理论最大流量消耗约: {est_mb / 1024:.2f} GiB（仅 Phase 2 精测节点消耗带宽）")
+        if args.mode:
+            print(f'模式: {args.mode}；probe {args.probe_count} 次；IP 范围 {task_config.ip_scope}。'
+                  '快速/标准模式只保证已测范围内推荐，预算不等于实际下载字节。')
         if not args.yes:
             ans = input("\n开始测速？[Y/n] ").strip().lower()
             if ans not in ("", "y", "yes"):
@@ -1896,7 +2442,21 @@ def main() -> int:
         try:
             results = run_pool(candidates, proto_by_name, args, main_api=api,
                                provider_by_name=provider_by_name)
+        except source_catalog.SourceSelectionChanged as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        except WorkerCleanupError:
+            # Stable machine-readable failure: never serialize private paths,
+            # retry a measurement in-place, or claim cancellation succeeded.
+            print('临时 worker 清理未完成；已停止后续测速，不会回退串行。',file=sys.stderr)
+            return CLEANUP_FAILED_EXIT
         except WorkerUnavailable as e:
+            if args.mode:
+                print(f'隔离 worker 不可用：{e}。新模式不会静默改用全量串行测试。',file=sys.stderr)
+                return 1
+            if getattr(args,'deny_serial_fallback',False):
+                print(f'隔离 worker 不可用：{e}。未切换 GLOBAL；可在界面选择兼容串行并确认后启动新任务。',file=sys.stderr)
+                return 1
             print(f"并发模式不可用：{e}\n回退到串行模式。", file=sys.stderr)
         else:
             return report(results, args, api, proxies)
@@ -1943,7 +2503,7 @@ def main() -> int:
 
     print("Clash SpeedBench")
     print(f"Mihomo: {version.get('version', version)}")
-    print(f"Controller: {base}")
+    print(f"Controller: {controller_config.redact_text(api.controller_base)}")
     print(f"Mixed port: {mixed_port}")
     print(f"Root group: {root}")
     print(f"候选节点: {len(candidates)}")
@@ -1965,6 +2525,8 @@ def main() -> int:
     intel_enricher: Optional[_IntelEnrichment] = None
     saved_groups: Dict[str, Tuple[str, Optional[str]]] = {}
     mode_changed = False
+    phase(args,'probing')
+    phase(args,'measuring')
 
     try:
         # Force global to guarantee curl's traffic uses the tested path.
@@ -1997,19 +2559,29 @@ def main() -> int:
                 )
                 res.tags = make_tags(res)
                 results.append(res)
+                publish_result(args,'node_probe',res,phase_name='probing')
                 continue
 
-            probe = probe_latency(
-                api, name, args.delay_timeout,
-                count=_probe_count_from_args(args),
-            )
+            probe=observed_probe(api,name,args.delay_timeout,args,source='serial',metric='delay',
+                proto=str(info.get('type','')),provider=str(info.get('provider-name','')))
             latency, jitter = probe
+            partial = Result(name=name,provider=str(info.get('provider-name','')),
+                             proto=str(info.get('type','')),latency_ms=latency,speeds_mbps=[],
+                             median_mbps=None,best_mbps=None,status='ok' if latency is not None else 'unreachable',
+                             jitter_ms=jitter)
+            _apply_probe_stats(partial,probe,fallback_attempts=_probe_count_from_args(args))
+            source_catalog.apply_origin(partial,args.source_origins.get(name))
+            publish_result(args,'node_probe',partial,phase_name='probing',completed=idx,total=len(candidates))
 
             # 带宽采样：--mb 未显式指定时先 ~1MB 预热估速，再自适应样本大小
             mb = args.mb
             max_time = args.max_time
+            partial.download_bytes=0
             if mb is None:
-                rough = warmup_speed(proxy_url, min(3.0, args.max_time))
+                with measure(args,'warmup') as counts:
+                    counter=DownloadCounter(args,partial,counts)
+                    rough = warmup_speed(proxy_url, min(3.0, args.max_time),
+                        on_attempt=counter.start,on_sample=counter.finish)
                 mb, max_time = adaptive_sample(rough, args.max_time)
 
             speeds = []
@@ -2021,22 +2593,38 @@ def main() -> int:
                 # Add cache-busting measId even though Cloudflare's __down is dynamic.
                 byte_count = mb * 1_000_000
                 url = DEFAULT_DOWNLOAD_URL.format(bytes=byte_count) + f"&measId={int(time.time()*1000)}-{idx}-{round_i}"
-                speed, st, c_ms, _sz = curl_speed(
-                    proxy_url=proxy_url,
-                    download_url=url,
-                    max_time=max_time,
-                    connect_timeout=min(3.0, max_time),
-                )
+                with measure(args,'download') as counts:
+                    counter=DownloadCounter(args,partial,counts);counter.start()
+                    speed, st, c_ms, _sz = curl_speed(
+                        proxy_url=proxy_url,
+                        download_url=url,
+                        max_time=max_time,
+                        connect_timeout=min(3.0, max_time),
+                    )
+                    counter.finish(speed,_sz)
                 statuses.append(st)
                 if connect_ms is None and c_ms is not None:
                     connect_ms = c_ms
                 if speed is not None:
                     speeds.append(speed)
+                partial.sample_mb=mb;partial.connect_ms=connect_ms
+                partial.speeds_mbps=list(speeds)
+                partial.median_mbps=statistics.median(speeds) if speeds else None
+                partial.best_mbps=max(speeds) if speeds else None
+                partial.measurement_scope=dict(mode=args.mode or 'legacy',bandwidth='partial')
+                stamp_metric(partial,'bandwidth','network')
+                publish_result(args,'node_measurement',partial,phase_name='measuring')
 
             multi = None
             if args.multi:
-                multi = multi_stream_speed(proxy_url, mb * 1_000_000, max_time,
-                                           min(3.0, max_time))
+                with measure(args,'download') as counts:
+                    counter=DownloadCounter(args,partial,counts)
+                    multi = multi_stream_speed(proxy_url, mb * 1_000_000, max_time,
+                        min(3.0,max_time),on_attempt=counter.start,on_sample=counter.finish)
+            partial.multi_mbps=multi
+            partial.measurement_scope=dict(mode=args.mode or 'legacy',bandwidth='completed' if speeds else 'failed')
+            stamp_metric(partial,'bandwidth','network')
+            publish_result(args,'node_measurement',partial,phase_name='measuring')
 
             median = statistics.median(speeds) if speeds else None
             best = max(speeds) if speeds else None
@@ -2048,7 +2636,15 @@ def main() -> int:
             exit_ipv4 = None
             exit_ipv6 = None
             if not args.no_ip:
-                exit_ipv4, exit_ipv6, data = fetch_exit_ips(proxy_url, args.ip_timeout)
+                partial.exit_status=dict(ipv4='pending',ipv6='pending')
+                def early_exit(family,address,status):
+                    if family!='legacy':
+                        setattr(partial,'exit_'+family,address);partial.exit_status[family]=status
+                        if address:stamp_metric(partial,'exit')
+                    else:partial.exit_status['basic']=status
+                    publish_result(args,'node_exit',partial,phase_name='measuring')
+                exit_ipv4, exit_ipv6, data = fetch_exit_ips(proxy_url, args.ip_timeout,
+                    on_result=early_exit,progress_args=args)
                 if data:
                     ip = classify_ip(data)
 
@@ -2070,7 +2666,13 @@ def main() -> int:
                 node_key=node_key_of(str(info.get("type", "")), "", "", name),
                 exit_ipv4=exit_ipv4,
                 exit_ipv6=exit_ipv6,
+                download_bytes=partial.download_bytes,
+                exit_status=partial.exit_status,
             )
+            # The partial row already observed probe/bandwidth/exit; carry those
+            # display boundaries forward so finalization cannot advance them.
+            res.metric_updated_at=dict(partial.metric_updated_at or {}) or None
+            res.measurement_scope=dict(partial.measurement_scope or {},intel='not_requested' if args.no_ip else 'pending')
             _apply_probe_stats(res, probe, fallback_attempts=_probe_count_from_args(args))
             if not args.no_ip:
                 if (intel_enricher is None and
@@ -2087,6 +2689,8 @@ def main() -> int:
             results.append(res)
 
             ip_txt = f" | {ip_brief(ip)}" if ip and ip.ok else ""
+            source_catalog.apply_origin(res,args.source_origins.get(name))
+            publish_result(args,'node_measurement',res,phase_name='measuring',completed=idx,total=len(candidates))
             multi_brief = f" / {multi:.0f}" if multi else ""
             print(
                 f"[{idx:>3}/{len(candidates)}] "
@@ -2097,19 +2701,27 @@ def main() -> int:
             )
 
     except KeyboardInterrupt:
+        args.cancelled=True
         print("\n\n收到 Ctrl+C，停止测速并恢复原配置……")
     finally:
-        restore_groups(api, saved_groups)
-        if mode_changed:
-            try:
-                api.patch("/configs", {"mode": original_mode})
-            except Exception as e:
-                print(f"⚠️ 恢复原模式失败，请手动切回 {original_mode}: {e}", file=sys.stderr)
+        with measure(args,'restore'):
+            restore_groups(api, saved_groups)
+            if mode_changed:
+                try:
+                    api.patch("/configs", {"mode": original_mode})
+                except Exception as e:
+                    print(f"⚠️ 恢复原模式失败，请手动切回 {original_mode}: {e}", file=sys.stderr)
 
     # Enrichment was submitted while the serial network work was in progress;
     # only now wait for the deduplicated provider jobs and recompute Overall.
-    finish_intelligence_enrichment(intel_enricher, results)
+    phase(args,'enriching')
+    if not getattr(args,'cancelled',False) and not cancel_requested():milestone(args,'network_complete')
+    with measure(args,'provider_wait'):
+        finish_intelligence_enrichment(intel_enricher, results)
+    if not getattr(args,'cancelled',False) and not cancel_requested():milestone(args,'intelligence_complete')
 
+    if getattr(args,'cancelled',False):
+        return 130
     return report(results, args, api, proxies)
 
 

@@ -12,6 +12,7 @@ import http.client
 import json
 import sys
 import threading
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -27,6 +28,11 @@ class WebServerCase(unittest.TestCase):
     """每个用例一个独立端口的面板服务器；子类直接写 test_ 方法即可。"""
 
     def setUp(self):
+        self._jobs_snapshot = web.JOBS
+        web.JOBS = web.JobStore()
+        self._cancel_snapshot = web.CANCEL_FILE
+        self._task_temp = tempfile.TemporaryDirectory()
+        web.CANCEL_FILE = Path(self._task_temp.name) / 'cancel-request'
         # 浅快照 + lines 换成副本：running/started/exit_code/proc 都是整体替换，
         # 只有 lines 会被原地 append，必须隔离
         with web.STATE_LOCK:
@@ -48,6 +54,9 @@ class WebServerCase(unittest.TestCase):
             with web.STATE_LOCK:
                 web.STATE.clear()
                 web.STATE.update(self._state_snapshot)
+            web.JOBS = self._jobs_snapshot
+            web.CANCEL_FILE = self._cancel_snapshot
+            self._task_temp.cleanup()
 
     def set_state(self, **kw):
         with web.STATE_LOCK:

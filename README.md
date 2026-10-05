@@ -3,7 +3,19 @@
 给**正在运行中的** Clash Verge Rev / Mihomo 加一个「节点体检」外挂：
 **延迟 + 真实带宽 + 多源出口 IP Intelligence + IP 风险评级 + 节点稳定性**，一次跑完直接排名。
 
-当前版本：**v1.0.1**。网络质量、IP 质量和客户端环境泄漏是三个彼此独立的维度。
+CLI/Web 版本：**v1.0.1**；桌面：**1.1.0-alpha.1**（未正式发布）。网络质量、IP 质量和客户端环境泄漏是三个彼此独立的维度。
+
+> 开发分支正在实施四阶段升级：可靠订阅来源/稳定节点 ID、quick/standard/deep/ip
+> 任务模式、实时任务中心和共享界面、Tauri 桌面客户端。桌面 **1.1.0-alpha.1**
+> 已通过 Windows、macOS Intel/ARM、Linux x64/ARM 五平台构建和包验证，尚未作为稳定 Release 发布。完整资源包自带固定
+> Python；测速仍使用标准库 + 系统 curl/Mihomo。[桌面构建、数据迁移与限制](desktop/README.md)。
+> 本地 macOS ARM、Intel/Rosetta 与已安装 Linux ARM 包的原生启动/退出通过；六格 Python CI 全部通过。
+> 完整安装/升级、托盘、通知、真实睡眠及各平台交互验收仍未完成，详见[验收报告](docs/superpowers/reports/2026-10-05-native-acceptance.md)。
+
+开发版设置页提供显式“检查正式 Release”：点击才访问固定 GitHub 官方 API，不携带
+密钥或历史，不检查 alpha 更新；失败显示无法确认，alpha 版本号领先正式版也不会自动降级。
+升级仍由用户在官方 Release 手动选择平台包、核对 SHA-256、退出写入程序并备份后完成，
+不自动下载／安装。校验和不能代替数字签名，当前桌面包为 unsigned。
 
 > English: A zero-dependency companion benchmark for a *running* Clash Verge Rev / Mihomo
 > instance — real per-node download Mbps, multi-source exit-IP intelligence and
@@ -36,6 +48,58 @@ SpeedBench ── 逐节点切换 → 经 mixed-port 真实下载 → 查出口 
 - **零依赖**：Python 3.9/3.12 均可，只用标准库 + 系统自带 curl；没有任何 API Key 也能正常测速
 
 ## 两阶段测速（默认）
+
+开发版设置页新增“数据位置与历史导入”及“显式迁移界面偏好”：从原浏览器
+导出白名单 JSON，在桌面预览并确认导入；收藏合并，未匹配项保留待确认。
+不转移历史、种子、路径、控制器信息、API Key 或写 token；不读取浏览器 profile。
+旧版无导出按钮时，先备份，再在原浏览器和原 host/port 加载新版共享 Web 界面。
+历史可另行从明确选择的本机绝对目录预览并合并；须关闭源目录的新旧程序，
+同一时间戳或任务身份的不同内容会阻止导入。合并前保存本实例 JSONL、一致 SQLite、
+偏好及 seed 的私有备份，任何新数据都阻止撤回。预览／合并不迁入源偏好、seed 或缓存；
+旧记录缺时区时按本机时区解释。中断后启动会先核验并恢复事务，发现未知更改时停止写入。
+此实现已在临时目录、浏览器和 macOS 原生设置页验证导入/撤回；其他平台的交互式迁移仍待验收。
+
+开发版新增任务模式（仅隔离 worker）：
+
+| 模式 | Probe 次数 | 默认带宽范围 | 出口画像范围 |
+|---|---|---|---|
+| `--mode quick` | 3 | Top 5，10MB / 3 秒 / 1 轮 | 精测候选 |
+| `--mode standard` | 3 | Top 10，自适应样本 / 1 轮 | 精测候选 |
+| `--mode deep` | 10 | 全部连通节点，自适应样本 / 1 轮 | 全部 |
+| `--mode ip` | 3 | 不下载，带宽 N/A | 全部 |
+
+新模式优先覆盖不同已验证订阅/已知地区，再按目标策略和当前延迟补足候选，不按节点名称猜地区。
+目标策略可使用下述受限历史提示。`--all-ip` 可扩大 quick/standard 的画像范围。
+高级参数显式覆盖默认值；不指定 `--mode` 时旧 CLI 的 Top 15 / 自适应行为保持。
+后端 `/api/run` 同样支持 `mode`，`/api/task-config` 返回共享默认值和允许范围；
+共享界面可选择目标、模式和来源范围，并在任务中心续接进度。
+
+快速/标准模式只提供已测范围内推荐，不保证全订阅绝对最快。结果含测量范围，
+已完成带宽精测者优先于仅测延迟者，避免缺少指标被重新归一化后反获最高分。
+新模式暂不静默回退到改变当前节点的串行测试；隔离 worker 不可用时明确退出。
+需要旧 CLI 串行测试时不指定 `--mode`，继续使用 `--workers 1`。共享界面的“兼容串行”
+会逐个全测已选范围，每次开始都须确认 GLOBAL 和沿途策略组切换影响；取消确认不会启动。
+Web/API 默认拒绝隔离 worker 失败后的串行回退；显式串行请求需 `mode=legacy`、
+`workers=1`、布尔 `allow_serial=true`。该确认不允许隔离任务自动改为串行，也不计入偏好。
+流量预算是请求上限（含自适应预热），不是实际下载字节。节点下载字节包括已报告的 warmup、
+单流和同节点多流样本，直接 CLI 不依赖进度通道才能计数；中断请求未报告的字节不推测。
+任务历史显示串行／worker 下载尝试及阶段计时，恢复和 CSV／JSONL 汇总也计入等待；
+重叠阶段的累计耗时不可直接相加。中断的 curl 调用计为尝试，不视为成功。
+30/100/300 相同覆盖 fixture 与固定五节点实测已记录于验收报告。实测首结果提前约24.5%，总耗时增加约2.6%；单次对照不能证明整体同精度提速。
+
+新模式候选先考虑订阅/已知地区代表，再按目标策略及当前延迟填充。综合/下载目标可参考同一
+强身份节点近 7 天的成功单流带宽；日常结合本次延迟/jitter/已完成 probe 失败率及受限带宽提示。
+IP/住宅目标参考同一身份、同轮实际出口的近期情报，双栈取较差证据；未知、失败及 all-false
+基础 flags 不构成 clean 或住宅证据。候选策略不改变原始指标和各 Profile 的评分公式。
+使用目标也用于最终 CLI/界面推荐、CSV 与历史顺序、显式允许的自动切换。非综合目标的
+CSV 另列 `target_profile`/`target_score`，Overall 保持原值；旧 CLI 默认综合口径与表头不变。
+新网络模式先比较已完成带宽、已保留有效样本的部分带宽，再比较失败/未测范围；同覆盖内
+按目标分排序。IP 专项不会成为下载冠军，自动 IP/住宅推荐要求已有有效 Quality/Grade。
+新模式和界面任务自动切换前重新核验强节点身份及策略组，来源变化时拒绝切换。
+提示只从已有 SQLite 镜像只读取得，
+每任务加载一次，总查询预算 250ms；无库、旧格式、占用或超时则退回当前探测。
+历史国家也只是候选覆盖提示，不证明本次出口仍在该国。不按名字借用历史，
+不把旧带宽复制为本次成绩；legacy 延迟 Top N、手选/来源范围、多节点带宽串行不变。
 
 为了保证带宽数字可信，**同一时刻全网只有一路测速下载**——并发只用于小流量探测：
 
@@ -216,7 +280,8 @@ python3 speedbench_web.py          # 打开 http://127.0.0.1:8950
 
 - **节点视图**：一键开始测速（可设节点过滤/每轮 MB/轮数/自动切换），实时进度和日志，可随时「中断测速」（SIGINT 优雅中断，自动恢复 Clash 配置）；结果表格支持点表头排序（不通沉底）、当前节点高亮、行内一键切换、点击行展开详情（抖动/建连/单·多流/ASN/ISP/出口 IP）
 - **历史视图**：历次测速轮次列表 + 该轮完整结果 + 任意节点 30 天带宽趋势图、出口 IP/ASN 变化时间线和 IP Grade/分类信誉变化（SQLite 历史库 `speedbench-history.db` 支撑）
-- **订阅视图**：按订阅来源（provider）聚合的回顾面板——各订阅的可用率/中位速度/平均分汇总，单订阅逐轮三线趋势（可用率·速度·评分）与最近一轮节点明细；节点凭据变化会用 `node_key`（proto|server|port 哈希）续上历史，失败记录带 `fail_reason` 分类
+- **来源选择（开发版）**：测速前可选择已加载的 Verge 订阅。通过本机 profile 与运行节点的有效连接定义验证来源，不将内核 provider 名直接视为订阅。相同定义属于多个订阅时标为多来源，脚本修改或无法验证时标为未知。未加载订阅不会被自动启用或下载。
+- **订阅历史**：旧 provider 汇总与 `node_key` 入口保留；新来源历史按不透明 `subscription_id` 聚合，新 `node_id` 区分认证/传输/链式依赖。改名不断链，凭据变化产生新身份，不再将不同账号成绩误合并。旧 raw 不回填当前订阅，可用率和测量覆盖率分开计算。
 - **评分 Profile 切换**：综合推荐 / ⚡日常（延迟+抖动优先）/ 🚀下载（单·多流带宽优先）/ 🧼IP（分类、风险、信誉优先）/ 🏠住宅优先；下载 Profile 不受 IP 风险排序干扰；搜索框实时过滤；地区分组榜单 + ⭐ 收藏节点（仅收藏偏好写入 localStorage）
 - **环境泄漏检测 `#/leak`**：检测当前浏览器 + 当前 Clash/TUN + 当前活动节点，独立于离线节点结果；WebRTC 使用浏览器标准 RTCPeerConnection/ICE，识别 host/srflx/prflx/relay 和公网候选。mDNS、隐私策略或 STUN 失败时显示“无法确认”，不会误报“无泄漏”
 - **DNS Guided Audit**：通过按钮打开 BrowserLeaks DNS / DNSLeakTest，由用户人工查看 resolver；不读取系统 DNS、不爬站点 HTML、不自动声称无泄漏。页面提示正常/危险判读并可保存人工结果
@@ -253,6 +318,16 @@ cp -R "dist/Clash SpeedBench.app" /Applications/
 
 ## 常用参数
 
+开发版增加 `--subscription-id ID`、`--node-id ID`，可重复指定。ID 可从本机面板
+`/api/catalog` 获取；来源仅限当前已加载范围，身份过期会拒绝操作，不隐式切订阅。
+自定义配置可使用已有 `--config-file PATH` 指向本机 Verge 运行配置；该配置声明的
+控制器必须与实际连接一致，否则来源降级为未知。UI 目录选择器仍在后续阶段实现。
+
+新身份使用应用数据目录的私有 `identity-seed` 文件参与 HMAC。它不是 API Key，
+不返回浏览器或进入导出/历史/发布包。POSIX 要求 0600；Windows 检查当前用户
+所有权与受限 ACL。迁移时应连同原配置目录及身份种子备份；种子丢失、配置根目录
+移动或凭据轮换可能产生新身份，旧历史仍保留，不自动合并。不要公开该文件。
+
 | 参数 | 说明 | 默认 |
 |---|---|---|
 | `--include REGEX` | 只测匹配的节点 | 全部 |
@@ -278,17 +353,63 @@ cp -R "dist/Clash SpeedBench.app" /Applications/
 | `--history PATH` | 历史记录 JSONL 路径 | 脚本目录下 |
 | `--no-history` | 不写历史记录 | 关 |
 
-设置了 External Controller Secret 时，用环境变量传入（避免写进 shell history）：
+### Clash Verge 控制器自动连接
+
+SpeedBench 的 CLI、Web 当前节点/切换和测速入口会自动读取本机 Clash Verge 的
+`clash-verge.yaml`，获得控制器地址及 `secret`，包含新版 Windows 动态命名管道。
+正常情况下直接双击启动即可，不需要每次设置环境变量，也不需要关闭控制器认证。
+此密钥是 **Mihomo External Controller 访问密钥**，与可选的 IPinfo/IPQS/Scamalytics API Key 无关。
+
+默认配置目录：
+
+- Windows：`%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\`
+- macOS：`~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/`
+- Linux：`$XDG_CONFIG_HOME/io.github.clash-verge-rev.clash-verge-rev/`，未设置时使用 `~/.config/`。
+
+在 macOS 默认目录下配置可读时，除配置声明的地址外，还会探测当前用户的 Clash Verge
+服务模式 IPC socket `/var/run/clash-verge-service/users/<当前 uid>/verge-mihomo.sock`
+（仅接受当前 uid 拥有的真实非符号链接 socket，使用同一配置文件的密钥）；显式或环境变量
+指定的自定义目录不会回退到该服务 socket。
+
+运行配置不存在时才回退同目录的 `config.yaml`；不能读取/不支持的格式会明确提示，
+仍保留旧版默认地址探测。便携版或自定义配置目录未被自动发现时，可以通过 CLI 的
+`--controller` 指定控制器，并用环境变量提供密钥；Web 仍支持默认地址与 `MIHOMO_SECRET` 回退。
+控制器字段仅支持 Verge 生成的顶层单行标量，不执行 YAML，不引入第三方 Python 依赖。
+
+优先级为显式 `--secret` > `MIHOMO_SECRET` > 本机配置（显式空值也属于手动设置）。
+错误或过期的手动密钥不会被自动覆盖；恢复自动发现时需移除旧环境变量。
+`--controller` 限定连接目标；自动密钥只发给同一配置文件声明的本机 loopback/IPC 地址，
+不发给不匹配的地址或远程控制器。手动连接远程实例仍需自行提供其密钥。
+每次连接重读本机配置；自动认证失败最多再重读一次，不自动重放节点切换操作。
+
+密钥只在后端内存中使用，不返回浏览器，不写测速历史、SQLite、日志或子进程命令行；
+自动密钥也不写入全局环境，不传给测速 worker 或 IP Intelligence provider。
+Web 测速在启动子进程前验证认证，失败立即报告，不再等待不可见的密码输入。
+交互 CLI 保留隐藏密码输入；`--non-interactive` 或非终端输入时认证失败直接退出。
+
+手动覆盖示例（这些命令仍会进入 shell history，请勿将含实际密钥的历史/截图公开）：
 
 ```bash
 export MIHOMO_SECRET='你的secret'
 ```
+
+Windows PowerShell：
+
+```powershell
+$env:MIHOMO_SECRET = '你的secret'
+.\SpeedBench.bat
+```
+
+若此前设置过临时变量，移除后可测试自动发现：`Remove-Item Env:MIHOMO_SECRET -ErrorAction SilentlyContinue`。
+若用户/系统级变量仍存在，还需在 Windows 环境变量设置中移除旧值，并从新进程启动。
+更新程序后必须退出旧 SpeedBench 后台再重新启动；仅刷新或关闭浏览器不会加载新后端代码。
 
 ## 注意事项
 
 - **仅串行模式**（`--workers 1` 或并发不可用时的回退）会临时切主实例到 GLOBAL 模式，全网流量跟着被测节点走；别在视频会议/游戏时跑。结束或 Ctrl+C 后自动恢复。两阶段模式全程不碰你正在用的 Clash。
 - **流量消耗**：全量 ≈ Phase 2 节点数 × 样本大小 × `--rounds`（自适应 10~95MB），默认 Top 15 约 0.5~1.4 GiB；`--all` 精测全量会大很多。粗筛阶段只走小流量探测，可忽略。
 - **探测失败率定义**：`probe_loss_pct` 是 HTTP/HTTPS application-level probe failure rate（应用层探测失败率），不是 ICMP 层真实 packet loss，也不等于物理链路丢包率。延迟/jitter 只按成功样本计算；全部失败时显示 N/A。
+- **清理失败（开发版）**：中断时仅按本任务登记的 worker 句柄并发清理（最多 16 路），不按进程名杀 Mihomo。每个 worker 原有 terminate/kill 等待重叠，不再逐个累加；这不是操作系统／文件删除的硬总时限承诺。只有确认进程退出才显式删除临时配置，GC 不自动删除仍可能使用的配置。若清理仍失败，CLI 返回专用退出码 3，不回退串行；CLI 尝试保存部分历史，后端保留已接收的部分任务结果并标记 failed，而不是“取消成功”。同一后端阻止新任务和目录修改，请退出并先核对该任务残留资源，不要按进程名批量结束用户 Clash 或广泛删除临时目录。取消预算与六格核心 CI 见验收报告；真实操作系统生命周期仍按平台保留待验。
 - **评分**：100 Mbps 仍是单流带宽满分标尺；Network Score 由单流/多流、延迟、jitter、TCP/TLS connect 和 probe success 组成。IP Quality Score 可用时 Overall 按 Network 80% + IP Quality 20%，数据缺失时按剩余有效维度重新归一化；未知 IP 不会得到 100 分。
 - **双栈边界**：节点支持 IPv6 与客户端真实 IPv6 是否绕过代理是两件事。每节点分别记录出口 IPv4/IPv6；双栈国家/ASN 不一致只是出口画像提示，只有「环境泄漏检测」页面才判断当前客户端是否绕过。
 - **IP 画像与配额**：未禁用且无 Key 时使用 ip-api 免费基础画像；第三方 provider 可能受账户套餐、配额、限速和 TTL 影响，缺失字段保持未知，不把缺失解释为 false。
@@ -324,6 +445,96 @@ export MIHOMO_SECRET='你的secret'
 `--no-ip` 仍可完全跳过出口画像；`--stability` / `--probe-count` 是新增可选项，默认普通模式只做
 3 次 application-level probe，不改变 Phase 1/Phase 2 和单流测速逻辑。Windows、macOS、Linux
 均保持 Python 3.9/3.12 与标准库运行，不需要 `pip install`；PyYAML 仍只是可选配置解析 fallback。
+
+## 自定义 Verge 配置根目录（开发版）
+
+默认自动发现保持不变。便携、自定义安装或多配置环境可在共享 Web／桌面设置中输入本机
+**绝对目录**，先预览固定布局，再确认应用。要求目录内存在 `clash-verge.yaml`、
+`profiles.yaml` 和 `profiles/`；不支持 UNC／Windows 映射网络盘、越界文件链接或超限文件。
+预览只检查布局，不代表已经连接或订阅来源核验成功。没有通用文件读取／导出 API，
+程序不会修改 Verge 配置，也没有新增原生文件选择器。
+
+应用后控制器、订阅目录和测速 worker 使用同一根目录；任务接受时冻结此选择，运行、取消
+及清理期间禁止更改。无效自定义目录**不会悄悄回退**到默认目录或另一个控制器，必须修正
+目录或明确点击“恢复自动发现”。切换目录清除当前待测选择；历史、收藏和原始记录不删除。
+稳定 ID 还依赖配置根目录命名空间与私有种子，不同根目录的旧 ID 不会强行匹配。
+
+界面选择仅驻留本次后端内存；刷新页面保留，重启后重新读取启动设置。不进入 localStorage、
+偏好导出、任务配置、JSONL 或 SQLite。需要固定启动目录时，由用户在启动环境设置
+`SPEEDBENCH_VERGE_ROOT`（不要放入订阅配置内容或密钥），例如 PowerShell 当前会话：
+
+```powershell
+$env:SPEEDBENCH_VERGE_ROOT = 'C:\本机\Verge配置目录'
+python speedbench_web.py
+```
+
+相同变量也适用于直接 CLI 和桌面后端；自定义根目录指定后，CLI 的 `--config-file` 必须
+与该目录的 `clash-verge.yaml` 一致，否则测速前报错。恢复自动发现只影响当前后端，不修改
+启动环境变量；下次启动仍读取该变量。`SPEEDBENCH_HOME` 是 SpeedBench **数据目录**，
+不是 Verge 配置根目录，两者不要混淆。
+
+### 同目录运行互斥（开发版）
+
+桌面、独立 Web 和直接 CLI 在任何测速／身份／历史写入前取得数据目录内核锁。
+CLI 默认历史目录遵循 `SPEEDBENCH_HOME`；显式 `--history` 位于另一目录时，两个目录均检查。
+同目录已有后端时，请先正常退出后端再运行独立 CLI；不同目录不构成全局互斥，备份前仍须停止全部写入者。
+
+后端启动的测速子任务经私有 stdin 管道核验实际父 PID、实例、目录和活跃内核锁，
+没有环境变量或单一命令行参数跳过锁的通道。子任务持有独立 writer 锁直至报告和清理结束，
+父管道 EOF 请求取消；即使父后端异常退出，新实例也不能抢占仍在清理的同目录子任务。
+退出前取消未开始的 Intelligence 查询并等待在途缓存写入，之后才释放目录锁；不会在后台继续消耗队列中的查询额度。
+私有帧不进 argv、日志或历史；锁文件不删除，旧 PID 元数据不会阻止已释放目录重启。
+管道故障后若不能确认子任务已退出，保留原进程句柄并锁定新任务，不显示“清理成功”。
+直接 CLI 在取消（退出码 130）、清理失败（3）或其他异常（1）时尝试保存已完成的逐节点快照，
+不重新测速、不自动切换节点。第二轮中断仍保留第一轮真实样本；IPv6 中断不丢弃已完成的 IPv4。
+部分结果标记为 partial/cancelled/failed；缺失指标不是网络不可达，缺失 IP 分数仍为 N/A。
+每次应用层探测完成后立即留存；一次取消不会丢弃该节点先前已完成的样本。
+JSONL／任务快照增加 `probe_sources`，分别保存主实例、worker 兜底和串行路径的
+请求总数、已调用次数、已完成样本数、成功／失败及完整／部分状态，不将不同路径简单合并。
+例如请求 3 次、已调用 3 次但只有 2 次返回（1 成功、1 失败），完成样本失败率为 50%，
+第三次未返回不能算作失败或成功。既有 CSV 主计数仍以当前采用路径的已完成样本为分母；
+展开详情可查看独立路径和中断说明。新字段是可选 JSON 元数据，不新增 SQLite 表／列，
+旧历史没有这些字段时照常回放。主实例池取消后不再开始排队节点或下一次 probe，
+TCP／Unix controller 探测和 worker 就绪读请求现在通过本请求拥有的非阻塞 socket
+检查取消，保留响应缓冲，不重发 HTTP。取消作用域只覆盖探测／就绪读取，结束后
+恢复策略组／模式的写请求不被取消标志阻断。
+DNS 池中断后停止排队解析，局部取消传递到各自拥有的 curl，并等待所有在途句柄回收。
+普通 DNS 失败保持原始失败类型，不以随后同池的中止冒充用户取消。
+worker 启动前／就绪前检查取消；情报关闭后不再开始同出口的下一 provider，但仍等待
+已经在进行的查询及缓存写入。开发分支新增 Windows 管道的作用域内 OVERLAPPED 读写，
+按单次操作取消并确认完成后回收缓冲／事件；真实 Windows 3.9/3.12 的 stalled header/body、
+chunked/NT fallback、预取消及timeout fixture已通过，包内私有引导/清理也已通过。
+作用域外的管道请求保留原同步行为；provider DNS/connect/TLS/HTTP和等待者取消已接入
+任务预算，失败地址共享剩余connect时间，不延长绝对deadline。平台异常清理仍不能保证操作系统级硬截止。
+CSV 写入失败仍尝试追加 JSONL（`--no-history` 除外），已提交的历史不重写或重复追加。
+若两种导出都失败会明确提示未持久化。强制结束进程、磁盘不可写或再次中断不能保证最终报告；
+交互式原生崩溃、真实睡眠与安装/升级门槛仍按平台保留待验。
+
+### 任务耗时和情报计数（开发版）
+
+新任务快照、增量事件及任务历史详情提供白名单数值统计，不记录 IP、URL、异常内容或 Key。
+`provider` 统计实际进入 transport 的调用次数和累计耗时；`successes` 只代表 HTTP 2xx，
+**不代表有效情报或干净 IP**，可解析结果另计 `usable_results`。缺少 Key、禁用、限流冷却
+不会冒充 API 请求。兼容简化测试 adapter 时先检查函数参数形式，不因函数内部 TypeError
+再次调用可能收费的 API；查询失败仍正常降级。
+
+`intel_cache` 的 hit/miss 是实际缓存读取次数，包括首次读取和防竞争的第二次读取，
+不是独立 IP 数；`unique_ips` 是实际开始执行的去重出口任务数。
+`intel_cache_wait.singleflight_reuses` 单列共享在途查询，不冒充 SQLite cache hit。
+worker 数是成功就绪的累计启动数，不是峰值同时运行数。
+`provider_wait` 单独表示网络工作结束后等待情报收尾的时间；并发 provider/cache 累计耗时
+不能与其他阶段直接相加作为用户等待总时间。
+
+任务的 `milestones` 记录从接受任务开始到首次结果、首次可用推荐候选、网络结束、情报结束、
+清理结束的毫秒数。由后端 monotonic 时钟首次观察，不信任子进程上传的耗时。
+首次推荐仅是当前目标／已测范围内的可用候选，不表示已找到全局最快节点，也不改变评分规则；
+IP 目标须有可用 IP Quality/Grade，不能用下载数据替代。
+清理结束只有后端确认正常或取消子任务已经退出才记录；清理失败不记录成功里程碑。
+取消／失败／旧历史中未到达的里程碑缺省为 N/A，不补零、不补造网络或情报完成。
+
+这些统计复用既有 `task_metrics.counters_json`（五个里程碑为 `phase=milestones` 的独立行），
+无新增 schema／Python 依赖，不修改 `runs.raw`。迟到的 checkpoint 不覆盖已经记录的首次里程碑。
+这批改进提供性能诊断依据，**不是同覆盖范围实测提速结论**；全阶段硬取消时限仍未验收。
 
 ## License
 

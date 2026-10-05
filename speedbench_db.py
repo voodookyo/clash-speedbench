@@ -33,7 +33,7 @@ import re
 import sqlite3
 import statistics
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA = """
@@ -138,10 +138,58 @@ CREATE TABLE IF NOT EXISTS leak_audits (
 );
 CREATE INDEX IF NOT EXISTS idx_leak_audits_created_at
     ON leak_audits(created_at DESC);
+CREATE TABLE IF NOT EXISTS subscription_sources (
+    subscription_id TEXT PRIMARY KEY,
+    current_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_identities (
+    node_id TEXT PRIMARY KEY,
+    identity_version INTEGER NOT NULL,
+    identity_strength TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_origins (
+    node_result_id INTEGER NOT NULL REFERENCES node_results(id),
+    subscription_id TEXT NOT NULL REFERENCES subscription_sources(subscription_id),
+    name_snapshot TEXT NOT NULL,
+    source_status TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY(node_result_id, subscription_id)
+);
+CREATE INDEX IF NOT EXISTS idx_node_origins_subscription ON node_origins(subscription_id);
+CREATE TABLE IF NOT EXISTS task_runs (
+    job_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    target_profile TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    config_json TEXT NOT NULL,
+    run_id INTEGER REFERENCES runs(id),
+    partial INTEGER NOT NULL DEFAULT 1,
+    results_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_task_runs_started ON task_runs(started_at DESC);
+CREATE TABLE IF NOT EXISTS task_metrics (
+    job_id TEXT NOT NULL REFERENCES task_runs(job_id),
+    phase TEXT NOT NULL,
+    duration_ms REAL NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    successes INTEGER NOT NULL DEFAULT 0,
+    bytes INTEGER NOT NULL DEFAULT 0,
+    counters_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(job_id, phase)
+);
 """
 
 # 旧库就地升级时要补的列（新库的 SCHEMA 已包含，_ensure_columns 对其为 no-op）
 _EXTRA_COLUMNS = {
+    'runs': [('job_id','TEXT')],
+    'task_runs': [('elapsed_ms','REAL')],
     "node_results": [
         ("node_key", "TEXT"), ("exit_ipv4", "TEXT"), ("exit_ipv6", "TEXT"),
         ("fail_reason", "TEXT"),
@@ -149,8 +197,10 @@ _EXTRA_COLUMNS = {
         ("probe_failures", "INTEGER"), ("probe_success_rate", "REAL"),
         ("probe_loss_pct", "REAL"), ("network_score", "REAL"),
         ("ip_quality_score", "REAL"), ("ip_grade", "TEXT"),
+        ("node_id", "TEXT"), ("identity_version", "INTEGER"),
+        ("identity_strength", "TEXT"), ("source_status", "TEXT"),
     ],
-    "ip_profiles": [("region", "TEXT"), ("city", "TEXT")],
+    "ip_profiles": [("region", "TEXT"), ("city", "TEXT"), ('node_result_id','INTEGER')],
     # These entries make an interrupted/experimental migration repairable as
     # well.  Normal v0.8/v0.9 databases do not have the tables, so SCHEMA
     # creates them first and these ALTERs become no-ops.
@@ -180,14 +230,45 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
             for col, ctype in cols:
                 if col not in have:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ctype}")
+                    if table=='ip_profiles' and col=='node_result_id':
+                        # A reused name is not sufficient identity evidence.
+                        # CASE WHEN instead of HAVING: older SQLite rejects
+                        # HAVING without GROUP BY; COUNT(*)=1 keeps the
+                        # unique-match-only semantics (ambiguous/zero → NULL).
+                        conn.execute('''UPDATE ip_profiles SET node_result_id=(
+                            SELECT CASE WHEN COUNT(*)=1 THEN MIN(n.id) ELSE NULL END
+                            FROM node_results n
+                            WHERE n.run_id=ip_profiles.run_id AND n.name=ip_profiles.name)''')
+
+
+def _run_time(value):
+    """Actual instant for ordering imported runs; old naive times are local.
+
+    Invalid historical timestamps keep their raw text and IDs, sort before
+    known instants, and remain excluded from dated trend windows.
+    """
+    try:
+        if not isinstance(value, str) or len(value) > 64:
+            return None
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def _time_key(value):
+    stamp = _run_time(value)
+    return stamp if stamp is not None else float('-inf')
 
 
 def _open(db_path) -> sqlite3.Connection:
     """打开（必要时创建）历史库并确保表结构存在。WAL：读查询不阻塞导入。"""
     conn = sqlite3.connect(str(db_path), timeout=10)
+    conn.create_function('speedbench_run_time', 1, _run_time)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     _ensure_columns(conn)
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_node_results_identity ON node_results(node_id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_runs_job ON runs(job_id)')
     return conn
 
 
@@ -259,6 +340,141 @@ def _safe_json(value, default):
                           separators=(",", ":"))
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+_TASK_TERMINAL = ('completed', 'cancelled', 'failed', 'interrupted')
+
+
+def save_task(db_path, snapshot):
+    """Idempotent bounded checkpoint; never modifies legacy runs.raw.
+
+    Only trusted public configuration/result fields survive. A delayed active
+    checkpoint cannot turn a persisted terminal task back into a running task.
+    """
+    from contextlib import closing
+    from dataclasses import fields
+    from speedbench_tasks import TaskConfig
+    from speedbench_jobs import _result, TRANSITIONS, MAX_RESULTS, METRIC_PHASES, safe_counters, safe_milestones
+    job_id = snapshot.get('job_id')
+    status = snapshot.get('status')
+    if not isinstance(job_id,str) or not re.fullmatch(r'job_[0-9a-f]{32}',job_id):
+        raise ValueError('Invalid task identity')
+    if status not in set(TRANSITIONS) | set(_TASK_TERMINAL):
+        raise ValueError('Invalid task status')
+    config = snapshot.get('config',{})
+    config = {f.name:config[f.name] for f in fields(TaskConfig) if f.name in config
+              and (config[f.name] is None or isinstance(config[f.name],(str,int,float,bool)))}
+    results = [_result(r) for r in snapshot.get('results',[])[:MAX_RESULTS]]
+    with closing(_open(db_path)) as conn, conn:
+        old = conn.execute('SELECT status FROM task_runs WHERE job_id=?',(job_id,)).fetchone()
+        if old and old[0] in _TASK_TERMINAL:
+            return False
+        conn.execute('''INSERT INTO task_runs
+            (job_id,mode,target_profile,status,started_at,finished_at,config_json,partial,results_json,elapsed_ms,run_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,(SELECT id FROM runs WHERE job_id=? ORDER BY id DESC LIMIT 1)) ON CONFLICT(job_id) DO UPDATE SET
+            status=excluded.status, finished_at=excluded.finished_at,
+            partial=excluded.partial, results_json=excluded.results_json,
+            elapsed_ms=excluded.elapsed_ms,run_id=excluded.run_id''',
+            (job_id, config.get('mode','legacy'),config.get('target_profile','balanced'),
+             status,str(snapshot.get('started_at',''))[:64],
+             str(snapshot['finished_at'])[:64] if snapshot.get('finished_at') else None,
+             _safe_json(config,'{}'),int(status!='completed'),_safe_json(results,'[]'),
+             max(0,min(_db_number(snapshot.get('elapsed_ms')) or 0,1e15)),job_id))
+        for phase, metric in snapshot.get('metrics',{}).items():
+            if phase not in METRIC_PHASES or not isinstance(metric,dict):
+                continue
+            def count(key):
+                value = metric.get(key,0)
+                return value if isinstance(value,int) and not isinstance(value,bool) and 0<=value<2**63 else 0
+            duration = _db_number(metric.get('duration_ms',0)) or 0
+            duration = max(0,min(duration,1e15))
+            attempts = count('attempts')
+            counters = safe_counters(metric.get('counters'))
+            conn.execute('''INSERT INTO task_metrics VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(job_id,phase) DO UPDATE SET
+                duration_ms=excluded.duration_ms,attempts=excluded.attempts,
+                successes=excluded.successes,bytes=excluded.bytes,counters_json=excluded.counters_json''',
+                (job_id,phase,duration,attempts,min(attempts,count('successes')),count('bytes'),_safe_json(counters,'{}')))
+        milestones=safe_milestones(snapshot.get('milestones'))
+        if milestones:
+            previous = conn.execute(
+                'SELECT counters_json FROM task_metrics WHERE job_id=? AND phase=?',
+                (job_id,'milestones')).fetchone()
+            if previous:
+                try:
+                    # First observations are immutable, even when a delayed
+                    # active checkpoint arrives after a more recent snapshot.
+                    milestones.update(safe_milestones(json.loads(previous[0])))
+                except (TypeError,ValueError):
+                    pass
+            conn.execute('''INSERT INTO task_metrics VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(job_id,phase) DO UPDATE SET counters_json=excluded.counters_json''',
+                (job_id,'milestones',0,0,0,0,_safe_json(milestones,'{}')))
+    return True
+
+
+def _task_row(row):
+    return dict(version=1,job_id=row[0],mode=row[1],target_profile=row[2],status=row[3],
+                started_at=row[4],finished_at=row[5],config=json.loads(row[6]),
+                run_id=row[7],partial=bool(row[8]),elapsed_ms=row[10])
+
+
+def task_history(db_path, limit=100):
+    from contextlib import closing
+    with closing(_open(db_path)) as conn:
+        return [_task_row(r) for r in conn.execute(
+            'SELECT * FROM task_runs ORDER BY speedbench_run_time(started_at) DESC,job_id DESC LIMIT ?', (max(1,min(int(limit),1000)),))]
+
+
+def task_snapshot(db_path, job_id):
+    from contextlib import closing
+    with closing(_open(db_path)) as conn:
+        row = conn.execute('SELECT * FROM task_runs WHERE job_id=?',(job_id,)).fetchone()
+        if not row:
+            return None
+        result = _task_row(row)
+        result['results'] = json.loads(row[9])
+        result['metrics'] = {r[0]:dict(duration_ms=r[1],attempts=r[2],successes=r[3],bytes=r[4],
+                                     counters=json.loads(r[5])) for r in conn.execute(
+                                         'SELECT phase,duration_ms,attempts,successes,bytes,counters_json FROM task_metrics WHERE job_id=?',
+                                         (job_id,))}
+        from speedbench_jobs import safe_milestones
+        result['milestones']=safe_milestones(result['metrics'].pop('milestones',{}).get('counters'))
+        return result
+
+
+def history_task_summaries(db_path, job_ids):
+    """Bounded public totals keyed by exact task identity, never timestamps.
+
+    Missing checkpoints/metrics remain absent; sample budgets are not bytes.
+    Batch queries avoid reopening SQLite once per historical run.
+    """
+    from contextlib import closing
+    ids=sorted({key for key in job_ids if isinstance(key,str) and re.fullmatch(r'job_[0-9a-f]{32}',key)})
+    result={}
+    if not ids:return result
+    with closing(_open(db_path)) as conn:
+        for start in range(0,len(ids),400):
+            chunk=ids[start:start+400]
+            rows=conn.execute('''SELECT t.job_id,t.status,t.partial,t.elapsed_ms,
+                TOTAL(m.bytes),COUNT(m.phase) FROM task_runs t
+                LEFT JOIN task_metrics m ON m.job_id=t.job_id AND m.phase!='milestones'
+                WHERE t.job_id IN ('''+','.join('?' for _ in chunk)+') GROUP BY t.job_id',chunk)
+            for key,status,partial,elapsed,bytes_,metric_count in rows:
+                summary=dict(status=status,partial=bool(partial))
+                if elapsed is not None and elapsed>0:summary['elapsed_ms']=elapsed
+                if metric_count and 0<=bytes_<=2**53-1:summary['downloaded_bytes']=int(bytes_)
+                result[key]=summary
+    return result
+
+
+def interrupt_tasks(db_path):
+    """Called only by an owning backend on restart; retains partial records."""
+    from contextlib import closing
+    with closing(_open(db_path)) as conn, conn:
+        return conn.execute('''UPDATE task_runs SET status='interrupted',partial=1,finished_at=?
+            WHERE status NOT IN ('completed','cancelled','failed','interrupted')''',
+            (datetime.now(timezone.utc).isoformat(timespec='milliseconds'),)).rowcount
 
 
 def _db_number(value):
@@ -471,6 +687,43 @@ def _insert_ip_intel(conn, run_id, result):
         )
 
 
+def _insert_source_origins(conn, node_result_id, run_id, r):
+    node_id = r.get('node_id')
+    if (not isinstance(node_id, str) or not re.fullmatch(r'node_v2_[0-9a-f]{32}', node_id)
+            or r.get('identity_version') != 2):
+        return
+    strength = 'strong' if r.get('identity_strength') == 'strong' else 'weak'
+    status = r.get('source_status')
+    status = status if status in ('verified', 'ambiguous', 'unknown') else 'unknown'
+    ts = conn.execute('SELECT ts FROM runs WHERE id=?', (run_id,)).fetchone()[0]
+    conn.execute('UPDATE node_results SET node_id=?,identity_version=2,identity_strength=?,source_status=? WHERE id=?',
+                 (node_id, strength, status, node_result_id))
+    conn.execute('INSERT INTO node_identities VALUES (?,2,?,?,?) ON CONFLICT(node_id) DO UPDATE SET last_seen=max(last_seen,excluded.last_seen),first_seen=min(first_seen,excluded.first_seen)',
+                 (node_id, strength, ts, ts))
+    memberships = r.get('subscriptions')
+    if status == 'unknown' or not isinstance(memberships, list):
+        return
+    allowed_ids = r.get('subscription_ids')
+    allowed_ids = allowed_ids if isinstance(allowed_ids, list) else []
+    for membership in memberships[:1000]:
+        if not isinstance(membership, dict):
+            continue
+        source_id = membership.get('subscription_id')
+        if (not isinstance(source_id, str) or
+                not re.fullmatch(r'subscription_v2_[0-9a-f]{32}', source_id) or
+                source_id not in allowed_ids):
+            continue
+        name = _db_text(membership.get('name'), '未命名订阅')
+        kind = membership.get('kind')
+        kind = kind if kind in ('remote','local','provider','unknown') else 'unknown'
+        conn.execute('INSERT INTO subscription_sources VALUES (?,?,?,?,?) ON CONFLICT(subscription_id) DO UPDATE SET current_name=CASE WHEN excluded.last_seen>=last_seen THEN excluded.current_name ELSE current_name END,last_seen=max(last_seen,excluded.last_seen),first_seen=min(first_seen,excluded.first_seen)',
+                     (source_id, name, kind, ts, ts))
+        # Source evidence contains fixed diagnostics, never raw configuration.
+        evidence = ['Exact local connection definition match']
+        conn.execute('INSERT OR IGNORE INTO node_origins VALUES (?,?,?,?,?)',
+                     (node_result_id, source_id, name, status, json.dumps(evidence)))
+
+
 def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
     name = str(r.get("name") or "")
     # A staged/new serializer may include only ``intel_v4``/``intel_v6`` and
@@ -485,7 +738,7 @@ def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
     exit_ipv4 = _family_ip(r, 4) or candidate_ips.get(4)
     exit_ipv6 = _family_ip(r, 6) or candidate_ips.get(6)
     # 旧行缺 node_key/fail_reason/provider 等新字段时落 ""，保持可聚合
-    conn.execute(
+    inserted = conn.execute(
         "INSERT INTO node_results(run_id, name, proto, provider, node_key,"
         " latency_ms, jitter_ms, connect_ms, median_mbps, best_mbps, multi_mbps,"
         " sample_mb, score, stars, status, fail_reason, tags)"
@@ -509,7 +762,8 @@ def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
          _db_int(r.get("probe_failures")), _db_number(r.get("probe_success_rate")),
          _db_number(r.get("probe_loss_pct")), _db_number(r.get("network_score")),
          _db_number(r.get("ip_quality_score")), _db_text(r.get("ip_grade") or r.get("grade")),
-         exit_ipv4, exit_ipv6))
+          exit_ipv4, exit_ipv6))
+    _insert_source_origins(conn, inserted.lastrowid, run_id, r)
     ip = r.get("ip")
     if isinstance(ip, dict) and ip:
         # 旧格式（v0.2 及更早）的 ip 没有 ok 字段：按 exit_ip 是否存在推断查询成功
@@ -547,6 +801,9 @@ def _insert_result(conn: sqlite3.Connection, run_id: int, r: dict) -> None:
              _db_text(basic.get("kind")), 1,
              _bool_or_none(basic.get("proxy")), _bool_or_none(basic.get("hosting")),
              _bool_or_none(basic.get("mobile"))))
+    if (isinstance(ip,dict) and ip) or exit_ipv4:
+        conn.execute('UPDATE ip_profiles SET node_result_id=? WHERE id=last_insert_rowid()',
+                     (inserted.lastrowid,))
     # New family-specific intelligence may be present even when the legacy
     # ``ip`` object is absent.  Keep it independent from ip_profiles so a
     # partially populated result is still useful for the reputation timeline.
@@ -599,6 +856,9 @@ def import_jsonl(db_path, jsonl_path) -> int:
                 if cur.rowcount == 0:
                     continue  # 并发下 ts 已被其他连接写入：跳过（仍幂等）
                 run_id = cur.lastrowid
+                job_id = rec.get('task',{}).get('job_id') if isinstance(rec.get('task'),dict) else None
+                if isinstance(job_id,str) and re.fullmatch(r'job_[0-9a-f]{32}',job_id):
+                    conn.execute('UPDATE runs SET job_id=? WHERE id=?',(job_id,run_id))
                 for r in results:
                     if isinstance(r, dict):
                         _insert_result(conn, run_id, r)
@@ -613,31 +873,154 @@ def latest_run(db_path) -> dict:
     conn = _open(db_path)
     try:
         row = conn.execute(
-            "SELECT raw FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+            "SELECT raw FROM runs ORDER BY speedbench_run_time(ts) DESC,id DESC LIMIT 1").fetchone()
         return json.loads(row[0]) if row else {}
     finally:
         conn.close()
 
 
 def all_runs(db_path) -> list:
-    """全部测速轮次（按写入先后升序，每项与 jsonl 行结构完全一致）。"""
+    """全部测速轮次（实际时间升序，同一时刻按 ID，raw 与旧 ID 不变）。"""
     conn = _open(db_path)
     try:
         return [json.loads(row[0])
-                for row in conn.execute("SELECT raw FROM runs ORDER BY id")]
+                for row in conn.execute("SELECT raw FROM runs ORDER BY speedbench_run_time(ts),id")]
     finally:
         conn.close()
 
 
-def node_series(db_path, name: str, days: int = 30, node_key: str = "") -> list:
+def _candidate_ip_hint(rows, exits):
+    """Conservative public history hints, including the worse observed family."""
+    qualities=[];categories=[];confidences=[];seen=set()
+    ranks={'residential':7,'corporate':6,'mobile':5.5,'residential_proxy':5,
+           'datacenter':3.5,'vpn_proxy':2,'unknown':0}
+    grades={'S':95,'A':85,'B':70,'C':50,'D':20}
+    def number(value):
+        return float(value) if isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and 0<=value<=100 else None
+    for address,quality,grade,category,confidence,fraud,scam,conflicts,normalized in rows:
+        seen.add(address)
+        values=[v for v in (number(quality),grades.get(grade)) if v is not None]
+        values.extend(100-v for v in (number(fraud),number(scam)) if v is not None)
+        observed=bool(values)
+        confidence=number(confidence)
+        if confidence is not None:values.append(confidence)
+        if category not in ranks:category='unknown'
+        if category=='unknown' or conflicts:values.append(35)
+        try:data=json.loads(normalized)
+        except (ValueError,TypeError):data=None
+        if not isinstance(data,dict):values.append(35)
+        else:
+            for key,cap in (('tor',10),('vpn',20),('proxy',25),('hosting',45),('mobile',75),
+                            ('residential_proxy',55),('ipqs_recent_abuse',30),
+                            ('scamalytics_blacklisted',20),('scamalytics_datacenter',45)):
+                if data.get(key) is True:values.append(cap);observed=True
+        qualities.append(min(values) if observed else 0)
+        if not observed:category='unknown'
+        categories.append(category);confidences.append(confidence or 0)
+    if any(address and address not in seen for address in exits):
+        qualities.append(0);categories.append('unknown');confidences.append(0)
+    if not qualities:return {}
+    return dict(recent_ip_quality=min(qualities),
+                recent_ip_category=min(categories,key=lambda value:ranks[value]),
+                recent_ip_confidence=min(confidences))
+
+
+def candidate_history_hints(db_path, node_ids, *, now=None, target_profile='balanced') -> dict:
+    """Bounded read-only hints for this task's strong stable-ID scope.
+
+    Never creates/migrates a database, imports raw history, matches a name or
+    returns a previous measurement as a present result. Missing/old/busy
+    databases silently fall back to current probes. Seven-day successful
+    single-stream samples or target-specific conservative IP summaries and
+    validated country codes are selection hints
+    only; country/exit reputations may have changed since that observation.
+    """
+    ids = sorted({v for v in list(node_ids)[:3000] if isinstance(v, str)
+                  and re.fullmatch(r'node_v2_[0-9a-f]{32}', v)})
+    if not ids:
+        return {}
+    conn = None
+    hints = {}
+    deadline = time.monotonic() + 0.25
+    observed_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    try:
+        path = Path(db_path)
+        if not path.is_file():
+            return {}
+        conn = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.05)
+        conn.create_function('speedbench_run_time', 1, _run_time)
+        conn.execute('PRAGMA query_only=ON')
+        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        # One indexed lookup per ID, limited to the newest usable bandwidth
+        # observation. A newer probe-only or failed run is not a speed sample.
+        sql = '''SELECT n.median_mbps,r.ts,
+                 (SELECT p.country_code FROM ip_profiles p
+                  WHERE p.node_result_id=n.id AND p.ok=1 ORDER BY p.id DESC LIMIT 1)
+                 FROM node_results n JOIN runs r ON r.id=n.run_id
+                 WHERE n.node_id=? AND n.identity_version=2
+                 AND n.identity_strength='strong' AND n.status='ok'
+                 AND n.median_mbps>0 ORDER BY speedbench_run_time(r.ts) DESC,n.id DESC LIMIT 1'''
+        ip_target=target_profile in ('ip','residential')
+        if ip_target:
+            sql='''SELECT n.run_id,r.ts,n.exit_ipv4,n.exit_ipv6,
+                   (SELECT p.country_code FROM ip_profiles p WHERE p.node_result_id=n.id
+                    AND p.ok=1 ORDER BY p.id DESC LIMIT 1)
+                   FROM node_results n JOIN runs r ON r.id=n.run_id
+                   WHERE n.node_id=? AND n.identity_version=2 AND n.identity_strength='strong'
+                   AND n.status='ok' AND EXISTS(SELECT 1 FROM ip_intel_results i
+                     WHERE i.run_id=n.run_id AND i.exit_ip IN (n.exit_ipv4,n.exit_ipv6))
+                   ORDER BY speedbench_run_time(r.ts) DESC,n.id DESC LIMIT 1'''
+        for node_id in ids:
+            if time.monotonic() >= deadline:
+                # Do not bias a large task towards the first sorted IDs when
+                # its optional history budget expires halfway through.
+                return {}
+            row = conn.execute(sql, (node_id,)).fetchone()
+            if not row:
+                continue
+            if ip_target:run_id,stamp,ipv4,ipv6,region=row
+            else:speed,stamp,region=row
+            try:
+                date = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+                # Historical CLI timestamps without an offset are local time.
+                age = (observed_now - date.astimezone(timezone.utc)).total_seconds() / 86400
+                if not 0<=age<=7:continue
+                if not ip_target and (not isinstance(speed,(int,float)) or not math.isfinite(speed) or speed<=0):continue
+            except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+                continue
+            hint=dict(history_age_days=age)
+            if ip_target:
+                rows=conn.execute('''SELECT exit_ip,ip_quality_score,ip_grade,classification,confidence,
+                    ipqs_fraud_score,scamalytics_score,CASE WHEN conflicts_json='[]' THEN 0 ELSE 1 END,
+                    substr(normalized_json,1,65536) FROM ip_intel_results
+                    WHERE run_id=? AND exit_ip IN (?,?)''',(run_id,ipv4,ipv6)).fetchall()
+                hint.update(_candidate_ip_hint(rows,(ipv4,ipv6)))
+            else:hint['recent_mbps']=speed
+            if isinstance(region, str) and re.fullmatch(r'[A-Z]{2}', region):
+                hint['region'] = region
+            hints[node_id] = hint
+        if time.monotonic()>=deadline:return {}
+    except (sqlite3.Error, OSError, ValueError):
+        # Optional enrichment cannot make a task fail or leak a local path,
+        # corrupt database content, credentials or raw exception in logs.
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+    return hints
+
+
+def node_series(db_path, name: str, days: int = 30, node_key: str = "", node_id: str = "") -> list:
     """某节点最近 days 天逐次测速序列（时间升序）。
 
-    ts 是 ISO 本地时间字符串，字典序即时间序，直接与 cutoff 比较。
+    带时区和无时区旧时间都按实际时刻排序；无时区按本机时区解释。
     node_key 非空时改按 node_key 匹配（订阅改名后仍可续上历史），否则按 name。
     """
     days = max(1, min(int(days), 3650))
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-    if node_key:
+    if node_id:
+        where, params = 'n.node_id = ?', (node_id, since)
+    elif node_key:
         where, params = "n.node_key = ?", (node_key, since)
     else:
         where, params = "n.name = ?", (name, since)
@@ -648,15 +1031,15 @@ def node_series(db_path, name: str, days: int = 30, node_key: str = "") -> list:
             "SELECT r.ts, n.median_mbps, n.best_mbps, n.multi_mbps,"
             " n.latency_ms, n.jitter_ms, n.connect_ms, n.score, n.status"
             " FROM node_results n JOIN runs r ON r.id = n.run_id"
-            f" WHERE {where} AND r.ts >= ?"
-            " ORDER BY r.id, n.id",
+            f" WHERE {where} AND speedbench_run_time(r.ts) >= speedbench_run_time(?)"
+            " ORDER BY speedbench_run_time(r.ts),r.id,n.id",
             params).fetchall()
         return [dict(row) for row in rows]
     finally:
         conn.close()
 
 
-def ip_changes(db_path, name: str) -> list:
+def ip_changes(db_path, name: str, node_id: str = '') -> list:
     """某节点出口 IP / ASN 变化时间线（时间升序）。
 
     相邻两次测速 (exit_ip, asn) 不变则合并，只保留变化点；
@@ -670,8 +1053,14 @@ def ip_changes(db_path, name: str) -> list:
             " p.asn, p.asname, p.kind, p.proxy, p.hosting, p.mobile"
             " FROM ip_profiles p JOIN runs r ON r.id = p.run_id"
             " WHERE p.name = ? AND p.exit_ip IS NOT NULL AND p.exit_ip != ''"
-            " ORDER BY r.id, p.id",
+            " ORDER BY speedbench_run_time(r.ts),r.id,p.id",
             (name,)).fetchall()
+        if node_id:
+            rows=conn.execute('''SELECT r.ts,p.exit_ip,p.country,p.country_code,p.isp,p.org,
+                p.asn,p.asname,p.kind,p.proxy,p.hosting,p.mobile FROM ip_profiles p
+                JOIN runs r ON r.id=p.run_id JOIN node_results n ON n.id=p.node_result_id
+                WHERE n.node_id=? AND p.exit_ip IS NOT NULL AND p.exit_ip!=''
+                ORDER BY speedbench_run_time(r.ts),r.id,p.id''',(node_id,)).fetchall()
         timeline = []
         last_key = None
         for row in rows:
@@ -738,7 +1127,7 @@ def _reputation_worsened(previous, current):
     return False
 
 
-def ip_reputation_changes(db_path, name: str, node_key: str = "") -> list:
+def ip_reputation_changes(db_path, name: str, node_key: str = "", node_id: str = "") -> list:
     """Return the deduplicated IP/reputation timeline for one node.
 
     The legacy ``ip_changes`` API intentionally keeps its old, small shape.
@@ -750,20 +1139,22 @@ def ip_reputation_changes(db_path, name: str, node_key: str = "") -> list:
     conn = _open(db_path)
     try:
         conn.row_factory = sqlite3.Row
-        if node_key:
+        if node_id:
+            where, params = 'n.node_id = ?', (node_id,)
+        elif node_key:
             where, params = "n.node_key = ?", (node_key,)
         else:
             where, params = "n.name = ?", (name,)
         rows = conn.execute(
-            "SELECT r.id AS run_id, r.ts, n.id AS node_result_id, n.name, "
+            "SELECT r.id AS run_id, r.node_count AS run_node_count, r.ts, n.id AS node_result_id, n.name, "
             "n.node_key, n.exit_ipv4, n.exit_ipv6, "
             "p.exit_ip, p.country, p.country_code, p.isp, p.org, p.asn, "
             "p.asname, p.kind, p.proxy, p.hosting, p.mobile "
             "FROM node_results n JOIN runs r ON r.id = n.run_id "
             "LEFT JOIN ip_profiles p ON p.id = ("
-            "SELECT p2.id FROM ip_profiles p2 WHERE p2.run_id = n.run_id "
-            "AND p2.name = n.name ORDER BY p2.id LIMIT 1) "
-            f"WHERE {where} ORDER BY r.id, n.id",
+            "SELECT p2.id FROM ip_profiles p2 WHERE p2.node_result_id=n.id "
+            "ORDER BY p2.id LIMIT 1) "
+            f"WHERE {where} ORDER BY speedbench_run_time(r.ts),r.id,n.id",
             params,
         ).fetchall()
         intel_by_run_ip = {}
@@ -787,6 +1178,7 @@ def ip_reputation_changes(db_path, name: str, node_key: str = "") -> list:
     for row in rows:
         d = dict(row)
         run_id = d.pop("run_id")
+        run_node_count = d.pop("run_node_count")
         d.pop("node_result_id", None)
         # New family columns are preferred, but old ip_profiles remains the
         # canonical fallback.  The list allows both IPv4 and IPv6 intel rows
@@ -798,10 +1190,10 @@ def ip_reputation_changes(db_path, name: str, node_key: str = "") -> list:
                 ips.append(value)
         matches = [intel_by_run_ip[(run_id, ip)] for ip in ips
                    if (run_id, ip) in intel_by_run_ip]
-        if not matches and not ips:
+        if not matches and not ips and run_node_count == 1:
             # A malformed/partial new row may have only an intelligence IP;
-            # attach it only when this run has a single intel row, avoiding
-            # cross-node duplication in a multi-node run.
+            # attach it only when the entire run has one node and one intel
+            # row. One intel row alone does not identify a failed sibling.
             candidates = [row for (rid, _), row in intel_by_run_ip.items()
                           if rid == run_id]
             if len(candidates) == 1:
@@ -969,6 +1361,100 @@ def _median_or_none(vals: list, ndigits: int):
     return round(statistics.median(vals), ndigits) if vals else None
 
 
+def source_summary(db_path, days=30, subscription_id=None):
+    """Versioned origins, keeping legacy unknowns separate and honest coverage.
+
+    Ambiguous membership is included in each possible source and explicitly
+    counted. Consumers must not sum these source totals as unique global nodes.
+    """
+    days = max(1, min(int(days), 3650))
+    since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+    conn = _open(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            'SELECT n.*,r.ts,o.subscription_id,o.name_snapshot,o.source_status AS origin_status,s.current_name '
+            'FROM node_results n JOIN runs r ON r.id=n.run_id '
+            'LEFT JOIN node_origins o ON o.node_result_id=n.id '
+            'LEFT JOIN subscription_sources s ON s.subscription_id=o.subscription_id '
+            'WHERE speedbench_run_time(r.ts)>=speedbench_run_time(?) ORDER BY speedbench_run_time(r.ts),r.id,n.id', (since,)).fetchall()
+    finally:
+        conn.close()
+    groups = {}
+    for row in rows:
+        sid = row['subscription_id'] or ''
+        if subscription_id is not None and sid != subscription_id:
+            continue
+        # Old provider labels are not verified subscriptions. They retain their
+        # own bucket instead of being silently attached to today's source.
+        legacy = (row['provider'] or '') if not sid else ''
+        key = (sid, legacy, bool(row['node_id']))
+        group = groups.setdefault(key, dict(subscription_id=sid,
+            name=row['current_name'] if sid else legacy or ('来源未知' if row['node_id'] else '历史来源未知'),
+            source_status='verified' if sid else 'unknown' if row['node_id'] else 'legacy_unknown',
+            rows=[], runs=set(), nodes=set(), ambiguous_node_count=0, last_ts=''))
+        group['rows'].append(row)
+        group['runs'].add(row['run_id'])
+        group['nodes'].add(row['node_id'] or ('legacy', row['name']))
+        if row['origin_status'] == 'ambiguous':
+            group['ambiguous_node_count'] += 1
+            group['source_status'] = 'ambiguous'
+        group['last_ts'] = max(group['last_ts'], row['ts'], key=_time_key)
+    result = []
+    for group in groups.values():
+        rows = group.pop('rows')
+        count = len(rows)
+        # Missing old probe data is neither success nor failure. Report known
+        # probe coverage separately, never silently classify unknown as offline.
+        probed = [r for r in rows if (r['probe_attempts'] and r['probe_successes'] is not None)
+                  or r['latency_ms'] is not None]
+        online = sum((r['probe_successes'] > 0 if r['probe_attempts'] and r['probe_successes'] is not None
+                      else True) for r in probed)
+        attempted = sum(r['sample_mb'] is not None or r['median_mbps'] is not None for r in rows)
+        successful = sum(r['median_mbps'] is not None and r['median_mbps'] > 0 for r in rows)
+        scores = [r['network_score'] for r in rows if r['network_score'] is not None]
+        run_count, node_count = len(group.pop('runs')), len(group.pop('nodes'))
+        result.append(dict(group, run_count=run_count, node_count=node_count,
+            probe_online_ratio=round(online/len(probed),4) if probed else None,
+            probe_coverage=round(len(probed)/count,4), bandwidth_coverage=round(attempted/count,4),
+            bandwidth_success_ratio=round(successful/attempted,4) if attempted else None,
+            median_mbps=_median_or_none([r['median_mbps'] for r in rows],3),
+            latency_ms=_median_or_none([r['latency_ms'] for r in rows],1),
+            avg_network_score=round(statistics.fmean(scores),1) if scores else None))
+    result.sort(key=lambda item: (_time_key(item['last_ts']),item['name']), reverse=True)
+    return result
+
+
+def source_series(db_path, subscription_id, days=30):
+    """Per-run source-ID coverage; old provider names are never evidence."""
+    from contextlib import closing
+    since=(datetime.now()-timedelta(days=max(1,min(int(days),3650)))).isoformat(timespec='seconds')
+    with closing(_open(db_path)) as conn:
+        conn.row_factory=sqlite3.Row
+        rows=conn.execute('''SELECT n.*,r.ts,o.name_snapshot FROM node_results n
+            JOIN runs r ON r.id=n.run_id JOIN node_origins o ON o.node_result_id=n.id
+            WHERE o.subscription_id=? AND speedbench_run_time(r.ts)>=speedbench_run_time(?) ORDER BY speedbench_run_time(r.ts),r.id,n.id''',
+            (subscription_id,since)).fetchall()
+    grouped={}
+    for row in rows:
+        grouped.setdefault(row['run_id'],[]).append(row)
+    result=[]
+    for rows in grouped.values():
+        probed=[r for r in rows if r['probe_attempts'] or r['latency_ms'] is not None]
+        online=sum(r['probe_successes']>0 if r['probe_attempts'] and r['probe_successes'] is not None
+                   else r['latency_ms'] is not None for r in probed)
+        attempted=sum(r['sample_mb'] is not None or r['median_mbps'] is not None for r in rows)
+        successful=sum(r['median_mbps'] is not None and r['median_mbps']>0 for r in rows)
+        scores=[r['network_score'] for r in rows if r['network_score'] is not None]
+        result.append(dict(ts=rows[0]['ts'],name_snapshot=rows[0]['name_snapshot'],node_count=len(rows),
+            online_ratio=online/len(probed) if probed else None,probe_coverage=len(probed)/len(rows),
+            bandwidth_coverage=attempted/len(rows),bandwidth_success_ratio=successful/attempted if attempted else None,
+            median_mbps=_median_or_none([r['median_mbps'] for r in rows],3),
+            latency_ms=_median_or_none([r['latency_ms'] for r in rows],1),
+            avg_score=statistics.fmean(scores) if scores else None))
+    return result
+
+
 def subscription_summary(db_path, days: int = 30) -> list:
     """按订阅（provider）聚合最近 days 天，供 /api/subscriptions。
 
@@ -985,8 +1471,8 @@ def subscription_summary(db_path, days: int = 30) -> list:
             "SELECT COALESCE(n.provider, ''), n.run_id, r.ts, n.name,"
             " n.status, n.median_mbps, n.latency_ms, n.score"
             " FROM node_results n JOIN runs r ON r.id = n.run_id"
-            " WHERE r.ts >= ?"
-            " ORDER BY r.id, n.id",
+            " WHERE speedbench_run_time(r.ts) >= speedbench_run_time(?)"
+            " ORDER BY speedbench_run_time(r.ts),r.id,n.id",
             (since,)).fetchall()
     finally:
         conn.close()
@@ -1004,7 +1490,7 @@ def subscription_summary(db_path, days: int = 30) -> list:
         g["meds"].append(med)
         g["lats"].append(lat)
         g["scores"].append(score)
-        if ts > g["last_ts"]:
+        if _time_key(ts) > _time_key(g["last_ts"]):
             g["last_ts"] = ts
     out = []
     for provider, g in groups.items():
@@ -1019,7 +1505,7 @@ def subscription_summary(db_path, days: int = 30) -> list:
             "avg_score": round(statistics.fmean(scores), 1) if scores else None,
             "last_ts": g["last_ts"],
         })
-    out.sort(key=lambda d: (d["last_ts"], d["provider"]), reverse=True)
+    out.sort(key=lambda d: (_time_key(d["last_ts"]), d["provider"]), reverse=True)
     return out
 
 
@@ -1036,8 +1522,8 @@ def subscription_series(db_path, provider: str, days: int = 30) -> list:
         rows = conn.execute(
             "SELECT r.id, r.ts, n.status, n.median_mbps, n.latency_ms, n.score"
             " FROM node_results n JOIN runs r ON r.id = n.run_id"
-            " WHERE COALESCE(n.provider, '') = ? AND r.ts >= ?"
-            " ORDER BY r.id, n.id",
+            " WHERE COALESCE(n.provider, '') = ? AND speedbench_run_time(r.ts) >= speedbench_run_time(?)"
+            " ORDER BY speedbench_run_time(r.ts),r.id,n.id",
             (provider or "", since)).fetchall()
     finally:
         conn.close()
