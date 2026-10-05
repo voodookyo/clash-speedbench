@@ -88,10 +88,43 @@ def _windows_private(path, sid):
             kernel.LocalFree(descriptor)
 
 
-def _secure_new_file(path, sid):
-    if os.name != 'nt':
-        os.chmod(path, 0o600)
-        return
+def _windows_set_owner(path, sid):
+    """Bind an exclusively-created path's owner to the current user SID.
+
+    Windows does not guarantee the token user owns every file it creates: an
+    elevated token whose default owner is BUILTIN\\Administrators (BA,
+    S-1-5-32-544) produces BA-owned files even though whoami reports the user
+    SID.  icacls only rewrites the DACL, so the strict owner check would reject
+    the private file this process just created exclusively.  Setting the owner
+    to the caller's own SID requires no restore privilege (the creator still
+    holds WRITE_OWNER through the inherited DACL) and keeps the existing strict
+    owner check meaningful for any pre-existing file.
+    """
+    from ctypes import wintypes
+    advapi = ctypes.WinDLL('advapi32', use_last_error=True)
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    convert = advapi.ConvertStringSidToSidW
+    convert.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    convert.restype = wintypes.BOOL
+    set_owner = advapi.SetNamedSecurityInfoW
+    set_owner.argtypes = [wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+                          ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                          ctypes.c_void_p]
+    set_owner.restype = wintypes.DWORD
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    owner = ctypes.c_void_p()
+    if not convert(sid, ctypes.byref(owner)):
+        raise IdentityError('Cannot set identity file owner')
+    try:
+        if set_owner(str(path), 1, 1, owner, None, None, None):  # SE_FILE_OBJECT, OWNER
+            raise IdentityError('Cannot set identity file owner')
+    finally:
+        kernel.LocalFree(owner)
+
+
+def _secure_new_windows_file(path, sid):
+    _windows_set_owner(path, sid)
     try:
         result = subprocess.run(['icacls.exe', str(path), '/inheritance:r',
                                  '/grant:r', '*' + sid + ':(F)'],
@@ -102,6 +135,13 @@ def _secure_new_file(path, sid):
     if result.returncode:
         raise IdentityError('Cannot restrict identity file permissions')
     _windows_private(path, sid)
+
+
+def _secure_new_file(path, sid):
+    if os.name != 'nt':
+        os.chmod(path, 0o600)
+        return
+    _secure_new_windows_file(path, sid)
 
 
 def _read_seed(path, sid):

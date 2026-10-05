@@ -43,3 +43,12 @@ class BackendOwnerTest(unittest.TestCase):
             path=Path(folder)/'backend-owner.lock';path.write_bytes(b' ');path.chmod(0o666)
             with self.assertRaises(LeaseError):BackendLease(folder).acquire()
 
+    @unittest.skipUnless(os.name=='nt','Windows owner boundary')
+    def test_windows_owner_round_trip_in_unicode_space_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            nested=Path(folder)/'速度 bench 数据';nested.mkdir()
+            with BackendLease(nested) as lease:
+                self.assertTrue(lease.path.exists())
+            with BackendLease(nested) as lease:
+                self.assertEqual(lease.path.name,'backend-owner.lock')
+

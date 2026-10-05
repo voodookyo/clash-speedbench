@@ -5,6 +5,7 @@ import unittest
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 from speedbench_identity import IdentityError, load_seed, opaque_id
 
@@ -78,6 +79,51 @@ class IdentityTest(unittest.TestCase):
             path.chmod(0o644)
             with self.assertRaises(IdentityError):
                 load_seed(path)
+
+    def test_new_file_owner_is_set_before_dacl_and_reverified(self):
+        import speedbench_identity as identity
+        order = []
+        def set_owner(path, sid): order.append('owner')
+        def run(*args, **kwargs):
+            order.append('dacl')
+            return subprocess.CompletedProcess(args, 0)
+        def verify(path, sid): order.append('verify')
+        with mock.patch.object(identity, '_windows_set_owner', set_owner), \
+             mock.patch.object(identity.subprocess, 'run', run), \
+             mock.patch.object(identity, '_windows_private', verify):
+            identity._secure_new_windows_file('C:\\tmp\\identity-seed', 'S-1-5-21-1')
+        self.assertEqual(order, ['owner', 'dacl', 'verify'])
+
+    def test_new_file_owner_failure_never_touches_dacl_or_reverifies(self):
+        import speedbench_identity as identity
+        with mock.patch.object(identity, '_windows_set_owner',
+                               side_effect=IdentityError('owner denied')), \
+             mock.patch.object(identity.subprocess, 'run',
+                               side_effect=AssertionError('icacls must not run')), \
+             mock.patch.object(identity, '_windows_private',
+                               side_effect=AssertionError('verification must not run')):
+            with self.assertRaises(IdentityError):
+                identity._secure_new_windows_file('C:\\tmp\\identity-seed', 'S-1-5-21-1')
+
+    def test_new_file_dacl_failure_never_reverifies(self):
+        import speedbench_identity as identity
+        def run(*args, **kwargs): return subprocess.CompletedProcess(args, 1)
+        with mock.patch.object(identity, '_windows_set_owner'), \
+             mock.patch.object(identity.subprocess, 'run', run), \
+             mock.patch.object(identity, '_windows_private',
+                               side_effect=AssertionError('verification must not run')):
+            with self.assertRaises(IdentityError):
+                identity._secure_new_windows_file('C:\\tmp\\identity-seed', 'S-1-5-21-1')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows owner boundary')
+    def test_windows_seed_round_trip_in_unicode_space_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td) / '速度 bench 数据'
+            folder.mkdir()
+            path = folder / 'identity-seed'
+            first = load_seed(path)
+            self.assertEqual(len(first), 32)
+            self.assertEqual(first, load_seed(path))
 
 
 if __name__ == '__main__':
