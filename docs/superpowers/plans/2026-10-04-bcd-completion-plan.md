@@ -44,7 +44,7 @@
 - [x] 更新后的 normal-code --write 从 clean eb2c31e 隔离完成桌面导入退出状态修复；Codex 检查限定 diff、源树保护元数据及 Python3.14/3.12 的 11 项桌面桥接测试后整合。私有导入产物 Git 忽略边界通过固定路径检查。
 - [x] normal-code 只读导入审阅完成；两个 normal-code --write 从 clean 06fffc1 隔离完成桌面首页数据发现引导、SQLite-only 固定文件存在性、情报状态读互斥及导入总量上限。Codex 检查 diff／保护记录后手动整合，28／32 项专项与真实浏览器键盘、明暗、390px、导入／撤回同步验证通过；原生首次启动门槛另列。
 - [x] D 休眠恢复源码接入：normal-code --write 从 clean f85b663／45c371a 隔离产出；第二轮因超时／403 未完成，由 Codex 在已结束的隔离工作区补足审阅修正和真实自有 Python 子进程取消测试后手动整合。两版本 76 项时钟专项、Python3.12 的 87 项接入专项、Python3.14/3.12 的 1132 项全量回归通过；仅记录固定原因计数，不自动重跑。实际 OS 休眠、原生窗口／包及平台矩阵仍未验收，见 desktop-power-recovery 报告。
-- [ ] B 实现与全部验收。
+- [x] B 实现与核心规格验收：目标/模式、取消预算、partial/指标、同覆盖fixture与限定实测、独立审阅及六格CI完成；原生OS生命周期另属D，不声称整体同精度提速。
 - [x] B/C 结果指标元数据：normal-code --write 从 clean a164efa 隔离产出，Codex 审阅修正并手动整合；真实观测时间、独立 probe/bandwidth/intel 与地址族状态、有效指标数、partial/final 合并及旧历史未知展示。两版最终全量各 1185 项通过（Python3.14 skipped=6、Python3.12 skipped=10），共享合成浏览器详情通过，见 result-metadata 报告；真实网络／原生／其他平台不在该证据范围。
 - [x] C 手动切换使用认证后端新鲜预览，确认目标／订阅／实际 Selector／当前选择后再次核验，过期映射拒绝。normal-code --write 从 clean a164efa 隔离完成，Codex 审阅补足 root/id/长名/焦点并手动整合；Python3.12 的 66 项专项、Python3.14 源仓库 53 项及实际合成浏览器键盘／确认／取消／切换操作通过，见 switch-confirmation 报告。真实控制器及原生 WebView 仍待验。
 - [ ] C 实现与全部验收。
@@ -52,6 +52,19 @@
 - [ ] D 实现与全部验收。
 - [x] C 实时目录／历史订阅显式分区、稳定 ID 选择入口、轮次模式／原范围／partial／SQLite 实测时间与字节／指标覆盖、空目录与无推荐引导；CLI 新 raw 保留筛选后数量，旧 raw 未知不补造。Codex 在已结束 normal-code --write 隔离区接续实现并审阅；两版各 1207 项全量通过，最终样式／中文文案修正后 7 项专项及390px历史／订阅实际浏览器通过，见 history-scope-ui 报告。原生和真实网络门槛未降低。
 - [x] C 订阅名称观测：复用按 subscription_id 查询的 name_snapshot，展示相邻名称变化、恢复旧名与未知快照；旧来源不推断改名，同名不同 ID 不合并，过期响应不覆盖新来源或天数。Codex 在既有已结束 normal-code --write 隔离区实现，88 项专项及键盘／常规和390px实际合成浏览器通过，见 history-scope-ui 补记；本次未重复旧全量或新增 native 验收结论。
-- [ ] 最终逐规格完成审计。
+- [x] 当前候选逐规格完成审计：B核心完成，C6与D3–D6/D8的完整原生人工门槛保留待验；不是全部升级完成。
+
+2026-10-05 当前验收补记：用户明确授权候选分支推送和草稿PR #1。normal-code --write
+从有效clean HEAD隔离执行最新IP文案、旧SQLite唯一回填、Windows新私有文件owner和
+Windows两份fixture修正，控制器审阅diff/保护元数据并分别执行10/44/16/26项专项后人工整合。
+无完成结果的loopback候选在全部结束后由控制器修正测试shutdown，再以54项专项验证。
+原生数字SID比较/账户缩写边界17项专项、connect绝对预算36项专项通过；GLM5.3限定只读审阅
+无阻断意见，其真实Windows条件随后由CI确认。生产413751a五平台包/locked native CI全成功；
+9faeaae六格Python各1242项（含平台skip）通过、同一冻结点的五平台桌面CI也全部成功，
+该提交仅两份测试夹具，不更改运行资产。
+所有包unsigned、禁自动更新，六个产物已留在项目dist；不合并/tag/Release/覆盖稳定安装。
+Mac后续七页/主题/focus与WebView unknown审计已操作，其他平台完整原生错误/可访问性、
+Windows安装/升级/缺依赖、托盘/通知、真实睡眠/Gatekeeper仍待真实桌面环境。
+参见 ../reports/2026-10-05-native-acceptance.md 的冻结点、CI链接和实际限制。
 
 当前路由执行补记：上述 GREEN 是路由更新时的历史检查。本批从 a164efa 启动的两个 normal-code --write 仍满足 VERIFIED／allowlist／worktree 隔离，实际多次超时后均由 DeepSeek flash 完成；registry 验证与历史健康不等于即时可用性。Codex 按返回 diff 与源树保护记录审阅，另行运行真实测试；未修改 ai-dev 或把 worker 测试文字当作最终验收。

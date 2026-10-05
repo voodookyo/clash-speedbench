@@ -19,23 +19,23 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 
 ## B：任务、调度、事件与耗时
 
-- [ ] B1：纯任务配置/候选选择/计时模块与测试；CLI/Web 参数一致、legacy 默认保持。
+- [x] B1：纯任务配置/候选选择/计时模块与测试；CLI/Web 参数一致、legacy 默认保持。
 - [x] B2：有界任务状态/事件存储、snapshot/resync/增量读取/SSE，测试 seq、重连、终态和并发请求。
-- [ ] B3：现有 worker 接入动态队列与取消；按模式控制精测/IP范围，不跨节点并发下载。
-- [ ] B4：IPv4/IPv6 独立结果状态、预算与在途请求清理；provider single-flight/cache 保持。
-- [ ] B5：task_runs/task_metrics 增量迁移、部分结果保存、真实下载字节和完整等待时间。
+- [x] B3：现有 worker 接入动态队列与取消；按模式控制精测/IP范围，不跨节点并发下载。
+- [x] B4：IPv4/IPv6 独立结果状态、预算与在途请求清理；provider single-flight/cache 保持。
+- [x] B5：task_runs/task_metrics 增量迁移、部分结果保存、真实下载字节和完整等待时间。
 - [x] B6：慢节点/失败/缓存 mock 基线，限定流量实际对照测试；记录覆盖率相同与不同模式的区别。
-- [ ] B7：专项/全量/六格 CI 核心矩阵、取消和恢复验收，阶段报告与提交。
+- [x] B7：专项/全量/六格 CI 核心矩阵、取消和恢复验收，阶段报告与提交。
 
 新测试按职责拆为 task_config、task_events、worker_schedule、phase_metrics、job_history、job_api。原 latency、probe、curl、phase2、cancel 测试必须继续通过。
 
 ## C：共享 UI
 
-- [ ] C1：确认 A/B 合约并按目录/任务/渲染/历史/泄漏分离前端责任，不重新编写测量规则。
-- [ ] C2：来源选择、目标/模式、流量提示、折叠高级参数、串行回退确认。
-- [ ] C3：实时结果/任务中心/覆盖范围/有限推荐/详情，刷新续接。
-- [ ] C4：稳定 ID 收藏/选择/趋势，旧收藏唯一匹配迁移与未确认项。
-- [ ] C5：主题、键盘、focus/aria、长名/窄窗口、明确错误/空状态。
+- [x] C1：确认 A/B 合约并按目录/任务/渲染/历史/泄漏分离前端责任，不重新编写测量规则。
+- [x] C2：来源选择、目标/模式、流量提示、折叠高级参数、串行回退确认。
+- [x] C3：实时结果/任务中心/覆盖范围/有限推荐/详情，刷新续接。
+- [x] C4：稳定 ID 收藏/选择/趋势，旧收藏唯一匹配迁移与未确认项。
+- [x] C5：主题、键盘、focus/aria、长名/窄窗口、明确错误/空状态。
 - [ ] C6：来源/历史/IP/泄漏/设置完整渲染操作、安全测试、截图证据和阶段提交。
 
 源码 Web 保持静态文件可直接服务；构建/测试工具需要锁版本且不能成为 Python 运行依赖。
@@ -48,10 +48,20 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 - [ ] D4：Windows EXE/便携/安装包与 WebView2 策略、无系统 Python实际验证。
 - [ ] D5：macOS Intel/Apple Silicon与Linux打包/构建/运行证据，不以Windows结果代替。
 - [ ] D6：升级/回退保留 raw、偏好/身份seed备份说明，旧独立Web协调。
-- [ ] D7：签名状态、SHA256/许可证、README迁移/限制、前端与桌面CI任务。
+- [x] D7：签名状态、SHA256/许可证、README迁移/限制、前端与桌面CI任务。
 - [ ] D8：完整规格逐项完成审计、交付报告。用户历史不因验证改变；不自动push/tag/Release。
 
 ## 实施状态与证据
+
+- 2026-10-05 后续CI验收：用户已明确授权独立开发分支与草稿PR #1，不合并/tag/Release。
+  normal-code隔离写入、控制器审查及专项修正后，9faeaae六格核心CI全部通过，每格1242项；
+  Windows两格5项真实pipe取消/timeout/NT fallback均实际执行成功。9faeaae五平台native
+  locked测试、包、provenance全部通过，Windows独立portable验证不依赖系统Python PATH；
+  本地留存413751a的包到9faeaae仅改两份测试夹具，运行资产相同。B1–B7核心验收完成，不声称同精度整体提速。
+  C1–C5由各专项及既有七页/错误/键盘/390px浏览器记录支撑，Mac原生后续七页、主题、
+  键盘与WebView无法确认审计补充真实证据；C6完整原生矩阵继续待验。D7完成锁定来源/
+  许可证/unsigned/禁自动更新/五平台产物，D3–D6/D8的人工门槛不以CI替代。
+  详见 ../reports/2026-10-05-native-acceptance.md；下列较早“待验/未授权push”均为当时状态。
 
 - 2026-10-05 本地原生/实测：用户批准隔离工具安装、固定5节点两轮10MB样本及外部执行；未批准 push/Release。normal-code --write 的退出修复经控制器补回归、审查整合；UI 委派无改动超时，由控制器在结束的隔离 worktree 内完成并整合。生产包 clean 3b8a3a6；最终测试8f1b874仅追加夹具修正，运行资产无差异。macOS3.9与Linux3.12最终全量各1231（skipped=10），包内36/两版109/JS39专项通过；Intel与Linux locked native各6通过。ARM原生、Intel Rosetta、Linux ARM installed/Xvfb实际启动及quit=0；ARM backend崩溃时5个真实worker及CLI全回收，空闲shell崩溃EOF清理/raw保留，用户kernel及mode/Selector保持。真实导入/撤回与失败IP历史不误推冠军通过。固定同覆盖静态/动态两轮各15探测/5带宽/5结果，实际27.84MB、首结果提前24.5%而总耗时增加2.6%，不声称整体同精度提速；结合30/100/300 fixture，B6完成。详见 ../reports/2026-10-05-native-acceptance.md。Windows真实pipe/当前包、六格+五平台CI、完整C页面及D托盘/通知/睡眠/Gatekeeper矩阵仍待验；B/C/D整阶段不整体勾选。
 

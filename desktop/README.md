@@ -7,6 +7,9 @@ Local acceptance now includes an Apple Silicon native window, an Intel build
 running under Rosetta, and an installed Linux ARM package under a virtual
 display. The complete platform/lifecycle matrix remains pending; see
 `../docs/superpowers/reports/2026-10-05-native-acceptance.md` for exact evidence.
+The five-platform native CI build/package matrix and six Python 3.9/3.12 jobs
+have now passed. CI includes a Windows portable-artifact check without system
+Python PATH; it does not prove interactive tray, notifications or suspend.
 
 ## Packages and system requirements
 
@@ -24,7 +27,8 @@ display. The complete platform/lifecycle matrix remains pending; see
   GTK3, WebKitGTK 4.1, appindicator, curl and compatible glibc required. Other
   distributions are not automatically compatible. ARM build/install/bootstrap/
   quit passed on an isolated Ubuntu 22.04 VM with Xvfb. Interactive desktop,
-  x86-64 and suspend acceptance remain pending.
+  x86-64 runtime/bootstrap/build/package CI has passed; interactive desktop
+  and suspend acceptance remain pending.
 
 All current packages are **unsigned**. No automatic update plugin is enabled.
 Official release links support manual upgrade; there is no silent download or

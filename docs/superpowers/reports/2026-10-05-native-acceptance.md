@@ -1,13 +1,15 @@
-# 本地原生包与限定实测验收
+# 原生包、跨平台 CI 与限定实测验收
 
 日期：2026-10-05。B/C/D 继续实施，整阶段尚未全部验收。
-用户已经批准项目隔离工具安装、限定真实网络样本和外部执行；这不包含
-push、合并、tag、Release 或覆盖稳定安装。
+B 核心规格验收完成；C6 和 D3–D6/D8 的完整人工验收仍保留待验。
+用户已经批准项目隔离工具安装、限定真实网络样本和外部执行。
+后续明确授权将候选分支推送公共仓库并创建草稿 PR，运行六格 Python 与五平台桌面 CI；
+仍不包含合并、tag、Release 或覆盖稳定安装。
 
 ## 冻结与委派
 
-生产包冻结 `3b8a3a6102dddca1be23dc1f89b319e587e0339f`，source_dirty=false；
-最终测试冻结 `8f1b8742f2d98e50f9e03bd4bc3d2da4e47edc5e`。
+本地首轮生产包冻结 `3b8a3a6102dddca1be23dc1f89b319e587e0339f`，source_dirty=false；
+对应首轮最终测试冻结 `8f1b8742f2d98e50f9e03bd4bc3d2da4e47edc5e`。
 两者 Git diff 仅为 tests/test_history_summary.py 的旧夹具修正，运行资产无差异。
 工具全部安装于外层 .toolchain 或自有 Linux VM；未修改全局 ai-dev 路由、
 认证、原生 AI 工具设置、Verge 配置或系统代理。测试历史位于专用 .acceptance。
@@ -28,7 +30,7 @@ UI 子任务 `db41379e-431b-48c7-81e6-82432bd798ec` 使用同一路由/隔离机
 abort（后端 -6）。现使用有界 os.read 读私有描述符，并从 bootstrap 开始复用
 同一 reader，避免一个 pipe write 中后续控制帧被读前缓冲吞掉。
 父 stdin 保持打开的实际 HTTP quit、真实 pipe 帧/EOF、超长/残缺帧和合并帧均覆盖。
-Windows 分支仍需真实系统运行，不用 POSIX 成功替代。
+Windows 后续 CI 的真实运行证据见文末，不用 POSIX 成功替代。
 
 失败 IP-only 任务虽有 probe 延迟与派生 score=0，原 UI 仍显示有限推荐及历史冠军。
 现活跃/终态任务推荐要求有效的父确认 first_recommendation（0 也有效）及当前
@@ -124,14 +126,105 @@ max-time=3s、--all、--no-ip、--deny-serial-fallback，没有自适应 warmup/
 
 ## 未验收与下一步
 
-本地功能/平台子项通过不使 B7/C6/D3–D8 全部完成。Windows真实命名管道取消、
-Windows当前源码原生包/安装器/WebView2及完整生命周期仍待对应系统；Linux x86-64、
-实体 Intel 与五平台完整 CI 仍缺当前冻结点证据。托盘/系统通知/真实睡眠恢复、
-Gatekeeper及完整共享页面/错误/可访问性矩阵仍待逐项验收。
+本地功能/平台子项通过不使 C6/D3–D6/D8 全部完成。Windows交互式窗口、安装/升级、
+缺WebView2、托盘/系统通知/真实睡眠恢复，Linux交互式桌面及实体Intel运行仍待对应系统。
+五平台编译/包/原生bootstrap和六格核心测试另列CI证据，不代表上述人工生命周期通过。
+Gatekeeper及完整原生错误/可访问性矩阵仍待逐项验收。
 Linux VM没有/sys/power/state，不能以 clock simulation 充作真实睡眠。
-另发现旧 IP-only结果顶部样本文案含 nullMB，作为剩余 C 文案项记录，未扩展本次修复。
+旧 IP-only结果顶部样本文案含 nullMB 已在后续 normal-code 隔离写入中修复：
+任务 mode=ip 显示“不请求带宽”；非 IP 且样本参数无效显示“带宽样本参数未知”，不推断旧数据。
 
-当前 GitHub 公共仓库仅 master=e4e33d3，只有 test.yml/release.yml；desktop.yml
-尚未在远端，workflow_dispatch 不能凭本地文件触发当前候选。
-下一外部步骤需明确授权推送一个独立开发分支并创建草稿 PR 触发既有六格 Python
-和新增五平台 desktop CI；不合并、tag、Release或覆盖稳定安装。
+## 后续授权与跨平台 CI
+
+用户明确授权推送分支并创建草稿 PR。开发分支为 codex/bcd-native-acceptance-20261005，
+[草稿 PR #1](https://github.com/voodookyo/clash-speedbench/pull/1) 针对 master；
+未合并、tag、Release 或替换稳定安装。
+
+首次0df3791运行：Ubuntu Python3.9/3.12通过；macOS两格失败；Windows两格卡在
+超长 anonymous pipe fixture同步写入，在控制器取消后日志保留。原生 macOS ARM/Intel、
+Linux ARM/x86-64四格通过；Windows7项 Rust中6项通过（含真实JobObject自有子树与
+无关进程保留），包内启动因私有所有权检查失败。
+[首次 Python](https://github.com/voodookyo/clash-speedbench/actions/runs/37248891464)、
+[首次桌面](https://github.com/voodookyo/clash-speedbench/actions/runs/37248891563)。
+以下定位与修复没有将首轮失败隐藏或当成环境问题跳过：
+
+- normal-code --write run 0ed349eb-0227-4f8b-b2cc-a8eb507d0757从clean0df3791
+  隔离完成最新IP样本文案；仅web/app.js与history summary测试，控制器10项专项通过。
+- normal-code --write run 3ba7b437-a8f2-457b-a245-2e79260991ae从clean59f0611
+  隔离替换旧SQLite不支持的裸HAVING为条件聚合；同run/name唯一匹配才回填，
+  0/多条保留NULL。控制器Python3.9.25的44项迁移/历史专项通过。
+- 超长帧拒绝测试的有效上限为256字节，只需259字节验证；旧4097字节同步写
+  满Windows匿名管道，在开始读取前死锁。改小fixture仍验证超限拒绝，不改变生产上限。
+  [Microsoft CreatePipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe)。
+- 临时启动栈记录确认macOS子进程实际阻塞socket.getfqdn→HTTPServer.server_bind；
+  这不是时钟/管道/SQLite问题。后续采用固定numeric loopback绑定，不查询反向DNS。
+- Windows原生子进程固定阶段诊断为lease；种子并发创建亦因owner/DACL检查失败。
+  normal-code --write run 5d8d47b3-5428-46e9-831c-ef0451796689从clean bdb2f16
+  隔离完成新私有文件owner设置，控制器16项专项通过（3项Windows skip）。
+  真实CI仍失败，不能将这个中间修复当作已解决。控制器随后在结束的隔离区改为
+  GetNamedSecurityInfoW返回owner PSID、ConvertSidToStringSidW取得数字SID再严格比较；
+  SDDL可使用LA等账户缩写，仅在真实owner匹配后允许该owner同一缩写的ACE。
+  BA旧owner及Everyone ACL继续拒绝；已有seed从不接管。17项专项通过（3 skip），
+  Windows后续真实seed/lease与包内bootstrap通过。
+  [Microsoft SID strings](https://learn.microsoft.com/zh-tw/windows/win32/secauthz/sid-strings)。
+- loopback委派e7bd08dc-f27e-4206-a366-a0bd13887289因新测试漏server.shutdown而超时，
+  无完成结果；控制器确认全部候选结束，在隔离区修正测试清理，54项专项通过后人工整合。
+  固定numeric loopback不进行server_bind反向DNS，正常认证/静态资源/HTTP quit保持。
+- localhost第一IPv6地址不通时原连接用尽整项deadline，不能再试IPv4。
+  控制器保留绝对总deadline，将剩余connect时间分给剩余地址，失败socket回收、
+  取消不被吞掉；真实loopback和确定性阻塞fixture等36项专项通过。
+- Windows Linux时钟ABI合成测试需create=True建立宿主不存在的time API，
+  Node profile/history对拍需显式UTF-8解码；不改变真实平台clock或排序公式。
+
+## 后续冻结、独立审阅与包
+
+生产冻结413751a；只读normal-code run 11fec4e4-a74c-430a-b41e-c8203f3353f7
+由OpenCode/GLM5.3完成owner/DACL与connect预算的限定独立审阅，no_blocking_issue，
+结论明确以真实Windows运行为条件，不等于全仓审计。此前一次normal-code只读调用因
+NO_ELIGIBLE_CANDIDATE没有结论，未修改路由/冷却/认证绕过限制。
+
+413751a的六格测试中macOS/Ubuntu四格成功，Windows尚有6 error/3 failure：
+测试用第二个handle读持有强制字节锁的文件、用cp1252读取UTF-8中文、在线程池中
+注册只能主线程注册的SIGBREAK。normal-code --write run
+524e2009-da75-4aa8-9e5d-dc2ce41d36c3从clean413751a隔离完成两份测试夹具修正。
+控制器检查只改test_history_transfer/test_prepare_cancel，保留锁、完整bytes/mtime/inode
+断言与1秒取消时限，26项专项通过后人工整合9faeaae，运行资产无改动。
+上述成功写委派write_isolated/source_head_unchanged/source_status_unchanged为true，
+auto_commit/merge/push为false；全部生产整合/提交/推送由控制器执行。
+
+[五平台桌面CI](https://github.com/voodookyo/clash-speedbench/actions/runs/37253509432)
+已全部成功：Windows x64、macOS ARM/Intel、Linux ARM/x64。每格完成locked原生测试、
+unsigned包与provenance；Windows另外完成portable/NSIS和独立无系统Python PATH包验收。
+PR checkout为合并提交21637cfb472858d1fbf57e543de5cf3144872f89，实际Git diff核对与
+413751a无文件差异；不要将PR merge SHA误写成开发分支HEAD。
+产物已保存于dist/desktop-ci/413751a的五个平台目录，每项source_dirty=false、
+runtime3.14.8、unsigned、automatic_updates=false；六个安装/便携包及各自SHA-256
+见其build-provenance.json。GitHub artifact仅保留14天，不是正式Release。
+
+[六格Python CI](https://github.com/voodookyo/clash-speedbench/actions/runs/37254784775)
+在9faeaae修正测试夹具后全部成功，Windows真实命名管道取消不再以POSIX skip代替。
+413751a到9faeaae只改上述两份测试文件，因此两轮冻结的运行资产相同。
+同一9faeaae的[最新五平台桌面CI](https://github.com/voodookyo/clash-speedbench/actions/runs/37254784794)
+也已全部成功，含Windows无系统Python PATH独立包验收；六格核心与五平台构建现在具有同一
+开发分支冻结点。此前413751a的本地留存包仍按原provenance标记，不冒充最新构建产物。
+后续仅文档提交不改变该测试冻结点；文档同步使用skip-ci，不能声称文档HEAD重新跑过上述测试。
+
+| 核心CI环境 | 实际Python | 数量 / 秒 | skip | 结果 |
+|---|---|---|---:|---|
+| Ubuntu | 3.9.25 | 1242 / 86.969 | 12 | OK |
+| Ubuntu | 3.12.14 | 1242 / 83.976 | 12 | OK |
+| macOS | 3.9.13 | 1242 / 124.082 | 12 | OK |
+| macOS | 3.12.10 | 1242 / 128.655 | 12 | OK |
+| Windows | 3.9.13 | 1242 / 183.085 | 23 | OK |
+| Windows | 3.12.10 | 1242 / 163.225 | 23 | OK |
+
+Windows两格NativePipeCancellationTest的5项stalled header/body取消与restore、chunked
+成功/强制NT fallback、预取消不打开、timeout失败语义均为ok；POSIX两OS的同5项是skip，
+不能混同。skip总数还包含各平台不适用测试，不表示有1242个执行通过的用例。
+
+本地后续ARM包ccbcf56亦source_dirty=false，46750982 bytes，由既有collector留在
+dist/desktop-artifacts/ccbcf56527c1。该包实际七页导航、崩溃任务partial回放、订阅趋势
+及名称观测、IP-only顶部不请求带宽、深色/系统主题切换、键盘focus通过；退出=0。
+真实系统WebView WebRTC探测获得一个candidate，但采集未完成，正确显示“无法确认”，
+保存的自有测试审计保持unknown/DNS unknown/系统WebView；不写成无泄漏，不公布出口地址。
+未更改Verge或系统代理、未增加带宽样本，所有本次原生测试实例已退出。
