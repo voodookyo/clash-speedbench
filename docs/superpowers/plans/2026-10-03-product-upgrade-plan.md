@@ -24,7 +24,7 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 - [ ] B3：现有 worker 接入动态队列与取消；按模式控制精测/IP范围，不跨节点并发下载。
 - [ ] B4：IPv4/IPv6 独立结果状态、预算与在途请求清理；provider single-flight/cache 保持。
 - [ ] B5：task_runs/task_metrics 增量迁移、部分结果保存、真实下载字节和完整等待时间。
-- [ ] B6：慢节点/失败/缓存 mock 基线，限定流量实际对照测试；记录覆盖率相同与不同模式的区别。
+- [x] B6：慢节点/失败/缓存 mock 基线，限定流量实际对照测试；记录覆盖率相同与不同模式的区别。
 - [ ] B7：专项/全量/六格 CI 核心矩阵、取消和恢复验收，阶段报告与提交。
 
 新测试按职责拆为 task_config、task_events、worker_schedule、phase_metrics、job_history、job_api。原 latency、probe、curl、phase2、cancel 测试必须继续通过。
@@ -52,6 +52,8 @@ A 的上述核心链路已完成本机验收；不代表整份规格或四阶段
 - [ ] D8：完整规格逐项完成审计、交付报告。用户历史不因验证改变；不自动push/tag/Release。
 
 ## 实施状态与证据
+
+- 2026-10-05 本地原生/实测：用户批准隔离工具安装、固定5节点两轮10MB样本及外部执行；未批准 push/Release。normal-code --write 的退出修复经控制器补回归、审查整合；UI 委派无改动超时，由控制器在结束的隔离 worktree 内完成并整合。生产包 clean 3b8a3a6；最终测试8f1b874仅追加夹具修正，运行资产无差异。macOS3.9与Linux3.12最终全量各1231（skipped=10），包内36/两版109/JS39专项通过；Intel与Linux locked native各6通过。ARM原生、Intel Rosetta、Linux ARM installed/Xvfb实际启动及quit=0；ARM backend崩溃时5个真实worker及CLI全回收，空闲shell崩溃EOF清理/raw保留，用户kernel及mode/Selector保持。真实导入/撤回与失败IP历史不误推冠军通过。固定同覆盖静态/动态两轮各15探测/5带宽/5结果，实际27.84MB、首结果提前24.5%而总耗时增加2.6%，不声称整体同精度提速；结合30/100/300 fixture，B6完成。详见 ../reports/2026-10-05-native-acceptance.md。Windows真实pipe/当前包、六格+五平台CI、完整C页面及D托盘/通知/睡眠/Gatekeeper矩阵仍待验；B/C/D整阶段不整体勾选。
 
 - 2026-10-04 macOS 接续：恢复 7cdf4fd 开发链与两份 Windows pipe WIP；本机 baseline 895 tests。新增作用域内 OVERLAPPED pipe 读写、精确操作取消/完成确认、默认 SIGINT 暂存与处理器恢复，保留 NT fallback/reader 所有权/非取消恢复写；25 portable 回归通过，Python3.14.7/3.12.13 最终全量各920 tests（skipped=6/10）。独立 K3 建议已核对修正，GLM无最终输出，review_coverage=partial。真实 Windows pipe/包、Python3.9、原生桌面和所有传输硬预算仍待验收；未安装依赖、push或改变真实用户数据。见 ../reports/2026-10-04-pipe-cancellation-checkpoint.md；B/C/D整项仍不勾选。
 - 初始代码 HEAD：32e21dd；书面规格提交：1000ff7。

@@ -3,8 +3,10 @@
 The desktop shell is **1.1.0-alpha.1**, not a published stable release. It is a
 real Tauri 2 WebView window around the existing Python/curl/Mihomo engine. The
 legacy CLI/Web launchers stay available. No pip package is needed at runtime.
-The current native acceptance evidence is Windows only; merely providing
-macOS/Linux build jobs is not proof that those packages run successfully.
+Local acceptance now includes an Apple Silicon native window, an Intel build
+running under Rosetta, and an installed Linux ARM package under a virtual
+display. The complete platform/lifecycle matrix remains pending; see
+`../docs/superpowers/reports/2026-10-05-native-acceptance.md` for exact evidence.
 
 ## Packages and system requirements
 
@@ -15,11 +17,14 @@ macOS/Linux build jobs is not proof that those packages run successfully.
   bootstrapper if missing (Internet required). Portable/offline systems need
   WebView2 already installed. The Python runtime is bundled, not system PATH.
 - macOS: separate Intel/Apple Silicon CPython runtime and app/DMG configuration;
-  minimum declared desktop OS 14.0. System curl required. Native build/run and
-  Gatekeeper acceptance are still pending; unsigned is not notarized.
+  minimum declared desktop OS 14.0. System curl required. ARM native and Intel
+  Rosetta build/run/quit checks passed locally. Physical Intel and Gatekeeper
+  acceptance remain pending; unsigned is not notarized.
 - Linux: x86-64/aarch64 runtime and Debian packaging, built against Ubuntu 22.04.
   GTK3, WebKitGTK 4.1, appindicator, curl and compatible glibc required. Other
-  distributions are not automatically compatible. Native acceptance pending.
+  distributions are not automatically compatible. ARM build/install/bootstrap/
+  quit passed on an isolated Ubuntu 22.04 VM with Xvfb. Interactive desktop,
+  x86-64 and suspend acceptance remain pending.
 
 All current packages are **unsigned**. No automatic update plugin is enabled.
 Official release links support manual upgrade; there is no silent download or
@@ -110,6 +115,9 @@ Window close hides to tray; tray offers open/status/cancel/exit. Exit requests
 cancel/cleanup before backend shutdown. Timeout is a failure, not clean success.
 Windows Job Object owns the backend and descendants before bootstrap; no global
 process-name kill. POSIX uses a dedicated process group and parent EOF cleanup;
+Apple Silicon acceptance includes an owned backend crash with five actual
+temporary Mihomo workers and an idle native-shell crash: captured descendants
+were reaped and the user's kernel/controller selections survived. Other
 platform crash/forced-signal acceptance is still pending.
 
 The private desktop backend now checks paired native clocks for suspend during
