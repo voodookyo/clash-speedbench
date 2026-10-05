@@ -228,3 +228,8 @@ dist/desktop-artifacts/ccbcf56527c1。该包实际七页导航、崩溃任务par
 真实系统WebView WebRTC探测获得一个candidate，但采集未完成，正确显示“无法确认”，
 保存的自有测试审计保持unknown/DNS unknown/系统WebView；不写成无泄漏，不公布出口地址。
 未更改Verge或系统代理、未增加带宽样本，所有本次原生测试实例已退出。
+
+后续ccbcf56的关闭/重复启动检查：关闭窗口后应用仍运行，第二次启动exit=0，
+恢复相同50958端口与同一native/backend PID；认证退出后两者均消失、native exit=0。
+CUA在隐藏窗口状态无法返回窗口快照，当前工具没有可操作的菜单栏托盘入口；
+没有据此判定产品托盘失败，也没有把重复启动恢复当成托盘菜单通过。
