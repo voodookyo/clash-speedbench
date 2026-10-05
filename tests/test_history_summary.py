@@ -101,8 +101,10 @@ class HistorySummaryJsTest(unittest.TestCase):
         out=task_ui.TaskUiJsTest.run_app(self,"""
           (async()=>{await new Promise(r=>setTimeout(r,0));sourceCatalog={status:'ok',nodes:[]};
             let sent=0,messages=[];post=async()=>{sent++;};toast=x=>messages.push(x);await startTask();
-            currentProfile='download';showTask({started_at:'fixture',status:'completed',config:{mode:'quick'},metrics:{},
-              results:[{name:'fixture',status:'ok',latency_ms:10,jitter_ms:2,measurement_scope:{probe:'completed',bandwidth:'not_requested'}}]});
+            currentProfile='download';showTask({started_at:'fixture',status:'completed',config:{mode:'ip'},metrics:{},
+              milestones:{first_recommendation:0},
+              results:[{name:'fixture',status:'ok',latency_ms:10,jitter_ms:2,ip_quality_score:70,ip_grade:'B',
+                measurement_scope:{mode:'ip',probe:'completed',bandwidth:'not_requested'}}]});
             const download=__el('latest-meta').textContent;setProfile('daily');const daily=__el('latest-meta').textContent;
             console.log(JSON.stringify({sent,messages,download,daily}));})();
         """)
