@@ -532,9 +532,9 @@ class LinuxBindingTest(unittest.TestCase):
             return {mono: 100 if seen.count(mono) == 1 else 300,
                     boot: 1_000_000_000}[clock_id]
 
-        with mock.patch.object(time, "clock_gettime_ns", fake_getter), \
+        with mock.patch.object(time, "clock_gettime_ns", fake_getter, create=True), \
              mock.patch.object(time, "CLOCK_BOOTTIME", boot, create=True), \
-             mock.patch.object(time, "CLOCK_MONOTONIC", mono):
+             mock.patch.object(time, "CLOCK_MONOTONIC", mono, create=True):
             clock = power._linux_power_clock()
         self.assertEqual(clock(), (1_000_000_000 - 300, 1_000_000_000 - 100))
         self.assertEqual(seen, [mono, boot, mono])
@@ -544,9 +544,9 @@ class LinuxBindingTest(unittest.TestCase):
         boot, mono = self._boot(), self._mono()
 
         with mock.patch.object(time, "clock_gettime_ns",
-                               mock.Mock(side_effect=OSError("nope"))), \
+                               mock.Mock(side_effect=OSError("nope")), create=True), \
              mock.patch.object(time, "CLOCK_BOOTTIME", boot, create=True), \
-             mock.patch.object(time, "CLOCK_MONOTONIC", mono):
+             mock.patch.object(time, "CLOCK_MONOTONIC", mono, create=True):
             clock = power._linux_power_clock()
             with self.assertRaises(power.PowerClockError):
                 clock()
@@ -559,9 +559,9 @@ class LinuxBindingTest(unittest.TestCase):
                 def fake_getter(clock_id, _bad=bad):
                     return _bad
 
-                with mock.patch.object(time, "clock_gettime_ns", fake_getter), \
+                with mock.patch.object(time, "clock_gettime_ns", fake_getter, create=True), \
                      mock.patch.object(time, "CLOCK_BOOTTIME", boot, create=True), \
-                     mock.patch.object(time, "CLOCK_MONOTONIC", mono):
+                     mock.patch.object(time, "CLOCK_MONOTONIC", mono, create=True):
                     clock = power._linux_power_clock()
                     with self.assertRaises(power.PowerClockError):
                         clock()

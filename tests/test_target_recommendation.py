@@ -124,7 +124,7 @@ class ProfileParityTest(unittest.TestCase):
         module=Path(__file__).resolve().parents[1]/'web/profiles.js'
         script='const P=require('+json.dumps(str(module))+');const rows='+json.dumps(rows)+';'
         script+='console.log(JSON.stringify(Object.fromEntries(["balanced","daily","download","ip","residential"].map(p=>[p,{scores:rows.map(r=>P.score(r,p)),order:[...rows].sort((a,b)=>P.compare(a,b,p)).map(r=>r.name)}]))));'
-        run=subprocess.run([NODE,'-e',script],capture_output=True,text=True,timeout=10)
+        run=subprocess.run([NODE,'-e',script],capture_output=True,text=True,encoding='utf-8',timeout=10)
         self.assertEqual(run.returncode,0,run.stderr);got=json.loads(run.stdout)
         before=copy.deepcopy(rows)
         for profile,actual in got.items():

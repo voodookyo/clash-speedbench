@@ -37,6 +37,50 @@ class ProviderTransportCancellationTest(unittest.TestCase):
     def test_cancel_stalled_headers(self): self.stalled(False)
     def test_cancel_stalled_connection_close_body(self): self.stalled(True)
 
+    def test_unavailable_first_family_leaves_budget_for_live_loopback(self):
+        # Windows may wait out an unavailable ::1 connect before trying the
+        # fixture's listening IPv4 socket. Keep one request-wide deadline.
+        listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen(1)
+        self.addCleanup(listener.close)
+        port=listener.getsockname()[1]
+        addresses=[(socket.AF_INET6,socket.SOCK_STREAM,0,'',('::1',port,0,0)),
+                   (socket.AF_INET,socket.SOCK_STREAM,0,'',('127.0.0.1',port))]
+        original=process.connect_socket;closed=[]
+        def connect(sock,target,cancel,deadline):
+            if sock.family==socket.AF_INET6:
+                import time
+                while time.monotonic()<deadline:time.sleep(.002)
+                closed.append(sock)
+                raise socket.timeout('fixture unavailable first address')
+            return original(sock,target,cancel,deadline)
+        import time
+        deadline=time.monotonic()+.2
+        with mock.patch.object(process,'_resolve_addresses',return_value=addresses), \
+             mock.patch.object(process,'connect_socket',side_effect=connect):
+            client=process._create_connection(('localhost',port),.2,None,lambda:False,deadline)
+        self.addCleanup(client.close)
+        accepted,_=listener.accept();self.addCleanup(accepted.close)
+        client.sendall(b'ok');self.assertEqual(accepted.recv(2),b'ok')
+        self.assertTrue(closed);self.assertEqual(closed[0].fileno(),-1)
+        self.assertLess(time.monotonic(),deadline)
+
+    def test_multiple_unavailable_addresses_share_one_absolute_budget(self):
+        import time
+        addresses=[(socket.AF_INET,socket.SOCK_STREAM,0,'',('127.0.0.1',1))]*2
+        attempted=[]
+        def connect(sock,target,cancel,deadline):
+            attempted.append(sock)
+            while time.monotonic()<deadline:time.sleep(.002)
+            raise socket.timeout('fixture unavailable address')
+        start=time.monotonic();deadline=start+.2
+        with mock.patch.object(process,'_resolve_addresses',return_value=addresses), \
+             mock.patch.object(process,'connect_socket',side_effect=connect), \
+             self.assertRaises(socket.timeout):
+            process._create_connection(('localhost',1),.2,None,lambda:False,deadline)
+        self.assertLess(time.monotonic()-start,.3)
+        self.assertEqual(len(attempted),2)
+        self.assertTrue(all(sock.fileno()==-1 for sock in attempted))
+
     def test_precancelled_request_does_not_open_connection(self):
         with process.cancellation_scope(lambda: True), mock.patch.object(socket, 'socket') as create:
             with self.assertRaises(KeyboardInterrupt):

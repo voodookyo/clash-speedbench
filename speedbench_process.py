@@ -105,17 +105,23 @@ def _resolve_addresses(host,port,cancel,deadline):
 
 def _create_connection(address,timeout,source_address,cancel,deadline):
     error=None
-    for family,kind,protocol,_,target in _resolve_addresses(*address,cancel,deadline):
+    addresses=_resolve_addresses(*address,cancel,deadline)
+    for index,(family,kind,protocol,_,target) in enumerate(addresses):
         if cancel():raise KeyboardInterrupt
         _remaining(deadline)
         sock=socket.socket(family,kind,protocol)
         try:
             if source_address:sock.bind(source_address)
-            connect_socket(sock,target,cancel,deadline)
+            # One unavailable family must not consume every remaining address
+            #'s connect budget; the overall request deadline never moves.
+            attempt_deadline=(time.monotonic()+_remaining(deadline)/(len(addresses)-index)
+                              if deadline is not None else None)
+            connect_socket(sock,target,cancel,attempt_deadline)
+            sock.settimeout(_remaining(deadline))
             return sock
         except BaseException as exc:
             sock.close()
-            if not isinstance(exc,OSError) or isinstance(exc,socket.timeout):raise
+            if not isinstance(exc,OSError):raise
             error=exc
     if error is not None:raise error
     raise OSError('Name resolution returned no addresses')
