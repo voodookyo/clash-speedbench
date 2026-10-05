@@ -11,6 +11,47 @@ MODULE = Path(__file__).resolve().parents[1]/'web'/'tasks.js'
 
 @unittest.skipUnless(NODE,'Node unavailable')
 class TaskUiJsTest(unittest.TestCase):
+    def test_task_recommendation_requires_parent_milestone_and_current_profile_data(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));currentProfile='all';
+            const row={name:'IP fixture',score:0,latency_ms:20,jitter_ms:1,
+              ip_quality_score:70,ip_grade:'B',measurement_scope:{mode:'ip',bandwidth:'not_requested'}};
+            const task={status:'completed',config:{mode:'ip',target_profile:'daily'},results:[row]};
+            const text=()=>{renderTaskResultMeta(task);return __el('latest-meta').textContent;};
+            const absent=text();task.status='probing';const pending=text();task.status='completed';
+            const invalid=[null,-1,'0',Infinity,NaN].map(value=>{task.milestones={first_recommendation:value};return text();});
+            task.milestones={first_recommendation:0};const confirmed=text();
+            currentProfile='download';const changed=text();
+            currentProfile='all';task.results=[{...row,ip_quality_score:null,ip_grade:null}];
+            const failed=text();showTask(task);renderBoard();
+            console.log(JSON.stringify({absent,pending,invalid,confirmed,changed,failed,board:__el('board').style.display}));})();
+        """)
+        self.assertIn('没有可推荐结果',out['absent'])
+        self.assertIn('等待可用于推荐',out['pending'])
+        self.assertTrue(all('没有可推荐结果' in text for text in out['invalid']))
+        self.assertIn('已测范围内推荐',out['confirmed'])
+        self.assertIn('没有可推荐结果',out['changed'])
+        self.assertIn('没有可推荐结果',out['failed'])
+        self.assertEqual(out['board'],'none')
+
+    def test_ip_history_champion_requires_observed_quality_and_grade(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const failed={name:'only probe',score:0,latency_ms:1,jitter_ms:1,
+              measurement_scope:{mode:'ip',bandwidth:'not_requested'}};
+            const measured={...failed,name:'IP measured',latency_ms:100,ip_quality_score:0,ip_grade:'D'};
+            const task={mode:'ip',target_profile:'daily'};
+            const missing=championOf({task,results:[failed]});
+            const invalid=[null,'70',NaN,Infinity,-1,101].map(q=>championOf({task,results:[{...measured,ip_quality_score:q}]}));
+            const badGrade=championOf({task,results:[{...measured,ip_grade:'unknown'}]});
+            const valid=championOf({task,results:[failed,measured]});
+            histData=[{task,results:[failed],ts:'fixture'}];renderHistList();
+            console.log(JSON.stringify({missing,invalid,badGrade,valid:valid?.name,list:__el('hist-list').innerHTML}));})();
+        """)
+        self.assertIsNone(out['missing']);self.assertTrue(all(value is None for value in out['invalid']))
+        self.assertIsNone(out['badGrade']);self.assertEqual(out['valid'],'IP measured')
+        self.assertNotIn('🥇',out['list'])
+
     def test_table_and_region_recommendations_prefer_measured_coverage(self):
         out=self.run_app("""
           (async()=>{await new Promise(r=>setTimeout(r,0));currentProfile='daily';

@@ -83,6 +83,24 @@ if(!PROFILES.includes(currentProfile)) currentProfile = 'all';
 
 function profileScore(r){ return SBProfiles.score(r,currentProfile); }
 
+// Recommendation eligibility is separate from the unchanged display scores.
+// A zero derived score or probe-only latency is not a completed IP observation.
+function recommendationEligible(r,config,profile){
+  const target=['all','balanced'].includes(profile)?config?.target_profile:profile;
+  if(target!=='download' && (config?.mode==='ip' || r.measurement_scope?.mode==='ip' ||
+      ['ip','ipclean','residential'].includes(target))){
+    return Number.isFinite(r.ip_quality_score) && r.ip_quality_score>=0 && r.ip_quality_score<=100 &&
+      ['S','A','B','C','D'].includes(r.ip_grade);
+  }
+  return Number.isFinite(r.median_mbps) && r.median_mbps>0 &&
+    !['pending','partial','not_requested','not_selected','failed','cancelled','interrupted'].includes(r.measurement_scope?.bandwidth);
+}
+function taskHasRecommendation(task){
+  const confirmed=task.milestones?.first_recommendation;
+  return Number.isFinite(confirmed) && confirmed>=0 && (task.results||[]).some(r=>
+    recommendationEligible(r,task.config,currentProfile) && Number.isFinite(profileScore(r)));
+}
+
 // 切换评分 Profile：存 localStorage、高亮选中按钮、自动按新 Profile 分数降序
 function setProfile(p){
   currentProfile = p;
@@ -503,14 +521,17 @@ function boardItem(x){
 function renderBoard(){
   const bd = document.getElementById('board');
   if(!latestData || !latestData.results || !latestData.results.length){ bd.style.display='none'; return; }
+  const isLive=activeTask && latestData.task===activeTask.config && latestData.ts===activeTask.started_at;
+  if(isLive && !taskHasRecommendation(activeTask)){bd.style.display='none';return;}
+  const rows=latestData.task?latestData.results.filter(r=>recommendationEligible(r,latestData.task,currentProfile)):latestData.results;
   let html = '';
-  const favRows = latestData.results.filter(r=>r.node_id?favIds.has(r.node_id):favs.has(r.name))
+  const favRows = rows.filter(r=>r.node_id?favIds.has(r.node_id):favs.has(r.name))
     .sort((a,b)=>SBProfiles.compare(a,b,currentProfile))
     .map(r=>({name:r.name, node_id:r.node_id, sc:profileScore(r), mbps:r.median_mbps}));
   if(favRows.length)
     html += `<div class="board-group"><span class="board-code">⭐ 收藏</span>${favRows.map(boardItem).join('')}</div>`;
   const groups = {};
-  for(const r of latestData.results){
+  for(const r of rows){
     const sc = profileScore(r);
     if(sc==null) continue;
     const code = regionOf(r);
@@ -544,7 +565,7 @@ let nodeTrend = null;
 function championOf(rec){
   if(rec.task || (rec.results||[]).some(r=>r.measurement_scope?.mode)){
     const profile=rec.task?.target_profile||'balanced';
-    return (rec.results||[]).filter(r=>SBProfiles.score(r,profile)!=null)
+    return (rec.results||[]).filter(r=>recommendationEligible(r,rec.task,profile) && Number.isFinite(SBProfiles.score(r,profile)))
       .sort((a,b)=>SBProfiles.compare(a,b,profile))[0]||null;
   }
   let best = null;
@@ -1654,7 +1675,7 @@ function showTask(task){
 }
 function renderTaskResultMeta(task){
   const rows=task.results||[],running=!SBTasks.terminal(task.status),text=taskLabels[task.status]||'状态未知';
-  const hasRecommendation=rows.some(r=>profileScore(r)!=null);
+  const hasRecommendation=taskHasRecommendation(task);
   document.getElementById('latest-meta').textContent=`${task.config?.mode||task.mode||'未知模式'} · ${text} · ${rows.length} 个已返回节点 · ${hasRecommendation?'已测范围内推荐':running?'等待可用于推荐的观测结果':'当前目标没有可推荐结果；请展开指标状态，检查节点连接或调整测速模式后重试'}`;
 }
 let taskListRevision=0,taskDetailRevision=0,selectedTaskHistoryId='';
