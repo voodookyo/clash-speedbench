@@ -350,3 +350,22 @@ checkout 为 `740b50b9faf32c271873f7770e391a878d341f82`，Git diff 核对与该�
 五个平台（Windows x64、Mac Intel/ARM、Linux x64/ARM）均完成 locked native 测试、构建、
 包及 provenance；Windows 含 NSIS/portable 和无系统 Python PATH 的既有包验证。
 这些成功仍不替代上述原生人工项目。后续文档补记使用 skip-ci，不声称文档 HEAD 重跑过此矩阵。
+
+
+## 2026-10-15 GUI 复测失败与 OWNER RIGHTS 修复
+
+`39352f3` 的真实 Windows GUI 导入仍失败：预览新增一轮成功，确认后显示“导入失败；已回退原文件或尚未替换，请保留私有备份”，回放和撤回受阻。备份目录已创建但为空，目标 JSONL 尚不存在、SQLite raw 仍空，源合成 JSONL 不变；API 状态 pending=false、can_rollback=false。这覆盖了前文“尚未执行桌面复测”的当时状态，不能将第一轮 owner 修复及其绿色 CI 写为 GUI 成功。
+
+用户在 Windows 按 Escape 停止 Computer Use。Mac 未继续操作或关闭该窗口，保留 failed backup 和旧包；后续 GUI 须用户明确恢复。原生/backend PID 和包路径的核对、token 与 ACL 诊断均按此边界执行。实际 GUI token 为非提升 limited token，默认 owner 为当前用户；相关目录实际数字 owner 同样匹配。失败备份目录的 allow trustees 只有当前用户、System、Administrators 和 OWNER RIGHTS，没有额外普通用户。`icacls /inheritance:r /grant:r` 保留显式 OWNER RIGHTS；严格校验随后将 OW 判为过宽。
+
+[Microsoft OWNER RIGHTS 定义](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-special-identities-groups#owner-rights)说明 OW / S-1-3-4 代表对象当前 owner。控制器在短命诊断进程只将自身 TokenOwner 设为自身用户（不改变账户、桌面进程或系统权限），于新临时目录复现：mkdir(0777) 通过，mkdir(0700) 在实际 owner 已匹配时被旧 `_windows_private` 拒绝。相同 token 默认 owner 下，两项合成历史合并/私有备份撤回测试在旧 `39352f3` 均失败，修复后均通过（2项 / 2.339s）；没有操作失败 GUI 数据或真实历史。这是进程默认 owner 的复现，不冒充整个 limited GUI token。
+
+当前 GREEN/VERIFIED 且在 normal-code write allowlist 的 GLM-5.3/OpenCode 经 `normal-code --write` run `231129d1-a953-4fee-b7a0-dbab8934db5f`，从 clean `4748cdb` 隔离返回三个文件。源 HEAD/status unchanged 与 write_isolated 均 true，auto_commit/merge/push 均 false。portable OW/numeric OW 正例先在旧实现失败；外来 owner、Everyone、CreatorOwner 仍被拒绝。控制器审阅后修正测试夹具中 TokenOwner 名称遮蔽、SD 内部 owner 指针不能单独 LocalFree 两处问题，补充外来用户 ACE 反例，再人工整合为 `1ee965f`。生产只在数字 owner 核验成功后允许 OW / S-1-3-4，不增加磁盘授权、不接管已有 seed。
+
+验证使用 `tests.test_node_identity tests.test_history_transfer tests.test_backend_owner tests.test_history_transfer_api`：
+
+- Mac ARM / Python3.14.7：56项 / 1.284s，OK，skip5。
+- Windows / Python3.14.7、3.12.10：首轮各56项 / 14.583s，只有新 native fixture 的源字节断言失败（文本写入 CRLF，断言误用 LF），其余通过，skip2。该失败未据此修改生产逻辑。`a0e45a8` 只将测试改为对比实际原始字节；仅复跑这一项，两版本分别0.594s/0.581s，通过，不重复其余成功测试。
+- 新 native child fixture 实际设置自身默认 owner，确认 mkdir(0700) 自带 OW 且 owner 正确，再运行真实权限收紧和核验、合成导入、SQLite raw 比对与撤回；保留源原始字节。POSIX 明确 skip，未把 skip 计为执行。
+
+本地新 Windows 包冻结 `a0e45a8`，在独立 checkout 构建及验证中；旧 `39352f3` 包和 GUI 现场保留。新跨平台 CI 与新包结果另补记，旧 `8102a5b` 的成功不替代本次修复验证。新 GUI 导入/回放/撤回仍待桌面实际复测；完整托盘、通知、GUI取消、自有崩溃、8950反向顺序、真实睡眠及安装器/缺依赖门槛仍未完成，本批没有额外真实测速或付费 API。

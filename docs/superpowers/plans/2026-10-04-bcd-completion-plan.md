@@ -15,6 +15,8 @@
 本批进展：第 1 项整合提交 `88145d9`，第 2 项隔离候选经审阅整合为 `a1fe6f3`；第 3 项 Windows Python3.14/3.12 各73项专项通过，含真实受限权限子进程回归。Mac 全量收集1259项、skip9，通过。第 4 项已从 clean `39352f3` 完成 Windows portable/NSIS 构建及既有 verifier，包内3.14.8的同一受限权限fixture也通过；原生 GUI 导入/撤回仍需桌面复测。Windows 已有隔离候选、受控脚本、合成源和接续提示词，保留用户正在使用的旧实例。第 5 项及其他平台既有人工缺口继续待验。完整范围及源码/包归属见 native-acceptance 报告的2026-10-15补记。
 后续跨平台冻结 `8102a5b` 的六格 Python 与五平台桌面 CI 均成功；两个 Windows CI 格实际执行新增受限权限回归通过。公共草稿 PR #1 已同步，后续仅报告文档更新使用 skip-ci，不替代新的原生人工证据。
 
+2026-10-15 后续真实 GUI 复测失败：第一轮 owner 修复尚未解决导入，回放/撤回受阻。用户 Escape 停止桌面操作，现场保留。已从实际 ACL 定位 mkdir(0700) 的 OWNER RIGHTS 被误拒；normal-code --write 从 clean4748cdb 隔离产出，经控制器修正测试/审阅整合为1ee965f；a0e45a8仅修正Windows测试CRLF字节比较。Mac56项专项、Windows两版本相关专项及自身默认owner=用户的合成导入/撤回复现通过，精确范围见报告。下一步先完成a0e45a8独立Windows包及新CI，再等待明确恢复桌面操作，以新隔离目录复测导入/回放/撤回；成功后按第5项继续。尚不勾选GUI或C/D整项完成。
+
 批准依据：2026-10-04 用户要求先做 ai-dev delegation assessment、优先本地路由，再完成 B/C/D 全部任务。此清单细化已批准规格，不降低原验收标准。起点：clean `e916af4`；各阶段整项仍未验收。
 
 ## Delegation assessment 与责任
