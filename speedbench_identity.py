@@ -88,6 +88,11 @@ def _windows_private(path, sid):
         # SDDL may abbreviate this same verified user (for example, LA for
         # the local Administrator). Trust only the actual owner's alias.
         allowed.add(owner.group(1))
+        # OWNER RIGHTS (OW, S-1-3-4) resolves to the object's *current* owner,
+        # already verified above to be exactly this caller's SID, so unlike
+        # CREATOR OWNER (CO, S-1-3-0) it can never grant a different account.
+        # mkdir(mode=0o700) emits such an ACE on import backup directories.
+        allowed.update({'OW', 'S-1-3-4'})
         for entry in entries:
             fields = entry.split(';')
             if len(fields) != 6 or fields[0] not in ('A', 'D'):

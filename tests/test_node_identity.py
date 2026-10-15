@@ -133,6 +133,46 @@ class IdentityTest(unittest.TestCase):
                         with self.assertRaises(IdentityError):
                             identity._windows_private('fixture.identity', current)
 
+    def test_windows_owner_rights_accepted_only_after_verified_current_owner(self):
+        import speedbench_identity as identity
+        from ctypes import wintypes
+        current = 'S-1-5-21-100-200-300-500'
+        cases = (
+            (current, 'O:' + current + 'D:P(A;;FA;;;OW)', True),
+            (current, 'O:' + current + 'D:P(A;;FA;;;S-1-3-4)', True),
+            ('S-1-5-21-100-200-300-501', 'O:' + current + 'D:P(A;;FA;;;OW)', False),
+            (current, 'O:' + current + 'D:P(A;;FA;;;OW)(A;;FR;;;WD)', False),
+            (current, 'O:' + current + 'D:P(A;;FA;;;OW)(A;;FR;;;S-1-5-21-100-200-300-501)', False),
+            (current, 'O:' + current + 'D:P(A;;FA;;;CO)', False),
+            (current, 'O:' + current + 'D:P(A;;FA;;;S-1-3-0)', False),
+        )
+        for actual, sddl, safe in cases:
+            with self.subTest(actual=actual, sddl=sddl):
+                owner_text = ctypes.create_unicode_buffer(actual)
+                descriptor_text = ctypes.create_unicode_buffer(sddl)
+                advapi, kernel = mock.Mock(), mock.Mock()
+                def get_info(path, kind, flags, owner, group, dacl, sacl, descriptor):
+                    ctypes.cast(owner, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(1)
+                    ctypes.cast(descriptor, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(2)
+                    return 0
+                def convert_owner(owner, output):
+                    ctypes.cast(output, ctypes.POINTER(wintypes.LPWSTR))[0] = ctypes.cast(owner_text, wintypes.LPWSTR)
+                    return True
+                def convert_descriptor(descriptor, revision, flags, output, size):
+                    ctypes.cast(output, ctypes.POINTER(wintypes.LPWSTR))[0] = ctypes.cast(descriptor_text, wintypes.LPWSTR)
+                    return True
+                advapi.GetNamedSecurityInfoW.side_effect = get_info
+                advapi.ConvertSidToStringSidW.side_effect = convert_owner
+                advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW.side_effect = convert_descriptor
+                libraries = {'advapi32': advapi, 'kernel32': kernel}
+                with mock.patch.object(ctypes, 'WinDLL', create=True,
+                                       side_effect=lambda name, **kwargs: libraries[name]):
+                    if safe:
+                        identity._windows_private('fixture.identity', current)
+                    else:
+                        with self.assertRaises(IdentityError):
+                            identity._windows_private('fixture.identity', current)
+
     def test_new_file_owner_failure_never_touches_dacl_or_reverifies(self):
         import speedbench_identity as identity
         with mock.patch.object(identity, '_windows_set_owner',
@@ -223,6 +263,23 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)[
             'protected_without_reassigning_owner'])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows owner rights boundary')
+    def test_owner_rights_backup_directory_created_private(self):
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [sys.executable, '-B', str(root/'tests/owner_rights_fixture.py'), str(root)],
+            capture_output=True, text=True, encoding='utf-8', timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertTrue(summary['default_owner_token_applied'])
+        self.assertTrue(summary['numeric_owner_verified_before_secure'])
+        self.assertTrue(summary['owner_rights_ace_in_real_sddl'])
+        self.assertTrue(summary['secure_private_accepted_owner_rights'])
+        self.assertTrue(summary['history_sql_raw_preserved'])
+        self.assertTrue(summary['source_bytes_unchanged'])
+        self.assertTrue(summary['history_import_applied_and_rolled_back'])
 
     @unittest.skipUnless(os.name == 'nt', 'Windows owner boundary')
     def test_windows_seed_round_trip_in_unicode_space_path(self):
