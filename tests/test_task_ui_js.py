@@ -11,6 +11,34 @@ MODULE = Path(__file__).resolve().parents[1]/'web'/'tasks.js'
 
 @unittest.skipUnless(NODE,'Node unavailable')
 class TaskUiJsTest(unittest.TestCase):
+    def test_old_failed_download_tags_are_corrected_without_mutating_history(self):
+        out=self.run_app("""
+          (async()=>{await new Promise(r=>setTimeout(r,0));
+            const rows=[
+              {name:'download failed',tags:'不通,ISP/非托管',latency_ms:100,
+               probe_successes:3,median_mbps:null,measurement_scope:{bandwidth:'failed'}},
+              {name:'probe success',tags:'不通',probe_successes:3,median_mbps:null,
+               measurement_scope:{bandwidth:'failed'}},
+              {name:'unmeasured',tags:'不通',latency_ms:100,median_mbps:null,
+               measurement_scope:{bandwidth:'not_selected'}},
+              {name:'unreachable',tags:'不通',latency_ms:null,probe_successes:0,median_mbps:null},
+              {name:'unknown',tags:'不通',latency_ms:'100',probe_successes:0,median_mbps:null}
+            ];
+            const before=JSON.stringify(rows);
+            const render=readonly=>rows.map(r=>rowHtml(r,0,{readonly,currentNode:'',favs:new Set()}));
+            console.log(JSON.stringify({live:render(false),history:render(true),unchanged:before===JSON.stringify(rows)}));
+          })();
+        """)
+        self.assertTrue(out['unchanged'])
+        for mode in ('live','history'):
+            self.assertIn('带宽测试失败',out[mode][0])
+            self.assertIn('ISP/非托管',out[mode][0])
+            self.assertNotIn('>不通<',out[mode][0])
+            self.assertIn('带宽测试失败',out[mode][1])
+            self.assertIn('未精测',out[mode][2])
+            self.assertIn('>不通<',out[mode][3])
+            self.assertIn('>不通<',out[mode][4])
+
     def test_task_recommendation_requires_parent_milestone_and_current_profile_data(self):
         out=self.run_app("""
           (async()=>{await new Promise(r=>setTimeout(r,0));currentProfile='all';

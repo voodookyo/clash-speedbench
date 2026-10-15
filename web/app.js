@@ -124,11 +124,25 @@ function toggleFav(name){
 }
 
 /* ==================== 标签 / IP 画像 ==================== */
+function displayTags(r){
+  const tags=typeof r.tags==='string'?r.tags:'';
+  const reachable=(typeof r.latency_ms==='number' && Number.isFinite(r.latency_ms) && r.latency_ms>=0) ||
+    (Number.isInteger(r.probe_successes) && r.probe_successes>0);
+  if(r.median_mbps!=null || !reachable || !tags.split(',').includes('不通')) return tags;
+  // Old raw history is immutable. Correct only its display when successful
+  // probe evidence disproves the legacy bandwidth-missing "unreachable" tag.
+  const scope=r.measurement_scope?.bandwidth;
+  const labels={not_selected:'未精测',not_requested:'未请求带宽',cancelled:'已取消',
+    interrupted:'未完成',partial:'未完成',pending:'等待带宽',failed:'带宽测试失败'};
+  const label=Object.hasOwn(labels,scope)?labels[scope]:
+    (/^(http-|curl-|no-data|switch-failed|worker-failed|error:)/.test(String(r.status||''))?'带宽测试失败':'未精测');
+  return tags.split(',').map(t=>t==='不通'?label:t).join(',');
+}
 function tagHtml(tags){
   if(!tags) return '-';
   return tags.split(',').map(t=>{
     let cls='tag';
-    if(/不通|龟速|脏IP|高延迟/.test(t)) cls+=' bad';
+    if(/不通|带宽测试失败|龟速|脏IP|高延迟/.test(t)) cls+=' bad';
     if(/低延迟|高带宽|ISP\/非托管/.test(t)) cls+=' good';
     return `<span class="${cls}">${esc(t)}</span>`;
   }).join('');
@@ -357,7 +371,7 @@ function rowHtml(r, i, opts){
   }else{
     h += `<td>${ipDisplayHtml(r)}</td>`;
   }
-  h += `<td>${tagHtml(r.tags)}</td><td>`;
+  h += `<td>${tagHtml(displayTags(r))}</td><td>`;
   if(!ro)
     h += isCur ? '<button class="mini" disabled>使用中</button>'
                : `<button class="mini sw" data-name="${esc(r.name)}" data-node-id="${esc(r.node_id||'')}">切换</button>`;

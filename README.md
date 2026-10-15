@@ -118,6 +118,8 @@ Phase 2 精测（严格串行）：warmup 1MB → 自适应样本（10~95MB）�
 - 测试域名和节点服务器域名通过 DoH 预解析后写进 worker 的 `hosts`，避开主实例 TUN 的
   fake-ip DNS 劫持
 - 每个节点拨号绑定物理网卡（`interface-name`），绕过主实例 TUN，不会产生「双重代理」
+- Windows 便携版即使使用受限 PATH 也会定位系统 PowerShell；TUN 接管默认路由时，
+  从已启用、有 IPv4 默认路由的物理网卡中选择出口。无法确认出口时停止测速并报错。
 
 并发不可用（非 Verge 安装、找不到配置/二进制、DoH 全挂）时自动回退到串行模式
 （临时切 GLOBAL，测完恢复，串行模式逐节点全量精测）。也可用 `--workers 1` 强制串行，

@@ -942,6 +942,12 @@ def curl_speed(proxy_url: str, download_url: str, max_time: float,
     if p.returncode not in (0, 28):
         err = (p.stderr or "").strip().replace("\n", " ")[:120]
         return None, f"curl-{p.returncode}: {err}", connect_ms, size_mb
+    # A time-limited sample is usable only after an actual HTTP 200 and
+    # enough bytes. Preserve a timeout before headers/data instead of turning
+    # HTTP 000 into a server error or losing the cause as generic no-data.
+    if p.returncode == 28 and (http_code == 0 or
+            (http_code == 200 and (speed_Bps <= 0 or size_B < 256 * 1024))):
+        return None, "curl-timeout", connect_ms, size_mb
     if http_code != 200:
         return None, f"http-{http_code}", connect_ms, size_mb
     # 下载量太少的样本不可信（对端提前断流、劫持返回小页面等）
@@ -1687,8 +1693,23 @@ def make_tags(r: Result) -> str:
     tags = []
     if r.median_mbps is None:
         scope = (r.measurement_scope or {}).get('bandwidth')
-        tags.append('未精测' if scope=='not_selected' else '未请求带宽' if scope=='not_requested' else
-                    '已取消' if scope=='cancelled' else '未完成' if scope in ('interrupted','partial') else "不通")
+        labels = {'not_selected': '未精测', 'not_requested': '未请求带宽',
+                  'cancelled': '已取消', 'interrupted': '未完成',
+                  'partial': '未完成', 'pending': '等待带宽'}
+        reachable = ((type(r.latency_ms) in (int, float) and
+                      math.isfinite(r.latency_ms) and r.latency_ms >= 0) or
+                     (type(r.probe_successes) is int and r.probe_successes > 0))
+        probe_failed = ((r.measurement_scope or {}).get('probe') == 'failed' and
+                        r.probe_attempts > 0 and r.probe_successes == 0)
+        if scope in labels:
+            tags.append(labels[scope])
+        elif not reachable and (r.status == 'unreachable' or probe_failed):
+            tags.append('不通')
+        elif scope == 'failed' or str(r.status).startswith(
+                ('http-', 'curl-', 'no-data', 'switch-failed', 'worker-failed', 'error:')):
+            tags.append('带宽测试失败')
+        else:
+            tags.append('未精测' if reachable else '带宽未知')
     else:
         if r.median_mbps < 5:
             tags.append("龟速")

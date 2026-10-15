@@ -12,7 +12,8 @@ sys.platform="win32" 运行，不起真子进程、不碰真文件系统、不�
 - physical_interface：首选 Find-NetRoute（路由栈真实选择；mihomo TUN 双 0/0
   路由同 RouteMetric 时 Get-NetRoute 排序乱序会漏检，真机实测），失败回退
   Get-NetRoute；输出解析（含中文「以太网」）、encoding/errors/timeout 参数、
-  非零/超时/空输出/进程不存在 → None
+  受限 PATH 使用系统 PowerShell；TUN 下仅使用 Up 物理网卡的默认路由，
+  查不到物理出口则保留虚拟路由以拒绝启动；非零/超时/空输出/进程不存在 → None
 - is_virtual_iface：win32 大小写不敏感 + WIN_VIRTUAL_IFACE_PREFIXES 并集；
   posix 分支行为不变
 - cancel_benchmark：win32 写哨兵文件（子进程 cancel_requested 轮询）、
@@ -225,7 +226,9 @@ class PhysicalInterfaceWinTest(unittest.TestCase):
         got, m_run = self.run_iface(run_return=self.cp("Ethernet\n"), which=None)
         self.assertEqual(got, "Ethernet")
         cmd, kwargs = m_run.call_args
-        self.assertEqual(cmd[0][0], "powershell.exe")   # which 未命中时用 .exe 兜底
+        self.assertEqual(cmd[0][0], os.path.join(
+            os.environ.get('SystemRoot', r'C:\Windows'), 'System32',
+            'WindowsPowerShell', 'v1.0', 'powershell.exe'))
         # 首选 Find-NetRoute 问路由栈的真实选择（mihomo TUN 双 0/0 路由同
         # RouteMetric 时 Sort-Object 乱序会漏检，真机实测踩过）
         self.assertIn("Find-NetRoute", cmd[0][-1])
@@ -267,6 +270,27 @@ class PhysicalInterfaceWinTest(unittest.TestCase):
     def test_powershell_missing_returns_none(self):
         got, _ = self.run_iface(run_side_effect=FileNotFoundError("powershell"))
         self.assertIsNone(got)
+
+    def test_tun_default_uses_up_physical_adapter_with_default_route(self):
+        got, run = self.run_iface(run_side_effect=[
+            self.cp('Mihomo\r\n'), self.cp('以太网\r\n')])
+        self.assertEqual(got, '以太网')
+        command = run.call_args_list[-1][0][0][-1]
+        self.assertIn('Get-NetAdapter -Physical', command)
+        self.assertIn("'Up'", command)
+        self.assertIn("'0.0.0.0/0'", command)
+        self.assertIn('InterfaceMetric', command)
+
+    def test_tun_without_confirmed_physical_route_remains_rejected(self):
+        for fallback in (self.cp(''), self.cp('以太网', 1), self.cp('Mihomo')):
+            with self.subTest(fallback=fallback):
+                got, _ = self.run_iface(run_side_effect=[self.cp('Mihomo'), fallback])
+                self.assertEqual(got, 'Mihomo')
+
+    def test_tun_physical_lookup_error_preserves_virtual_route(self):
+        got, _ = self.run_iface(run_side_effect=[self.cp('Mihomo'),
+                                                FileNotFoundError('powershell')])
+        self.assertEqual(got, 'Mihomo')
 
     def test_posix_route_get_default_unchanged(self):
         got, m_run = self.run_iface(

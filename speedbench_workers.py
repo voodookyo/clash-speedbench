@@ -35,9 +35,9 @@ Key tricks (validated against Clash Verge Rev + TUN on macOS):
 
 Anything missing (PyYAML / ruby / 内置解析器均失败, binary / config / DoH) ->
 WorkerUnavailable, and the caller falls back to the sequential in-place mode.
-A default route that already lives on a virtual interface (global TUN / other VPN)
-raises VirtualDefaultRoute (a WorkerUnavailable subclass) and takes the same
-fallback.
+On Windows a TUN default route uses an active physical adapter's IPv4 default
+route instead. Without a confirmed physical route it raises VirtualDefaultRoute
+(a WorkerUnavailable subclass). POSIX retains the virtual-default refusal.
 """
 
 from __future__ import annotations
@@ -800,7 +800,10 @@ def physical_interface() -> Optional[str]:
         # Windows 没有 route get default；用 PowerShell 查默认流量实际走的接口别名。
         # 中文系统上网卡名可能是「以太网」，PowerShell 默认输出编码不是 UTF-8，
         # 先把 [Console]::OutputEncoding 钉成 UTF-8，再按 utf-8/replace 解码。
-        ps = shutil.which("powershell") or "powershell.exe"
+        # The portable launcher deliberately restricts PATH to System32.
+        # Windows PowerShell lives below that directory, not directly in it.
+        ps = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                          "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
         # mihomo TUN（auto-route）会给虚拟网卡也挂一条 0.0.0.0/0 并把接口 metric
         # 压得比物理网卡低：此时 Get-NetRoute 有多条同 RouteMetric 记录，按
         # RouteMetric 排序取第一是乱序赌博（真机实测拿到物理网卡、漏检 TUN）。
@@ -812,6 +815,7 @@ def physical_interface() -> Optional[str]:
             "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
             "Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias",
         ]
+        name = None
         for c in cmds:
             try:
                 p = run_external(
@@ -820,12 +824,39 @@ def physical_interface() -> Optional[str]:
                     capture_output=True, timeout=10,
                     encoding="utf-8", errors="replace",
                     **_no_window_kwargs())
-                name = (p.stdout or "").strip()
-                if p.returncode == 0 and name:
-                    return name
+                candidate = (p.stdout or "").strip()
+                if p.returncode == 0 and candidate:
+                    name = candidate
+                    break
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        return None
+        if name and is_virtual_iface(name):
+            # Binding the throwaway core to a physical egress bypasses the
+            # main TUN. Only consider Up hardware adapters with an IPv4
+            # default route; never guess from an arbitrary non-TUN alias.
+            physical = (
+                "$physical=@(Get-NetAdapter -Physical -ErrorAction Stop | "
+                "Where-Object { $_.Status -eq 'Up' } | "
+                "Select-Object -ExpandProperty ifIndex); "
+                "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | "
+                "Where-Object { $physical -contains $_.InterfaceIndex } | "
+                "Sort-Object @{Expression={ $_.RouteMetric + "
+                "(Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex "
+                "$_.InterfaceIndex -ErrorAction Stop).InterfaceMetric }}, "
+                "InterfaceIndex | Select-Object -First 1).InterfaceAlias"
+            )
+            try:
+                p = run_external(
+                    [ps, "-NoProfile", "-Command",
+                     "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + physical],
+                    capture_output=True, timeout=10, encoding="utf-8", errors="replace",
+                    **_no_window_kwargs())
+                candidate = (p.stdout or "").strip()
+                if p.returncode == 0 and candidate and not is_virtual_iface(candidate):
+                    return candidate
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return name
     try:
         p = run_external(["route", "get", "default"],
                            capture_output=True, text=True, timeout=5)
@@ -1448,7 +1479,11 @@ def run_pool(candidates: List[str], proto_by_name: Dict[str, str], args,
             f"默认路由接口 {iface} 是虚拟隧道接口（全局 TUN/其他 VPN 接管了默认路由），"
             f"worker 模式测速无意义")
     if not iface:
+        if sys.platform == 'win32':
+            raise WorkerUnavailable('无法确定 Windows 测速出口网卡；已停止隔离测速，避免流量被主实例 TUN 截获')
         print("⚠️ 无法确定物理网卡，worker 拨号可能被主实例 TUN 截获（结果可能不准）")
+    else:
+        print(f"Worker 出口网卡: {iface}")
     config = getattr(args,'task_config',None)
     hosts = None
     if config is None or config.mode == 'legacy':

@@ -337,10 +337,18 @@ class RunPoolVirtualRouteTest(unittest.TestCase):
         hosts_mock.assert_called_once()
 
     def test_unknown_iface_passes_virtual_check(self):
-        # 拿不到默认路由接口（None）只警告，不阻断
-        exc, hosts_mock = self._run_until_hosts(None, self.PROXIES)
+        # Preserve the existing POSIX warning; Windows must not dial unbound
+        # when the system route may be captured by a TUN.
+        with mock.patch.object(sys, 'platform', 'darwin'):
+            exc, hosts_mock = self._run_until_hosts(None, self.PROXIES)
         self.assertIsInstance(exc, _ReachedBuildHosts)
         hosts_mock.assert_called_once()
+
+    def test_windows_unknown_iface_stops_before_network_measurement(self):
+        with mock.patch.object(sys, 'platform', 'win32'):
+            exc, hosts_mock = self._run_until_hosts(None, self.PROXIES)
+        self.assertIsInstance(exc, sbw.WorkerUnavailable)
+        hosts_mock.assert_not_called()
 
     def test_build_hosts_receives_dependency_closure(self):
         # 依赖闭包里的前置节点 server 域名也要钉住，否则链式拨号拿到 fake-ip
