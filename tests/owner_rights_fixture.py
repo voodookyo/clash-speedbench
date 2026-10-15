@@ -116,6 +116,7 @@ with tempfile.TemporaryDirectory(prefix='speedbench-owner-rights-home-') as home
     raw = json.dumps(dict(ts='2026-10-14T01:00:00', mb=10, rounds=1, results=[dict(
         name='fixture', proto='ss', latency_ms=20, median_mbps=12, status='ok')]))
     (source/'speedbench-history.jsonl').write_text(raw+'\n', encoding='utf-8')
+    source_before = (source/'speedbench-history.jsonl').read_bytes()
     from speedbench_owner import BackendLease
     from speedbench_transfer import HistoryTransfer
     owner = BackendLease(home).acquire()
@@ -131,13 +132,14 @@ with tempfile.TemporaryDirectory(prefix='speedbench-owner-rights-home-') as home
             stored = conn.execute('SELECT raw FROM runs LIMIT 1').fetchone()[0]
         result['history_sql_raw_preserved'] = stored == raw
         assert result['history_sql_raw_preserved'], stored
-        assert (source/'speedbench-history.jsonl').read_bytes() == (raw+'\n').encode('utf-8')
+        assert (source/'speedbench-history.jsonl').read_bytes() == source_before
         result['source_bytes_unchanged'] = True
         assert service.rollback(applied['backup_id'], owner)['ok']
         assert not (home/'speedbench-history.jsonl').exists()
         assert not (home/'speedbench-history.db').exists()
         receipt = json.loads((backup/'receipt.json').read_text(encoding='utf-8'))
         assert receipt['state'] == 'rolled_back', receipt
+        assert (source/'speedbench-history.jsonl').read_bytes() == source_before
         result['history_import_applied_and_rolled_back'] = True
     finally:
         owner.close()
