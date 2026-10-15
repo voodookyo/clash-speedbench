@@ -229,7 +229,32 @@ class LatestAndAllRunsTest(DbCase):
         db.import_jsonl(self.db_path, self.jsonl)
         runs = db.all_runs(self.db_path)
         self.assertEqual(len(runs), 3)
-        self.assertEqual(runs, recs)  # 按写入先后升序，每项逐字段一致
+        self.assertEqual(runs, [recs[1], recs[0], recs[2]])  # 按实际时间升序，raw 不变
+
+    def test_imported_old_runs_and_offsets_use_actual_time_without_changing_ids(self):
+        recs = [make_record('2026-10-04T04:00:00Z', [make_result('fixture', exit_ip='203.0.113.3')]),
+                make_record('2026-10-04T10:00:00+08:00', [make_result('fixture', exit_ip='203.0.113.1')]),
+                make_record('2026-10-04T03:00:00+00:00', [make_result('fixture', exit_ip='203.0.113.2')])]
+        self.dump_records(recs)
+        db.import_jsonl(self.db_path, self.jsonl)
+        before = self.query('SELECT id,ts,raw FROM runs ORDER BY id')
+        self.assertEqual(db.latest_run(self.db_path), recs[0])
+        self.assertEqual(db.all_runs(self.db_path), [recs[1], recs[2], recs[0]])
+        for rows in (db.node_series(self.db_path, 'fixture', days=3650),
+                     db.ip_changes(self.db_path, 'fixture'),
+                     db.ip_reputation_changes(self.db_path, 'fixture'),
+                     db.subscription_series(self.db_path, '机场甲', days=3650)):
+            self.assertEqual([row['ts'] for row in rows], [recs[1]['ts'], recs[2]['ts'], recs[0]['ts']])
+        self.assertEqual(db.subscription_summary(self.db_path, days=3650)[0]['last_ts'], recs[0]['ts'])
+        self.assertEqual(db.source_summary(self.db_path, days=3650)[0]['last_ts'], recs[0]['ts'])
+        self.assertEqual(self.query('SELECT id,ts,raw FROM runs ORDER BY id'), before)
+
+    def test_bad_old_timestamp_is_preserved_but_not_newer_than_known_time(self):
+        recs = [make_record('2026-10-04T04:00:00Z', []), make_record('unknown-time', [])]
+        self.dump_records(recs)
+        db.import_jsonl(self.db_path, self.jsonl)
+        self.assertEqual(db.latest_run(self.db_path), recs[0])
+        self.assertEqual(db.all_runs(self.db_path), [recs[1], recs[0]])
 
     def test_all_runs_empty_db(self):
         self.assertEqual(db.all_runs(self.db_path), [])

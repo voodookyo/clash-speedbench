@@ -12,7 +12,8 @@ sys.platform="win32" 运行，不起真子进程、不碰真文件系统、不�
 - physical_interface：首选 Find-NetRoute（路由栈真实选择；mihomo TUN 双 0/0
   路由同 RouteMetric 时 Get-NetRoute 排序乱序会漏检，真机实测），失败回退
   Get-NetRoute；输出解析（含中文「以太网」）、encoding/errors/timeout 参数、
-  非零/超时/空输出/进程不存在 → None
+  受限 PATH 使用系统 PowerShell；TUN 下仅使用 Up 物理网卡的默认路由，
+  查不到物理出口则保留虚拟路由以拒绝启动；非零/超时/空输出/进程不存在 → None
 - is_virtual_iface：win32 大小写不敏感 + WIN_VIRTUAL_IFACE_PREFIXES 并集；
   posix 分支行为不变
 - cancel_benchmark：win32 写哨兵文件（子进程 cancel_requested 轮询）、
@@ -225,7 +226,9 @@ class PhysicalInterfaceWinTest(unittest.TestCase):
         got, m_run = self.run_iface(run_return=self.cp("Ethernet\n"), which=None)
         self.assertEqual(got, "Ethernet")
         cmd, kwargs = m_run.call_args
-        self.assertEqual(cmd[0][0], "powershell.exe")   # which 未命中时用 .exe 兜底
+        self.assertEqual(cmd[0][0], os.path.join(
+            os.environ.get('SystemRoot', r'C:\Windows'), 'System32',
+            'WindowsPowerShell', 'v1.0', 'powershell.exe'))
         # 首选 Find-NetRoute 问路由栈的真实选择（mihomo TUN 双 0/0 路由同
         # RouteMetric 时 Sort-Object 乱序会漏检，真机实测踩过）
         self.assertIn("Find-NetRoute", cmd[0][-1])
@@ -267,6 +270,27 @@ class PhysicalInterfaceWinTest(unittest.TestCase):
     def test_powershell_missing_returns_none(self):
         got, _ = self.run_iface(run_side_effect=FileNotFoundError("powershell"))
         self.assertIsNone(got)
+
+    def test_tun_default_uses_up_physical_adapter_with_default_route(self):
+        got, run = self.run_iface(run_side_effect=[
+            self.cp('Mihomo\r\n'), self.cp('以太网\r\n')])
+        self.assertEqual(got, '以太网')
+        command = run.call_args_list[-1][0][0][-1]
+        self.assertIn('Get-NetAdapter -Physical', command)
+        self.assertIn("'Up'", command)
+        self.assertIn("'0.0.0.0/0'", command)
+        self.assertIn('InterfaceMetric', command)
+
+    def test_tun_without_confirmed_physical_route_remains_rejected(self):
+        for fallback in (self.cp(''), self.cp('以太网', 1), self.cp('Mihomo')):
+            with self.subTest(fallback=fallback):
+                got, _ = self.run_iface(run_side_effect=[self.cp('Mihomo'), fallback])
+                self.assertEqual(got, 'Mihomo')
+
+    def test_tun_physical_lookup_error_preserves_virtual_route(self):
+        got, _ = self.run_iface(run_side_effect=[self.cp('Mihomo'),
+                                                FileNotFoundError('powershell')])
+        self.assertEqual(got, 'Mihomo')
 
     def test_posix_route_get_default_unchanged(self):
         got, m_run = self.run_iface(
@@ -418,6 +442,7 @@ class BenchmarkPopenFlagsTest(WebStateCase):
                 mock.patch.object(web.subprocess, "Popen",
                                   return_value=proc) as m_popen, \
                 mock.patch.object(web, "sync_db"), \
+                mock.patch.object(web, "connect_controller"), \
                 mock.patch.object(subprocess, "CREATE_NO_WINDOW",
                                   self.FAKE_NO_WINDOW, create=True), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -513,11 +538,13 @@ class SigbreakRegistrationTest(unittest.TestCase):
     FAKE_SIGBREAK = getattr(signal, "SIGBREAK", 21)
 
     def run_main(self, platform):
-        with mock.patch.object(sys, "platform", platform), \
+        with tempfile.TemporaryDirectory() as cli_data, \
+                mock.patch.dict(os.environ, {"SPEEDBENCH_HOME": cli_data}), \
+                mock.patch.object(sys, "platform", platform), \
                 mock.patch.object(signal, "SIGBREAK", self.FAKE_SIGBREAK,
                                   create=True), \
                 mock.patch.object(sys, "argv", ["clash_speedbench.py", "--yes"]), \
-                mock.patch.object(csb, "detect_controller",
+                mock.patch.object(csb, "connect_controller",
                                   side_effect=csb.ApiError("停止于 controller 探测")), \
                 contextlib.redirect_stderr(io.StringIO()):
             return csb.main()
@@ -526,7 +553,7 @@ class SigbreakRegistrationTest(unittest.TestCase):
         old_handler = signal.getsignal(self.FAKE_SIGBREAK)
         try:
             rc = self.run_main("win32")
-            self.assertEqual(rc, 1)  # detect_controller 失败路径，注册已发生
+            self.assertEqual(rc, 1)  # connect_controller 失败路径，注册已发生
             handler = signal.getsignal(self.FAKE_SIGBREAK)
             self.assertTrue(callable(handler))
             self.assertNotIn(handler, (signal.SIG_DFL, signal.SIG_IGN,
@@ -721,7 +748,10 @@ class TrayModuleTest(unittest.TestCase):
                 return None
 
         with mock.patch.object(web, "ThreadingHTTPServer", return_value=FakeServer()), \
+                mock.patch.object(web, 'BackendLease'), \
+                mock.patch.object(web, 'recover_history_import'), \
                 mock.patch.object(web, "sync_db", return_value=0), \
+                mock.patch.object(web.speedbench_db, "interrupt_tasks"), \
                 mock.patch.object(web, "write_token_file"), \
                 mock.patch.object(web.webbrowser, "open"), \
                 mock.patch.object(sys, "argv", ["speedbench_web.py", "--no-browser"]), \
@@ -758,7 +788,7 @@ class TrayModuleTest(unittest.TestCase):
         但 macOS App 或 Windows zip 在用户机器上启动即失败。因此这里
         同时钉住 macOS copy/完整性校验、Windows Copy-Item 和 CI AST 清单。
         """
-        modules = ("speedbench_ip_intel.py", "speedbench_leak.py")
+        modules = ("speedbench_ip_intel.py", "speedbench_leak.py", "speedbench_controller.py")
         release = (self.ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8")
         build = (self.ROOT / "build_app.sh").read_text(encoding="utf-8")

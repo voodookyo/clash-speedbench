@@ -58,6 +58,28 @@ class CurlSpeedTest(unittest.TestCase):
         self.assertEqual(connect_ms, 200.0)
         self.assertEqual(size_mb, 0.0)
 
+    def test_timeout_before_http_response_keeps_timeout_reason(self):
+        (mbps, status, connect_ms, size_mb), _ = self.run_curl(
+            proc=fake_proc(stdout=writeout(code=0, speed=0, size=0,
+                                          connect=0, appconnect=0),
+                           stderr='curl: (28) fixture timeout', returncode=28))
+        self.assertEqual((mbps, status, connect_ms, size_mb),
+                         (None, 'curl-timeout', None, 0.0))
+        self.assertEqual(csb.classify_failure(status), 'timeout')
+
+    def test_timeout_with_insufficient_http_200_sample_is_not_valid_bandwidth(self):
+        (mbps, status, _, size_mb), _ = self.run_curl(
+            proc=fake_proc(stdout=writeout(size=100_000), returncode=28))
+        self.assertIsNone(mbps)
+        self.assertEqual(status, 'curl-timeout')
+        self.assertEqual(size_mb, 0.1)
+
+    def test_timeout_does_not_hide_an_actual_http_error_response(self):
+        (mbps, status, _, _), _ = self.run_curl(
+            proc=fake_proc(stdout=writeout(code=403), returncode=28))
+        self.assertIsNone(mbps)
+        self.assertEqual(status, 'http-403')
+
     def test_http_code_not_200_fails(self):
         (mbps, status, _, _), _ = self.run_curl(
             proc=fake_proc(stdout=writeout(code=403), returncode=0))

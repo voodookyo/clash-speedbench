@@ -195,7 +195,7 @@ class DbMigrationTest(unittest.TestCase):
             conn.executescript(OLD_SCHEMA)
             cur = conn.execute(
                 "INSERT INTO runs(ts, mb, rounds, node_count, raw)"
-                " VALUES ('2026-08-20T10:00:00', 20, 1, 1, '{}')")
+                " VALUES (?, 20, 1, 1, '{}')", (ts_before(days=1),))
             conn.execute(
                 "INSERT INTO node_results(run_id, name, proto, provider, status)"
                 " VALUES (?, '旧节点', 'ss', '机场甲', 'ok')", (cur.lastrowid,))

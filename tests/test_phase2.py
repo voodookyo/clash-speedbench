@@ -55,8 +55,8 @@ class SelectPhase2NodesTest(unittest.TestCase):
 class RelabelUnmeasuredTest(unittest.TestCase):
     def test_reachable_unmeasured_becomes_unmeasured(self):
         r = mk("节点", 120)
-        r.tags = csb.make_tags(r)          # 连通但没测带宽 → 不通
-        self.assertEqual(r.tags, "不通")
+        r.tags = csb.make_tags(r)
+        self.assertEqual(r.tags, "未精测")
         sbw.relabel_unmeasured(r)
         self.assertEqual(r.tags, "未精测")
 
@@ -69,7 +69,7 @@ class RelabelUnmeasuredTest(unittest.TestCase):
     def test_other_tags_preserved(self):
         r = mk("节点", 120)
         r.ip = csb.IpInfo(kind="ISP/非托管", ok=True)
-        r.tags = csb.make_tags(r)          # 不通,ISP/非托管
+        r.tags = csb.make_tags(r)
         sbw.relabel_unmeasured(r)
         self.assertEqual(r.tags, "未精测,ISP/非托管")
 

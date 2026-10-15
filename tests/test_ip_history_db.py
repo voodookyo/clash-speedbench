@@ -206,6 +206,57 @@ class IpHistoryDbTest(unittest.TestCase):
         # Reopening must not produce duplicate columns or fail on the new tables.
         self.assertEqual(db.import_jsonl(self.db_path, self.jsonl), 0)
 
+    def test_migration_backfills_node_result_id_only_for_unique_names(self):
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.executescript("""
+                CREATE TABLE runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL UNIQUE, mb REAL, rounds INTEGER,
+                    node_count INTEGER NOT NULL DEFAULT 0, raw TEXT NOT NULL);
+                CREATE TABLE node_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL, name TEXT NOT NULL,
+                    proto TEXT, provider TEXT, latency_ms REAL,
+                    jitter_ms REAL, connect_ms REAL, median_mbps REAL,
+                    best_mbps REAL, multi_mbps REAL, sample_mb REAL,
+                    score REAL, stars TEXT, status TEXT, tags TEXT);
+                CREATE TABLE ip_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL, name TEXT NOT NULL,
+                    exit_ip TEXT, country TEXT, country_code TEXT,
+                    isp TEXT, org TEXT, asn TEXT, asname TEXT, kind TEXT,
+                    ok INTEGER, proxy INTEGER, hosting INTEGER, mobile INTEGER);
+            """)
+            conn.execute(
+                "INSERT INTO runs(ts, raw, node_count) VALUES (?,?,?)",
+                ("2026-08-20T00:00:00", "{}", 4))
+            run_id = conn.execute("SELECT id FROM runs").fetchone()[0]
+            for name in ("solo", "dup", "dup"):
+                conn.execute(
+                    "INSERT INTO node_results(run_id,name,status) VALUES (?,?,?)",
+                    (run_id, name, "ok"))
+            for name in ("solo", "dup", "missing"):
+                conn.execute(
+                    "INSERT INTO ip_profiles(run_id,name) VALUES (?,?)",
+                    (run_id, name))
+            conn.commit()
+        finally:
+            conn.close()
+        self.write([])
+        self.assertEqual(db.import_jsonl(self.db_path, self.jsonl), 0)
+        solo_id = self.query(
+            "SELECT id FROM node_results WHERE name='solo'")[0][0]
+        # Unique match links; ambiguous and absent names stay NULL.
+        self.assertEqual(self.query(
+            "SELECT name, node_result_id FROM ip_profiles ORDER BY name"),
+            [("dup", None), ("missing", None), ("solo", solo_id)])
+        # Reopening preserves the existing link without changing it.
+        self.assertEqual(db.import_jsonl(self.db_path, self.jsonl), 0)
+        self.assertEqual(self.query(
+            "SELECT node_result_id FROM ip_profiles WHERE name='solo'"),
+            [(solo_id,)])
+
     def test_reputation_change_marks_same_ip_residential_proxy_and_score_drop(self):
         first = {
             "ip": "203.0.113.50", "ip_version": 4,
@@ -302,6 +353,25 @@ class IpHistoryDbTest(unittest.TestCase):
         self.assertEqual(len(changes), 1)
         self.assertFalse(changes[0]["intel_available"])
         self.assertIsNone(changes[0]["ip_quality_score"])
+
+    def test_one_intel_in_multi_node_run_is_not_borrowed_by_node_without_exit(self):
+        self.write([record('2026-08-29T00:04:10',[
+            result('measured',intel={'ip':'203.0.113.10','ip_grade':'S','ip_quality_score':90}),
+            {'name':'failed','node_id':'node_v2_'+'a'*32,'identity_version':2,'identity_strength':'strong','status':'timeout'},
+        ])])
+        db.import_jsonl(self.db_path,self.jsonl)
+        timeline=db.ip_reputation_changes(self.db_path,'',node_id='node_v2_'+'a'*32)
+        self.assertEqual(len(timeline),1)
+        self.assertFalse(timeline[0]['intel_available'])
+        self.assertIsNone(timeline[0]['exit_ip']);self.assertIsNone(timeline[0]['ip_grade'])
+
+    def test_single_node_legacy_intel_only_fallback_remains_readable(self):
+        self.write([record('2026-08-29T00:04:20',[{'name':'partial','intel_v4':{
+            'ip':'203.0.113.30','ip_grade':'A','ip_quality_score':80}}])])
+        db.import_jsonl(self.db_path,self.jsonl)
+        timeline=db.ip_reputation_changes(self.db_path,'partial')
+        self.assertTrue(timeline[0]['intel_available'])
+        self.assertEqual(timeline[0]['exit_ip'],'203.0.113.30')
 
     def test_malicious_json_values_are_parameters_not_sql(self):
         marker = "x'); DROP TABLE runs;--"

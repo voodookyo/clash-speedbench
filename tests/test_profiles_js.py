@@ -70,6 +70,8 @@ for(const [k,v] of Object.entries(__PRESEED__)) localStorage.setItem(k,v);
 async function fetch(){ return { json: async () => ({}) }; }
 """
 
+STUB_JS = 'const SBProfiles=require('+json.dumps(str(APP_JS.parent/'profiles.js'))+');\n'+STUB_JS
+
 # 与页面脚本同一词法作用域：可直接读写其顶层 let/const/function 绑定
 DRIVER_JS = r"""
 // ===== 测试驱动 =====

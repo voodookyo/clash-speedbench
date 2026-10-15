@@ -69,12 +69,16 @@ class ResultToDictTest(unittest.TestCase):
                         "probe_attempts", "probe_successes", "probe_failures",
                         "probe_success_rate", "probe_loss_pct", "exit_ipv4",
                         "exit_ipv6", "intel_v4", "intel_v6", "network_score",
-                        "ip_quality_score", "ip_grade", "dual_stack_inconsistent"}
+                        "ip_quality_score", "ip_grade", "dual_stack_inconsistent",
+                        'measurement_scope','metric_updated_at','measured_metric_count'}
         self.assertEqual(set(d), expected_top)
         expected_ip = {"exit_ip", "country", "country_code", "region", "city",
                        "isp", "org", "asn", "asname", "kind",
                        "proxy", "hosting", "mobile", "ok"}
         self.assertEqual(set(d["ip"]), expected_ip)
+        self.assertEqual(d['metric_updated_at'],{})
+        self.assertEqual(d['measurement_scope'],{'probe':'unknown','bandwidth':'unknown','intel':'unknown'})
+        self.assertEqual(d['measured_metric_count'],6)
 
     def test_values_and_rounding(self):
         d = csb.result_to_dict(full_result())

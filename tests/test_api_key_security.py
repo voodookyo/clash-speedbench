@@ -295,6 +295,7 @@ class WebCredentialBoundaryTest(WebServerCase):
                 "scamalytics_key": API_KEY,
             })
         with mock.patch.object(web, "sync_db"), \
+                mock.patch.object(web, "connect_controller"), \
                 mock.patch.object(
                     web.subprocess,
                     "Popen",

@@ -87,10 +87,39 @@ class MakeTagsTest(unittest.TestCase):
         self.assertEqual(tags, "不通")
         self.assert_clean(tags)
 
-    def test_unreachable_with_latency_has_no_latency_tag(self):
-        # median None 时不进入延迟标签分支
+    def test_latency_without_bandwidth_is_not_unreachable(self):
         tags = csb.make_tags(mk_result(median=None, latency=50))
-        self.assertEqual(tags, "不通")
+        self.assertEqual(tags, "未精测")
+
+    def test_failed_bandwidth_does_not_negate_successful_probe(self):
+        for latency, successes in ((100, 3), (None, 3)):
+            with self.subTest(latency=latency):
+                r = mk_result(median=None, latency=latency)
+                r.status = 'http-0'
+                r.probe_attempts = r.probe_successes = successes
+                r.measurement_scope = {'probe': 'completed', 'bandwidth': 'failed'}
+                self.assertEqual(csb.make_tags(r), '带宽测试失败')
+
+    def test_missing_probe_evidence_does_not_prove_unreachable(self):
+        r = mk_result()
+        r.status = 'ok'
+        self.assertEqual(csb.make_tags(r), '带宽未知')
+
+    def test_explicit_bandwidth_states_are_preserved(self):
+        labels = {'not_selected': '未精测', 'not_requested': '未请求带宽',
+                  'cancelled': '已取消', 'interrupted': '未完成',
+                  'partial': '未完成', 'pending': '等待带宽'}
+        for scope, label in labels.items():
+            with self.subTest(scope=scope):
+                r = mk_result(latency=100)
+                r.measurement_scope = {'bandwidth': scope}
+                self.assertEqual(csb.make_tags(r), label)
+
+    def test_completed_failed_probe_still_reports_unreachable(self):
+        r = mk_result()
+        r.probe_attempts = r.probe_failures = 3
+        r.measurement_scope = {'probe': 'failed', 'bandwidth': 'failed'}
+        self.assertEqual(csb.make_tags(r), '不通')
 
     def test_slow(self):
         tags = csb.make_tags(mk_result(median=3.0, latency=200))
