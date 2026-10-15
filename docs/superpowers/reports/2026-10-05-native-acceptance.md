@@ -271,3 +271,59 @@ indicates they must be present”。这是当前未完整签名bundle的系统�
 再验证系统信任；当前没有提供此类凭据，规格允许明确标识的unsigned alpha。
 本次只读检查未修补签名、添加权限、关闭Gatekeeper或绕过系统提示。
 系统图形安装/提示流程及其他平台生命周期仍保留未验收。
+
+## 2026-10-15 Windows 回传与权限候选
+
+Windows 回传基线为 clean `2bffb77`。原 CI 包实际 revision 为 PR merge
+`c378b45173fa2bf7acdcf5e540e1d714cf70da51`，Windows 记录其文件内容与 `9faeaae`
+一致；后续本地 v2 包为 `2bffb77` 加未提交补丁，source_dirty=true，不能冒充 CI 包。
+原生七页、受限 PATH、中文/空格/emoji、限定主题/焦点/窄窗口、partial 回放及正常退出已有
+Windows 操作记录；合成导入失败、撤回阻断，其余人工范围继续按原矩阵保留。
+
+控制器在独立 worktree 审阅十文件回传补丁，201 项 Mac 相关回归通过后提交 `88145d9`：
+有成功 probe 的带宽失败不再标作“不通”，旧 raw 仅纠正显示；curl 超时保留原因；
+Windows 通过系统 PowerShell 绝对路径识别物理出口，TUN 下只选 Up 的物理 IPv4 默认路由。
+Windows 已有两轮 182/144 项回归和单节点 1 MB 下载证据，范围相交不相加，不据此声称峰值或
+全订阅性能；本批控制器没有增加真实节点测量。
+
+原历史恢复失败测试经 SSH 在旧代码上也通过，说明执行上下文有差异。控制器另用真实 Win32
+fixture 确认：当前数字 owner SID 和私有 DACL 已合格时，仅在自有短命测试进程禁用权限，
+并仅对自有临时文件拒绝 WRITE_OWNER，会使旧代码不必要的 owner 重设失败。没有修改账户
+权限或系统策略。此边界与原报告 ERROR_ACCESS_DENIED 一致，但未独立采集原 GUI token，
+不能据此断言原 GUI 的所有原因已经排除。
+
+`normal-code --write` run `c70fe4e7-b472-4731-93a6-7eeab0992ff9` 从 clean `2bffb77`
+隔离产出 `speedbench_identity.py` 和四项 portable 回归。write_isolated、source_head_unchanged、
+source_status_unchanged 均为 true，auto_commit/merge/push 均为 false；控制器审阅后人工整合，
+并加入独立子进程中的真实 Windows ACL 回归，提交 `a1fe6f3`。实际 owner 已匹配才跳过设置，
+不同 owner 仍须调整，随后 DACL 收紧与最终核验保持；已有 seed 仍不接管。
+最初 GLM 调用超时后由控制器停止本任务调用，动态选取 normal-code 当前 GREEN/VERIFIED
+候选 DeepSeek 完成写入；另一次只读审阅未形成完整意见，不记为独立审阅通过。
+
+当前本地测试冻结 `39352f3331f615c5ca4d5df18e100165c7e45708`（含接续计划文档）：
+
+| 环境 | 验证 | 实际结果 |
+|---|---|---|
+| Mac ARM / Python 3.14.7 / Node 26.9 | 回传补丁相关回归 | 201 项，21.826s，OK |
+| Mac ARM / Python 3.14.7 | owner/lease/history/API/bootstrap 专项 | 73 项，2.290s，OK，skip=4 |
+| Mac ARM / Python 3.14.7 | 全量 | 1259 项收集，83.296s，OK，skip=9 |
+| Windows x64 / Python 3.14.7 | 同一权限/历史专项，含真实受限权限子进程 | 73 项，15.876s，OK，skip=2 |
+| Windows x64 / Python 3.12.10 | 同一权限/历史专项，含真实受限权限子进程 | 73 项，15.627s，OK，skip=2 |
+
+skip 均不计执行通过；各组范围重叠，不相加为独立总数。源码测试没有替代原生导入/撤回、
+完整托盘、通知、GUI 取消、自有崩溃、8950 反向顺序、真实睡眠及 NSIS/缺 WebView2 验收。
+候选包构建、包协议验证和原生复测状态在后续补记中分别记录。
+
+Windows 候选已在独立 checkout 从 clean `39352f3` 构建：Node 24.20.0、Rust 1.97.0，
+prepare → locked Tauri build → portable package → 现有 verifier → collector 均 exit 0。
+实际 provenance 为该完整源码 revision、source_dirty=false、windows-x86_64、Python 3.14.8、
+unsigned、automatic_updates=false。portable ZIP 15,805,621 bytes，NSIS 12,815,937 bytes；
+仅构建 NSIS，没有运行安装器。新包留在独立候选目录，没有替换供用户使用的旧包。
+包内 Python 3.14.8 在 PATH 仅 System32 下额外运行同一真实 ACL/受限权限 fixture，exit 0，
+实际 owner 与最终私有 ACL 验证通过，fixture raw 字节不变；该诊断使用 `-B` 防止污染包。
+
+Windows 已准备新的桌面启动脚本与一轮明确标识的合成导入源。脚本固定独立数据及
+APPDATA/LOCALAPPDATA，使用空 controller fixture，拒绝 Session0 和现存 native 实例，
+不会自动停止用户正在使用的窗口。脚本仅完成语法检查，尚未在桌面执行；下一步由 Windows
+Codex/用户实际确认导入、回放、撤回，再推进原有未验人工项。不得把本批源码/包测试
+改写为这些 GUI 操作已通过，C6 与 D3–D6/D8 整项继续未勾选。
