@@ -266,6 +266,10 @@ class IdentityTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'nt', 'Windows owner rights boundary')
     def test_owner_rights_backup_directory_created_private(self):
+        # Older Windows CPython ignores mkdir(0700), so cannot emit this ACE.
+        minimum_patch = {(3, 9): 20, (3, 10): 15, (3, 11): 10, (3, 12): 4}
+        if sys.version_info.micro < minimum_patch.get(sys.version_info[:2], 0):
+            self.skipTest('CPython predates Windows mkdir(0700) ACL handling')
         root = Path(__file__).resolve().parents[1]
         result = subprocess.run(
             [sys.executable, '-B', str(root/'tests/owner_rights_fixture.py'), str(root)],
