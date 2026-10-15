@@ -1,5 +1,6 @@
 import concurrent.futures
 import ctypes
+import json
 import os
 import tempfile
 import unittest
@@ -152,6 +153,76 @@ class IdentityTest(unittest.TestCase):
                                side_effect=AssertionError('verification must not run')):
             with self.assertRaises(IdentityError):
                 identity._secure_new_windows_file('C:\\tmp\\identity-seed', 'S-1-5-21-1')
+
+    def _fake_win_dll(self, actual_owner, *, get_result=0, set_result=0):
+        """Fake advapi/kernel32 exposing numeric owner and a settable owner."""
+        from ctypes import wintypes
+        owner_text = ctypes.create_unicode_buffer(actual_owner)
+        advapi, kernel = mock.Mock(), mock.Mock()
+        def get_info(path, kind, flags, owner, group, dacl, sacl, descriptor):
+            ctypes.cast(owner, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(1)
+            ctypes.cast(descriptor, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(2)
+            return get_result
+        def convert_owner(owner, output):
+            ctypes.cast(output, ctypes.POINTER(wintypes.LPWSTR))[0] = ctypes.cast(owner_text, wintypes.LPWSTR)
+            return True
+        def convert_sid(text, output):
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(3)
+            return True
+        advapi.GetNamedSecurityInfoW.side_effect = get_info
+        advapi.ConvertSidToStringSidW.side_effect = convert_owner
+        advapi.ConvertStringSidToSidW.side_effect = convert_sid
+        advapi.SetNamedSecurityInfoW.return_value = set_result
+        return advapi, {'advapi32': advapi, 'kernel32': kernel}
+
+    def _with_fake_win_dll(self, libraries):
+        return mock.patch.object(ctypes, 'WinDLL', create=True,
+                                 side_effect=lambda name, **kwargs: libraries[name])
+
+    def test_windows_set_owner_does_not_reassign_an_already_correct_owner(self):
+        import speedbench_identity as identity
+        current = 'S-1-5-21-100-200-300-500'
+        advapi, libraries = self._fake_win_dll(current)
+        with self._with_fake_win_dll(libraries):
+            identity._windows_set_owner('fixture.identity', current)
+        advapi.SetNamedSecurityInfoW.assert_not_called()
+
+    def test_windows_set_owner_reassigns_only_when_actual_owner_differs(self):
+        import speedbench_identity as identity
+        current = 'S-1-5-21-100-200-300-500'
+        advapi, libraries = self._fake_win_dll('S-1-5-32-544', set_result=0)
+        with self._with_fake_win_dll(libraries):
+            identity._windows_set_owner('fixture.identity', current)
+        advapi.SetNamedSecurityInfoW.assert_called_once()
+
+    def test_windows_set_owner_inspection_failure_is_fatal_and_never_sets(self):
+        import speedbench_identity as identity
+        current = 'S-1-5-21-100-200-300-500'
+        advapi, libraries = self._fake_win_dll(current, get_result=5)
+        with self._with_fake_win_dll(libraries):
+            with self.assertRaises(IdentityError):
+                identity._windows_set_owner('fixture.identity', current)
+        advapi.SetNamedSecurityInfoW.assert_not_called()
+
+    def test_windows_set_owner_reassignment_failure_is_fatal(self):
+        import speedbench_identity as identity
+        current = 'S-1-5-21-100-200-300-500'
+        advapi, libraries = self._fake_win_dll('S-1-5-32-544', set_result=5)
+        with self._with_fake_win_dll(libraries):
+            with self.assertRaises(IdentityError):
+                identity._windows_set_owner('fixture.identity', current)
+        advapi.SetNamedSecurityInfoW.assert_called_once()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows owner boundary')
+    def test_current_owner_without_write_owner_privilege_remains_private(self):
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [sys.executable, '-B', str(root/'tests/owner_acl_fixture.py'), str(root)],
+            capture_output=True, text=True, encoding='utf-8', timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)[
+            'protected_without_reassigning_owner'])
 
     @unittest.skipUnless(os.name == 'nt', 'Windows owner boundary')
     def test_windows_seed_round_trip_in_unicode_space_path(self):

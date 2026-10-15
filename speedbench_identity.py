@@ -103,6 +103,45 @@ def _windows_private(path, sid):
             kernel.LocalFree(descriptor)
 
 
+def _windows_owner(path):
+    """Return the actual numeric owner SID of an existing path, or fail closed.
+
+    Read-only: requests OWNER security information only.  A caller that only
+    needs to confirm its own SID must not ask Windows to reassign ownership,
+    because SetNamedSecurityInfoW requires WRITE_OWNER or SeTakeOwnershipPrivilege
+    even when the requested owner already matches.
+    """
+    from ctypes import wintypes
+    advapi = ctypes.WinDLL('advapi32', use_last_error=True)
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    get_info = advapi.GetNamedSecurityInfoW
+    get_info.argtypes = [wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+                         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                         ctypes.POINTER(ctypes.c_void_p)]
+    get_info.restype = wintypes.DWORD
+    sid_string = advapi.ConvertSidToStringSidW
+    sid_string.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    sid_string.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    descriptor = ctypes.c_void_p()
+    owner_sid = ctypes.c_void_p()
+    numeric_owner = wintypes.LPWSTR()
+    try:
+        if get_info(str(path), 1, 1, ctypes.byref(owner_sid), None, None, None,
+                    ctypes.byref(descriptor)):
+            raise IdentityError('Cannot inspect identity file owner')
+        if not owner_sid or not sid_string(owner_sid, ctypes.byref(numeric_owner)):
+            raise IdentityError('Cannot inspect identity file owner')
+        return numeric_owner.value
+    finally:
+        if numeric_owner:
+            kernel.LocalFree(ctypes.cast(numeric_owner, ctypes.c_void_p))
+        if descriptor:
+            kernel.LocalFree(descriptor)
+
+
 def _windows_set_owner(path, sid):
     """Bind an exclusively-created path's owner to the current user SID.
 
@@ -114,7 +153,14 @@ def _windows_set_owner(path, sid):
     to the caller's own SID requires no restore privilege (the creator still
     holds WRITE_OWNER through the inherited DACL) and keeps the existing strict
     owner check meaningful for any pre-existing file.
+
+    Reassigning an already-correct actual owner is unsafe: a restricted token
+    without WRITE_OWNER or SeTakeOwnershipPrivilege is denied by
+    SetNamedSecurityInfoW even though no change is needed.  Read the numeric
+    owner first and only request the privileged change when it actually differs.
     """
+    if _windows_owner(path) == sid:
+        return
     from ctypes import wintypes
     advapi = ctypes.WinDLL('advapi32', use_last_error=True)
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
