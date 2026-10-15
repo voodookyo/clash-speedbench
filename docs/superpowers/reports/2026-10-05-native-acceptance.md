@@ -291,6 +291,8 @@ fixture 确认：当前数字 owner SID 和私有 DACL 已合格时，仅在自�
 并仅对自有临时文件拒绝 WRITE_OWNER，会使旧代码不必要的 owner 重设失败。没有修改账户
 权限或系统策略。此边界与原报告 ERROR_ACCESS_DENIED 一致，但未独立采集原 GUI token，
 不能据此断言原 GUI 的所有原因已经排除。
+owner 设置与 DACL 设置所需权限的差异见
+[Microsoft SetNamedSecurityInfoW](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setnamedsecurityinfow)。
 
 `normal-code --write` run `c70fe4e7-b472-4731-93a6-7eeab0992ff9` 从 clean `2bffb77`
 隔离产出 `speedbench_identity.py` 和四项 portable 回归。write_isolated、source_head_unchanged、
@@ -327,3 +329,24 @@ APPDATA/LOCALAPPDATA，使用空 controller fixture，拒绝 Session0 和现存 
 不会自动停止用户正在使用的窗口。脚本仅完成语法检查，尚未在桌面执行；下一步由 Windows
 Codex/用户实际确认导入、回放、撤回，再推进原有未验人工项。不得把本批源码/包测试
 改写为这些 GUI 操作已通过，C6 与 D3–D6/D8 整项继续未勾选。
+
+本批 [六格 Python CI](https://github.com/voodookyo/clash-speedbench/actions/runs/38703024398)
+和 [五平台桌面 CI](https://github.com/voodookyo/clash-speedbench/actions/runs/38703024389)
+在分支冻结 `8102a5bce6022e43eab27d83f7b6d661dd8237a4` 全部成功。实际 PR merge
+checkout 为 `740b50b9faf32c271873f7770e391a878d341f82`，Git diff 核对与该分支冻结无文件
+差异。CI 产物保留自身 merge revision，不改标为 `39352f3` 本地 Windows 包。
+`39352f3` 到 `8102a5b` 仅更新上述计划和报告，运行资产相同。
+
+| 核心 CI | 收集 / 秒 | skip | 结果 |
+|---|---|---:|---|
+| Ubuntu / Python 3.9 | 1259 / 86.163 | 13 | OK |
+| Ubuntu / Python 3.12 | 1259 / 87.897 | 13 | OK |
+| macOS / Python 3.9 | 1259 / 130.038 | 13 | OK |
+| macOS / Python 3.12 | 1259 / 121.230 | 13 | OK |
+| Windows / Python 3.9 | 1259 / 181.944 | 23 | OK |
+| Windows / Python 3.12 | 1259 / 160.756 | 23 | OK |
+
+新增真实受限权限子进程用例在两个 Windows 格均实际执行为 ok，POSIX 格明确 skip。
+五个平台（Windows x64、Mac Intel/ARM、Linux x64/ARM）均完成 locked native 测试、构建、
+包及 provenance；Windows 含 NSIS/portable 和无系统 Python PATH 的既有包验证。
+这些成功仍不替代上述原生人工项目。后续文档补记使用 skip-ci，不声称文档 HEAD 重跑过此矩阵。
